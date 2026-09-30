@@ -1,20 +1,22 @@
-//! Window root: connection status, thread navigation and the open thread.
+//! Window root: title bar, thread sidebar, connection status and the open thread.
 
 use futures::StreamExt as _;
 use futures::channel::mpsc::UnboundedReceiver;
+use gpui_kit::assets::IconName;
 use gpui_kit::component::alert::Alert;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
-use gpui_kit::component::sidebar::{
-    Sidebar, SidebarFooter, SidebarGroup, SidebarHeader, SidebarMenu, SidebarMenuItem,
+use gpui_kit::component::{
+    ActiveTheme as _, Sizable as _, StyledExt as _, TitleBar, h_flex, v_flex,
 };
-use gpui_kit::component::{ActiveTheme as _, Sizable as _, StyledExt as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
-use t3_client::{SessionStatus, ShellState, ThreadShell};
+use t3_client::{ShellState, ThreadShell};
 
 use crate::backend::{Backend, Command, Event, Status};
+use crate::sidebar::{Sidebar, SidebarEvent};
 use crate::thread_view::{ThreadView, ThreadViewEvent};
+use crate::ui::{self, SIDEBAR_WIDTH, icon};
 
 pub struct T3App {
     backend: Backend,
@@ -23,6 +25,8 @@ pub struct T3App {
     shell: ShellState,
     thread: Option<Entity<ThreadView>>,
     pairing_link: Entity<InputState>,
+    sidebar: Entity<Sidebar>,
+    sidebar_open: bool,
     /// Pairing screen opened by hand while already paired, to switch servers.
     switching_server: bool,
     _thread_subscription: Option<Subscription>,
@@ -37,15 +41,30 @@ impl T3App {
         let pairing_link = cx.new(|cx| {
             InputState::new(window, cx).placeholder("Pairing link or token")
         });
-        let subscriptions = vec![cx.subscribe_in(
-            &pairing_link,
-            window,
-            |this, _, event: &InputEvent, window, cx| {
-                if matches!(event, InputEvent::PressEnter { .. }) {
-                    this.pair(window, cx);
+        let sidebar = cx.new(|cx| Sidebar::new(window, cx));
+        let subscriptions = vec![
+            cx.subscribe_in(
+                &pairing_link,
+                window,
+                |this, _, event: &InputEvent, window, cx| {
+                    if matches!(event, InputEvent::PressEnter { .. }) {
+                        this.pair(window, cx);
+                    }
+                },
+            ),
+            cx.subscribe_in(&sidebar, window, |this, _, event: &SidebarEvent, window, cx| {
+                match event {
+                    SidebarEvent::OpenThread(thread_id) => {
+                        this.open_thread(thread_id.clone(), window, cx)
+                    }
+                    SidebarEvent::SwitchServer => {
+                        this.switching_server = true;
+                        this.pairing_link.update(cx, |state, cx| state.focus(window, cx));
+                        cx.notify();
+                    }
                 }
-            },
-        )];
+            }),
+        ];
 
         Self {
             backend,
@@ -54,6 +73,8 @@ impl T3App {
             shell: ShellState::default(),
             thread: None,
             pairing_link,
+            sidebar,
+            sidebar_open: true,
             switching_server: false,
             _thread_subscription: None,
             _subscriptions: subscriptions,
@@ -79,6 +100,8 @@ impl T3App {
                     self.error = None;
                     // Fresh subscriptions resend snapshots; drop stale state.
                     self.shell = ShellState::default();
+                    let shell = self.shell.clone();
+                    self.sidebar.update(cx, |sidebar, cx| sidebar.set_shell(shell, cx));
                 }
                 if let Some(thread) = &self.thread {
                     thread.update(cx, |view, cx| {
@@ -88,11 +111,14 @@ impl T3App {
                         view.set_connected(connected, cx);
                     });
                 }
+                self.sidebar.update(cx, |sidebar, cx| sidebar.set_status(status.clone(), cx));
                 self.status = status;
             }
             Event::Shell(item) => {
                 self.shell.apply(item);
-                self.sync_thread_working(cx);
+                self.sync_thread_shell(cx);
+                let shell = self.shell.clone();
+                self.sidebar.update(cx, |sidebar, cx| sidebar.set_shell(shell, cx));
             }
             Event::Thread { thread_id, item } => {
                 if let Some(thread) = &self.thread {
@@ -109,14 +135,11 @@ impl T3App {
         cx.notify();
     }
 
-    fn sync_thread_working(&self, cx: &mut Context<Self>) {
+    /// Hands the open thread its shell entry: working state and modes.
+    fn sync_thread_shell(&self, cx: &mut Context<Self>) {
         let Some(thread) = &self.thread else { return };
-        let working = self
-            .shell
-            .thread(thread.read(cx).thread_id())
-            .and_then(|t| t.session.as_ref())
-            .is_some_and(|s| s.is_working());
-        thread.update(cx, |view, cx| view.set_shell_working(working, cx));
+        let shell = self.shell.thread(thread.read(cx).thread_id()).cloned();
+        thread.update(cx, |view, cx| view.set_shell(shell, cx));
     }
 
     fn open_thread(&mut self, thread_id: String, window: &mut Window, cx: &mut Context<Self>) {
@@ -131,7 +154,10 @@ impl T3App {
         });
         self._thread_subscription = Some(cx.subscribe(&view, Self::on_thread_event));
         self.thread = Some(view);
-        self.sync_thread_working(cx);
+        self.sync_thread_shell(cx);
+        self.sidebar.update(cx, |sidebar, cx| {
+            sidebar.set_open_thread(Some(thread_id.clone()), cx)
+        });
         self.backend.send(Command::OpenThread(thread_id));
         cx.notify();
     }
@@ -169,6 +195,10 @@ impl T3App {
         self.backend.send(Command::Pair(link));
         cx.notify();
     }
+
+    fn open_thread_shell(&self, cx: &App) -> Option<&ThreadShell> {
+        self.shell.thread(self.thread.as_ref()?.read(cx).thread_id())
+    }
 }
 
 impl Render for T3App {
@@ -176,111 +206,112 @@ impl Render for T3App {
         let main = if self.status == Status::NeedsPairing || self.switching_server {
             self.render_pairing(window, cx).into_any_element()
         } else if let Some(thread) = &self.thread {
-            thread.clone().into_any_element()
+            // Cached: `T3App` re-renders on plenty of events (shell deltas,
+            // status changes) that have nothing to do with this thread. Skip
+            // re-rendering the transcript unless the thread view notifies
+            // itself (see `ThreadView::apply`/`set_shell`/`set_connected`).
+            thread.clone().cached(StyleRefinement::default().size_full()).into_any_element()
         } else {
             div()
                 .flex()
                 .flex_1()
                 .items_center()
                 .justify_center()
+                .text_sm()
                 .text_color(cx.theme().muted_foreground)
                 .child("Select a thread")
                 .into_any_element()
         };
 
-        h_flex()
-            .items_stretch()
+        v_flex()
             .size_full()
             .bg(cx.theme().background)
             .text_color(cx.theme().foreground)
-            .child(self.render_sidebar(cx))
+            .child(self.render_title_bar(cx))
             .child(
-                v_flex()
+                h_flex()
                     .flex_1()
-                    .min_w_0()
-                    .h_full()
-                    .children(self.error.clone().map(|error| {
-                        div().p_2().child(Alert::error("backend-error", error))
-                    }))
-                    .child(main),
+                    .min_h_0()
+                    .items_stretch()
+                    .when(self.sidebar_open, |row| row.child(self.sidebar.clone()))
+                    .child(
+                        v_flex()
+                            .flex_1()
+                            .min_w_0()
+                            .h_full()
+                            .children(self.error.clone().map(|error| {
+                                div().p_2().child(Alert::error("backend-error", error))
+                            }))
+                            .child(main),
+                    ),
             )
     }
 }
 
 impl T3App {
-    fn render_sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let open_id = self.thread.as_ref().map(|t| t.read(cx).thread_id().to_owned());
-
-        let groups = self.shell.projects.iter().map(|project| {
-            let items = self.shell.project_threads(&project.id).into_iter().map(|thread| {
-                let thread_id = thread.id.clone();
-                let badge = thread_badge(thread);
-                SidebarMenuItem::new(thread.title.clone())
-                    .active(open_id.as_deref() == Some(thread.id.as_str()))
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        this.open_thread(thread_id.clone(), window, cx)
-                    }))
-                    .when_some(badge, |item, badge| {
-                        item.suffix(move |_, cx| {
-                            div().text_xs().text_color(badge.color(cx)).child(badge.label())
-                        })
-                    })
+    fn render_title_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme();
+        let toggle = Button::new("toggle-sidebar")
+            .ghost()
+            .small()
+            .icon(icon(IconName::PanelLeft))
+            .tooltip(if self.sidebar_open { "Hide sidebar" } else { "Show sidebar" })
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.sidebar_open = !this.sidebar_open;
+                cx.notify();
+            }));
+        let brand = h_flex()
+            .gap_2()
+            .px_2()
+            .h_full()
+            .flex_shrink_0()
+            .child(toggle)
+            .child(div().text_sm().font_semibold().child("T3 Code"))
+            .when(self.sidebar_open, |brand| {
+                brand.w(SIDEBAR_WIDTH).bg(theme.sidebar).border_r_1().border_color(theme.sidebar_border)
             });
-            SidebarGroup::new(project.title.clone()).child(SidebarMenu::new().children(items))
+
+        let shell = self.open_thread_shell(cx);
+        let project = shell.and_then(|thread| {
+            self.shell.projects.iter().find(|p| p.id == thread.project_id)
         });
+        let breadcrumb = h_flex()
+            .gap_2()
+            .px_4()
+            .min_w_0()
+            .text_sm()
+            .when_some(project, |row, project| {
+                row.child(ui::project_tag(&project.id, &project.title))
+                    .child(div().text_color(theme.muted_foreground).child(project.title.clone()))
+                    .child(div().text_color(theme.muted_foreground).child("/"))
+            })
+            .when_some(shell, |row, thread| {
+                row.child(div().min_w_0().truncate().font_semibold().child(thread.title.clone()))
+            });
 
-        let (label, color) = match &self.status {
-            Status::NeedsPairing => ("Not paired".to_owned(), cx.theme().muted_foreground),
-            Status::Connecting(_) => ("Connecting…".to_owned(), cx.theme().warning),
-            Status::Connected(server) => (server.clone(), cx.theme().success),
-            Status::Reconnecting { reason, .. } => {
-                (format!("Reconnecting: {reason}"), cx.theme().danger)
-            }
-        };
-
-        Sidebar::new("threads")
-            .header(SidebarHeader::new().child(div().font_semibold().child("T3 Code")))
-            .children(groups)
-            .footer(
-                SidebarFooter::new().child(
-                    v_flex()
-                        .gap_1()
-                        .w_full()
-                        .min_w_0()
-                        .child(
-                            h_flex()
-                                .gap_2()
-                                .min_w_0()
-                                .text_xs()
-                                .text_color(cx.theme().muted_foreground)
-                                .child(div().size_2().flex_shrink_0().rounded_full().bg(color))
-                                .child(div().min_w_0().truncate().child(label)),
-                        )
-                        .when(self.status != Status::NeedsPairing, |footer| {
-                            footer.child(
-                                Button::new("switch-server")
-                                    .ghost()
-                                    .xsmall()
-                                    .label("Switch server")
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.switching_server = true;
-                                        this.pairing_link
-                                            .update(cx, |state, cx| state.focus(window, cx));
-                                        cx.notify();
-                                    })),
-                            )
-                        }),
-                ),
-            )
+        TitleBar::new()
+            .pl_0()
+            .child(h_flex().h_full().min_w_0().child(brand).child(breadcrumb))
     }
 
     fn render_pairing(&self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        div().flex().flex_1().items_center().justify_center().child(
+        let theme = cx.theme();
+        div().flex().flex_1().items_center().justify_center().p_4().child(
             v_flex()
-                .gap_3()
+                .gap_4()
                 .w(px(520.))
-                .child(div().text_xl().font_semibold().child("Connect to a T3 server"))
-                .child(div().text_sm().text_color(cx.theme().muted_foreground).child(
+                .p_6()
+                .rounded_xl()
+                .border_1()
+                .border_color(theme.border)
+                .bg(theme.secondary)
+                .child(
+                    h_flex()
+                        .gap_2()
+                        .child(icon(IconName::Plug).text_color(theme.primary))
+                        .child(div().text_lg().font_semibold().child("Connect to a T3 server")),
+                )
+                .child(div().text_sm().text_color(theme.muted_foreground).child(
                     "Paste the pairing link from `npx t3 serve`, or the token from \
                      `npx t3 auth pairing create`. A token alone connects to \
                      http://localhost:3773; for another server enter `<server url> <token>`.",
@@ -289,12 +320,7 @@ impl T3App {
                 .child(
                     h_flex()
                         .gap_2()
-                        .child(
-                            Button::new("pair")
-                                .primary()
-                                .label("Connect")
-                                .on_click(cx.listener(|this, _, window, cx| this.pair(window, cx))),
-                        )
+                        .justify_end()
                         .when(self.switching_server, |row| {
                             row.child(Button::new("cancel-pair").ghost().label("Cancel").on_click(
                                 cx.listener(|this, _, _, cx| {
@@ -302,44 +328,14 @@ impl T3App {
                                     cx.notify();
                                 }),
                             ))
-                        }),
+                        })
+                        .child(
+                            Button::new("pair")
+                                .primary()
+                                .label("Connect")
+                                .on_click(cx.listener(|this, _, window, cx| this.pair(window, cx))),
+                        ),
                 ),
         )
-    }
-}
-
-#[derive(Clone, Copy)]
-enum Badge {
-    NeedsInput,
-    Working,
-    Failed,
-}
-
-impl Badge {
-    fn label(self) -> &'static str {
-        match self {
-            Badge::NeedsInput => "needs you",
-            Badge::Working => "working",
-            Badge::Failed => "error",
-        }
-    }
-
-    fn color(self, cx: &App) -> Hsla {
-        match self {
-            Badge::NeedsInput => cx.theme().warning,
-            Badge::Working => cx.theme().info,
-            Badge::Failed => cx.theme().danger,
-        }
-    }
-}
-
-fn thread_badge(thread: &ThreadShell) -> Option<Badge> {
-    if thread.has_pending_approvals || thread.has_pending_user_input {
-        return Some(Badge::NeedsInput);
-    }
-    match thread.session.as_ref()?.status {
-        SessionStatus::Starting | SessionStatus::Running => Some(Badge::Working),
-        SessionStatus::Error => Some(Badge::Failed),
-        _ => None,
     }
 }

@@ -6665,6 +6665,7 @@ dependencies = [
 name = "t3-gpui"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "dirs 6.0.0",
  "futures",
  "gpui-kit",
@@ -6884,6 +6885,7 @@ dependencies = [
  "libc",
  "mio",
  "pin-project-lite",
+ "signal-hook-registry",
  "socket2",
  "tokio-macros",
  "windows-sys 0.61.2",

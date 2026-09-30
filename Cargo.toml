@@ -19,7 +19,16 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "process", "io-util"] }
 tokio-tungstenite = { version = "0.26", features = ["rustls-tls-webpki-roots"] }
 url = { version = "2", features = ["serde"] }
 uuid = { version = "1", features = ["v4"] }
+
+# GPUI (layout, text shaping, markdown) is very slow unoptimized. Optimize
+# dependencies in dev builds too; our own crates stay quick to rebuild and debug.
+[profile.dev.package."*"]
+opt-level = 2
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

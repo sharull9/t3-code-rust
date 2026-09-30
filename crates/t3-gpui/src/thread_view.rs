@@ -1,24 +1,19 @@
 //! One open thread: transcript, working state and composer.
 //!
-//! The view owns the thread projection and keeps `MessageScrollerState`'s row
-//! count aligned with it. Sending and stopping are emitted as events; the app
-//! turns them into backend commands.
+//! The view owns connection/shell state and the composer; the transcript
+//! itself (rows, scroll position) lives in its own entity, [`Transcript`] —
+//! see `transcript.rs` for why. Sending and stopping are emitted as events;
+//! the app turns them into backend commands.
 
-use std::rc::Rc;
-
-use gpui_kit::component::bubble::Bubble;
-use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::assets::IconName;
 use gpui_kit::component::input::{InputEvent, Textarea, TextareaState};
-use gpui_kit::component::message::{Message, MessageAlignment, MessageContent, MessageHeader};
-use gpui_kit::component::message_scroller::{MessageScroller, MessageScrollerState};
-use gpui_kit::component::spinner::Spinner;
-use gpui_kit::component::text::TextView;
-use gpui_kit::component::{
-    ActiveTheme as _, Disableable as _, IconName, Sizable as _, StyledExt as _, h_flex, v_flex,
-};
+use gpui_kit::component::{ActiveTheme as _, Icon, Size, Sizable as _, StyledExt as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
-use t3_client::{MessageRole, ThreadDetail, ThreadState, ThreadStreamItem};
+use t3_client::{Session, ThreadShell, ThreadStreamItem};
+
+use crate::transcript::Transcript;
+use crate::ui::{self, CONTENT_WIDTH};
 
 pub enum ThreadViewEvent {
     Send(String),
@@ -27,13 +22,11 @@ pub enum ThreadViewEvent {
 
 pub struct ThreadView {
     thread_id: String,
-    state: ThreadState,
-    /// Snapshot of the transcript handed to the virtualized row renderer.
-    rows: Rc<Vec<t3_client::Message>>,
-    scroller: Entity<MessageScrollerState>,
+    transcript: Entity<Transcript>,
     composer: Entity<TextareaState>,
-    /// From the shell stream, which can report a turn before detail catches up.
-    shell_working: bool,
+    /// The thread's shell entry. It carries the modes, and can report a turn
+    /// before detail catches up.
+    shell: Option<ThreadShell>,
     connected: bool,
     _subscriptions: Vec<Subscription>,
 }
@@ -42,15 +35,14 @@ impl EventEmitter<ThreadViewEvent> for ThreadView {}
 
 impl ThreadView {
     pub fn new(thread_id: String, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let scroller = cx.new(|cx| MessageScrollerState::new(0, cx));
+        let transcript = cx.new(Transcript::new);
         let composer = cx.new(|cx| {
             TextareaState::new(window, cx)
-                .auto_grow(1, 8)
+                .auto_grow(2, 10)
                 .submit_on_enter(true)
-                .placeholder("Message the agent  (Shift+Enter for a new line)")
+                .placeholder("Ask anything  (Shift+Enter for a new line)")
         });
         let subscriptions = vec![
-            cx.observe(&scroller, |_, _, cx| cx.notify()),
             cx.subscribe_in(&composer, window, |this, _, event: &InputEvent, window, cx| {
                 if let InputEvent::PressEnter { shift: false, .. } = event {
                     this.submit(window, cx);
@@ -61,11 +53,9 @@ impl ThreadView {
 
         Self {
             thread_id,
-            state: ThreadState::default(),
-            rows: Rc::default(),
-            scroller,
+            transcript,
             composer,
-            shell_working: false,
+            shell: None,
             connected: true,
             _subscriptions: subscriptions,
         }
@@ -75,11 +65,16 @@ impl ThreadView {
         &self.thread_id
     }
 
-    pub fn set_shell_working(&mut self, working: bool, cx: &mut Context<Self>) {
-        if self.shell_working != working {
-            self.shell_working = working;
+    /// Shell-stream updates arrive frequently while an agent works, but most
+    /// carry no change to anything this view renders (e.g. a bare
+    /// `updated_at` bump). `ThreadShell` doesn't derive `PartialEq` because
+    /// it also carries fields this view never reads, so compare only the
+    /// fields `render` and `is_working` actually use before notifying.
+    pub fn set_shell(&mut self, shell: Option<ThreadShell>, cx: &mut Context<Self>) {
+        if !shell_render_state_eq(self.shell.as_ref(), shell.as_ref()) {
             cx.notify();
         }
+        self.shell = shell;
     }
 
     pub fn set_connected(&mut self, connected: bool, cx: &mut Context<Self>) {
@@ -91,47 +86,18 @@ impl ThreadView {
 
     /// A reconnect resubscribes and resends the snapshot; drop the stale copy.
     pub fn reset(&mut self, cx: &mut Context<Self>) {
-        self.state = ThreadState::default();
-        self.rows = Rc::default();
-        self.scroller.update(cx, |scroller, cx| scroller.reset(0, cx));
-        cx.notify();
+        self.transcript.update(cx, |transcript, cx| transcript.reset(cx));
     }
 
     pub fn apply(&mut self, item: ThreadStreamItem, cx: &mut Context<Self>) {
-        let replaced = matches!(item, ThreadStreamItem::Snapshot { .. });
-        self.state.apply(item);
-
-        let previous = std::mem::take(&mut self.rows);
-        let current = self.state.thread.as_ref().map(|t| t.messages.clone()).unwrap_or_default();
-        let changed = first_changed_row(&previous, &current);
-        let (old_len, new_len) = (previous.len(), current.len());
-        self.rows = Rc::new(current);
-
-        self.scroller.update(cx, |scroller, cx| {
-            if replaced || new_len < old_len {
-                scroller.reset(new_len, cx);
-                return;
-            }
-            if new_len > old_len {
-                scroller.append(new_len - old_len, cx);
-            }
-            if let Some(first) = changed.filter(|&index| index < old_len) {
-                scroller.remeasure_items(first..old_len, cx);
-            }
-        });
-        cx.notify();
+        self.transcript.update(cx, |transcript, cx| transcript.apply(item, cx));
     }
 
-    fn detail(&self) -> Option<&ThreadDetail> {
-        self.state.thread.as_ref()
-    }
-
-    fn is_working(&self) -> bool {
-        self.shell_working
-            || self
-                .detail()
-                .and_then(|t| t.session.as_ref())
-                .is_some_and(|s| s.is_working())
+    fn is_working(&self, cx: &App) -> bool {
+        let shell_session = self.shell.as_ref().and_then(|t| t.session.as_ref());
+        let detail_session = self.transcript.read(cx).session();
+        shell_session.is_some_and(|s| s.is_working())
+            || detail_session.is_some_and(|s| s.is_working())
     }
 
     fn submit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -147,142 +113,171 @@ impl ThreadView {
 impl Render for ThreadView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
-        let working = self.is_working();
-        let detail = self.detail();
-        let title = detail.map(|t| t.title.clone()).unwrap_or_default();
-        let branch = detail.and_then(|t| t.branch.clone());
-        let session_error = detail
-            .and_then(|t| t.session.as_ref())
-            .and_then(|s| s.last_error.clone());
+        let working = self.is_working(cx);
+        let transcript_state = self.transcript.read(cx);
+        let shell = self.shell.as_ref();
+        let branch = transcript_state
+            .branch()
+            .map(str::to_owned)
+            .or_else(|| shell.and_then(|t| t.branch.clone()));
+        let session = transcript_state.session().or_else(|| shell.and_then(|t| t.session.as_ref()));
+        let session_error = session.and_then(|s| s.last_error.clone());
+        let provider = ui::provider_label(session.and_then(|s| s.provider_name.as_deref()));
+        let (runtime_label, runtime_icon) =
+            ui::runtime_mode(shell.map_or("", |t| t.runtime_mode.as_str()));
+        let (mode_label, mode_icon) =
+            ui::interaction_mode(shell.map_or("", |t| t.interaction_mode.as_str()));
 
-        let header = h_flex()
-            .gap_3()
-            .px_4()
-            .py_3()
-            .border_b_1()
-            .border_color(theme.border)
-            .child(div().flex_1().min_w_0().truncate().font_semibold().child(title))
-            .when(working, |row| {
-                row.child(
-                    h_flex()
-                        .gap_1()
-                        .text_xs()
-                        .text_color(theme.muted_foreground)
-                        .child(Spinner::new().small())
-                        .child("Working"),
-                )
-            })
-            .children(branch.map(|branch| {
-                div().text_xs().text_color(theme.muted_foreground).child(branch)
-            }));
+        // `Transcript` is embedded cached and styled to fill the remaining
+        // column; it repaints only when it notifies itself (new stream
+        // items, scrolling), never because this view redraws for an
+        // unrelated reason such as the composer's loader animation below
+        // (see `transcript.rs`).
+        let transcript =
+            self.transcript.clone().cached(StyleRefinement::default().flex_1().min_h_0());
 
-        let transcript = if detail.is_none() {
-            centered(h_flex().gap_2().child(Spinner::new()).child("Loading thread"), cx)
-                .into_any_element()
-        } else if self.rows.is_empty() {
-            centered("No messages yet. Say something to start a turn.", cx).into_any_element()
-        } else {
-            let rows = self.rows.clone();
-            MessageScroller::new("transcript", self.scroller.clone(), move |index, _, cx| {
-                match rows.get(index) {
-                    Some(message) => render_message(message, cx).into_any_element(),
-                    None => div().into_any_element(),
+        let action = div()
+            .id(if working { "stop" } else { "send" })
+            .flex()
+            .flex_shrink_0()
+            .items_center()
+            .justify_center()
+            .size_8()
+            .rounded_full()
+            .text_color(theme.primary_foreground)
+            .map(|button| {
+                if working {
+                    button
+                        .bg(theme.danger)
+                        .child(Icon::new(IconName::Square).xsmall())
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            if this.connected {
+                                cx.emit(ThreadViewEvent::Stop);
+                            }
+                        }))
+                } else {
+                    button
+                        .bg(theme.primary)
+                        .hover(|style| style.bg(theme.primary_hover))
+                        .child(Icon::new(IconName::ArrowUp).small())
+                        .on_click(cx.listener(|this, _, window, cx| this.submit(window, cx)))
                 }
             })
-            .with_bottom_fade(theme.background)
-            .flex_1()
-            .min_h_0()
-            .into_any_element()
-        };
+            .when(!self.connected, |button| button.opacity(0.4));
 
-        let action = if working {
-            Button::new("stop")
-                .danger()
-                .icon(IconName::CircleX)
-                .label("Stop")
-                .disabled(!self.connected)
-                .on_click(cx.listener(|_, _, _, cx| cx.emit(ThreadViewEvent::Stop)))
-        } else {
-            Button::new("send")
-                .primary()
-                .icon(IconName::ArrowUp)
-                .label("Send")
-                .disabled(!self.connected)
-                .on_click(cx.listener(|this, _, window, cx| this.submit(window, cx)))
-        };
+        let composer = v_flex()
+            .w_full()
+            .max_w(CONTENT_WIDTH)
+            .rounded_xl()
+            .border_1()
+            .border_color(theme.border)
+            .bg(theme.secondary)
+            .child(
+                div()
+                    .px_2()
+                    .pt_2()
+                    .child(Textarea::new(&self.composer).appearance(false)),
+            )
+            .child(
+                h_flex()
+                    .gap_1()
+                    .px_2()
+                    .pb_2()
+                    .child(chip(IconName::Bot, provider, cx))
+                    .child(separator(cx))
+                    .child(chip(runtime_icon, runtime_label, cx))
+                    .child(separator(cx))
+                    .child(chip(mode_icon, mode_label, cx))
+                    .child(div().flex_1())
+                    .when(working, |row| {
+                        row.child(div().mr_1().child(ui::loader("composer-working", Size::Small)))
+                    })
+                    .child(action),
+            );
+
+        let footer = h_flex()
+            .w_full()
+            .max_w(CONTENT_WIDTH)
+            .gap_1()
+            .px_3()
+            .text_xs()
+            .text_color(theme.muted_foreground)
+            .child(Icon::new(IconName::FolderClosed).xsmall())
+            .child("Local checkout")
+            .child(div().flex_1())
+            .children(branch.map(|branch| {
+                h_flex().gap_1().child(Icon::new(IconName::GitBranch).xsmall()).child(branch)
+            }));
 
         v_flex()
             .size_full()
             .min_h_0()
-            .child(header)
             .child(transcript)
-            .children(session_error.map(|error| {
-                div().px_4().py_2().text_sm().text_color(theme.danger).child(error)
-            }))
             .child(
-                h_flex()
-                    .items_end()
+                v_flex()
+                    .items_center()
                     .gap_2()
-                    .p_3()
-                    .border_t_1()
-                    .border_color(theme.border)
-                    .child(div().flex_1().min_w_0().child(Textarea::new(&self.composer)))
-                    .child(action),
+                    .px_6()
+                    .pt_2()
+                    .pb_3()
+                    .children(session_error.map(|error| {
+                        div()
+                            .w_full()
+                            .max_w(CONTENT_WIDTH)
+                            .px_1()
+                            .text_sm()
+                            .text_color(theme.danger)
+                            .child(error)
+                    }))
+                    .child(composer)
+                    .child(footer),
             )
     }
 }
 
-fn render_message(message: &t3_client::Message, cx: &App) -> impl IntoElement {
-    let theme = cx.theme();
-    let id = SharedString::from(format!("message-{}", message.id));
-    let streaming = message.streaming.then(|| Spinner::new().xsmall());
-
-    match message.role {
-        MessageRole::User => Message::new()
-            .id(id)
-            .alignment(MessageAlignment::End)
-            .content(MessageContent::new().bubble(Bubble::new().child(message.text.clone())))
-            .into_any_element(),
-        MessageRole::Assistant => Message::new()
-            .id(id.clone())
-            .header(MessageHeader::new().child("Agent").children(streaming))
-            .content(MessageContent::new().child(TextView::markdown(id, message.text.clone())))
-            .into_any_element(),
-        MessageRole::Reasoning => Message::new()
-            .id(id)
-            .header(MessageHeader::new().child("Thinking").children(streaming))
-            .content(
-                MessageContent::new()
-                    .text_sm()
-                    .text_color(theme.muted_foreground)
-                    .child(message.text.clone()),
-            )
-            .into_any_element(),
-        MessageRole::System | MessageRole::Unknown => Message::new()
-            .id(id)
-            .content(
-                MessageContent::new()
-                    .text_xs()
-                    .text_color(theme.muted_foreground)
-                    .child(message.text.clone()),
-            )
-            .into_any_element(),
-    }
-}
-
-fn centered(content: impl IntoElement, cx: &App) -> impl IntoElement {
-    div()
-        .flex()
-        .flex_1()
-        .items_center()
-        .justify_center()
+/// A read-only setting in the composer footer.
+fn chip(icon: IconName, label: impl Into<SharedString>, cx: &App) -> impl IntoElement {
+    h_flex()
+        .gap_1p5()
+        .px_2()
+        .py_1()
+        .text_xs()
+        .font_medium()
         .text_color(cx.theme().muted_foreground)
-        .child(content)
+        .child(Icon::new(icon).xsmall())
+        .child(label.into())
 }
 
-/// Index of the first row whose rendered content differs, if any.
-fn first_changed_row(old: &[t3_client::Message], new: &[t3_client::Message]) -> Option<usize> {
-    old.iter().zip(new).position(|(a, b)| {
-        a.id != b.id || a.streaming != b.streaming || a.text.len() != b.text.len()
-    })
+fn separator(cx: &App) -> impl IntoElement {
+    div().w_px().h_4().bg(cx.theme().border)
+}
+
+/// Compares the [`ThreadShell`] fields this view actually renders
+/// (`render`'s branch/provider/runtime/mode/session-error chips and
+/// `is_working`'s working spinner), so `set_shell` can skip `cx.notify()`
+/// when a shell-stream update changes nothing on screen.
+fn shell_render_state_eq(a: Option<&ThreadShell>, b: Option<&ThreadShell>) -> bool {
+    match (a, b) {
+        (None, None) => true,
+        (Some(a), Some(b)) => {
+            a.runtime_mode == b.runtime_mode
+                && a.interaction_mode == b.interaction_mode
+                && a.branch == b.branch
+                && session_render_state_eq(a.session.as_ref(), b.session.as_ref())
+        }
+        _ => false,
+    }
+}
+
+/// The [`Session`] half of [`shell_render_state_eq`].
+fn session_render_state_eq(a: Option<&Session>, b: Option<&Session>) -> bool {
+    match (a, b) {
+        (None, None) => true,
+        (Some(a), Some(b)) => {
+            a.is_working() == b.is_working()
+                && a.provider_name == b.provider_name
+                && a.last_error == b.last_error
+        }
+        _ => false,
+    }
 }

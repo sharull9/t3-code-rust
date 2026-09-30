@@ -41,6 +41,15 @@ crates/
    launches reconnect without pairing again. Use **Switch server** in the sidebar to pair with a
    different server.
 
+For the smoothest scrolling and animation, run an optimized build:
+
+```sh
+cargo run --release -p t3-gpui
+```
+
+`cargo run` builds dependencies (GPUI) with `opt-level = 2` so debug builds stay usable, but
+only `--release` optimizes the app itself and enables thin LTO.
+
 Headless check of the protocol layer, with no UI:
 
 ```sh
