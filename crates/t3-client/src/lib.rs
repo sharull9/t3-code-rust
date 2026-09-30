@@ -28,7 +28,7 @@ pub use reqwest;
 pub use auth::{Credentials, PairingLink};
 pub use error::{Error, RpcError};
 pub use rpc::{RpcSession, Subscription};
-pub use state::{ShellState, ThreadState};
+pub use state::{ShellState, ThreadState, sort_settled_threads};
 pub use types::*;
 
 /// An authenticated RPC session with one environment.
@@ -60,21 +60,25 @@ impl Connection {
         )
     }
 
-    /// One thread's detail: a snapshot of the last `turn_limit` turns, then events.
+    /// One thread's detail: a snapshot, then events. `turn_limit` bounds the
+    /// snapshot to the last N user-anchored turns; `None` omits `turnLimit`
+    /// entirely, which the server treats as unbounded (see `turnLimit` on
+    /// `orchestration.subscribeThread` in `orchestration.ts`), loading the
+    /// thread's full history.
     pub fn subscribe_thread(
         &self,
         thread_id: &str,
-        turn_limit: u32,
+        turn_limit: Option<u32>,
     ) -> Result<Subscription<ThreadStreamItem>, RpcError> {
-        self.rpc.subscribe(
-            methods::SUBSCRIBE_THREAD,
-            json!({
-                "threadId": thread_id,
-                "reasoningMessages": true,
-                "requestCompletionMarker": true,
-                "turnLimit": turn_limit,
-            }),
-        )
+        let mut params = json!({
+            "threadId": thread_id,
+            "reasoningMessages": true,
+            "requestCompletionMarker": true,
+        });
+        if let Some(turn_limit) = turn_limit {
+            params["turnLimit"] = json!(turn_limit);
+        }
+        self.rpc.subscribe(methods::SUBSCRIBE_THREAD, params)
     }
 
     /// Dispatch any `ClientOrchestrationCommand` (see `orchestration.ts`).
@@ -113,9 +117,60 @@ impl Connection {
         }
         self.dispatch(command).await
     }
+
+    /// `project.create` (see `orchestration.ts`'s `ProjectCreateCommand`).
+    /// `project_id` is generated client-side, same as the web app's
+    /// `newProjectId()`; the folder is expected to already exist (picked via
+    /// a native folder dialog), so `createWorkspaceRootIfMissing` is omitted.
+    pub async fn create_project(
+        &self,
+        project_id: &str,
+        title: &str,
+        workspace_root: &str,
+    ) -> Result<Value, RpcError> {
+        self.dispatch(json!({
+            "type": "project.create",
+            "commandId": new_id(),
+            "projectId": project_id,
+            "title": title,
+            "workspaceRoot": workspace_root,
+            "createdAt": now_iso(),
+        }))
+        .await
+    }
+
+    /// `thread.create` (see `orchestration.ts`'s `ThreadCreateCommand`).
+    /// Mirrors the defaults `ChatView.tsx` sends for a fresh thread:
+    /// `DEFAULT_RUNTIME_MODE` ("full-access"), the "default" interaction
+    /// mode, and no branch/worktree. `model_selection` should be the
+    /// project's `defaultModelSelection` when it has one.
+    pub async fn create_thread(
+        &self,
+        thread_id: &str,
+        project_id: &str,
+        title: &str,
+        model_selection: Value,
+    ) -> Result<Value, RpcError> {
+        self.dispatch(json!({
+            "type": "thread.create",
+            "commandId": new_id(),
+            "threadId": thread_id,
+            "projectId": project_id,
+            "title": title,
+            "modelSelection": model_selection,
+            "runtimeMode": "full-access",
+            "interactionMode": "default",
+            "branch": null,
+            "worktreePath": null,
+            "createdAt": now_iso(),
+        }))
+        .await
+    }
 }
 
-fn new_id() -> String {
+/// A fresh id for a client-generated aggregate (project, thread, message…),
+/// same shape as the web app's `newProjectId()` / `newThreadId()`.
+pub fn new_id() -> String {
     uuid::Uuid::new_v4().to_string()
 }
 

@@ -75,6 +75,16 @@ impl ShellState {
     }
 }
 
+/// Port of `sortSettledThreads` in
+/// `packages/client-runtime/src/state/threadSort.ts`: settled rows are
+/// history, so they order by when the work ended, newest first, with an id
+/// tiebreak so the order is stable across re-sorts.
+pub fn sort_settled_threads(threads: &mut [ThreadShell]) {
+    threads.sort_by(|a, b| {
+        b.settled_timestamp().cmp(&a.settled_timestamp()).then_with(|| a.id.cmp(&b.id))
+    });
+}
+
 #[derive(Debug, Default, Clone)]
 pub struct ThreadState {
     pub sequence: u64,
@@ -145,6 +155,18 @@ fn apply_event(thread: &mut ThreadDetail, event: OrchestrationEvent) {
         "thread.meta-updated" => {
             if let Some(title) = event.payload.get("title").and_then(|v| v.as_str()) {
                 thread.title = title.to_owned();
+            }
+        }
+        "thread.activity-appended" => {
+            let Ok(payload) = serde_json::from_value::<ActivityAppendedPayload>(event.payload)
+            else {
+                return;
+            };
+            // The server never replaces an activity in place (a tool's
+            // lifecycle transitions are separate activities with their own
+            // ids), but guard against a duplicate delivery anyway.
+            if !thread.activities.iter().any(|a| a.id == payload.activity.id) {
+                thread.activities.push(payload.activity);
             }
         }
         _ => {}
@@ -219,6 +241,73 @@ mod tests {
         assert_eq!(state.thread.unwrap().messages[0].text, "a");
     }
 
+    fn activity_event(sequence: u64, id: &str, tone: &str, kind: &str) -> ThreadStreamItem {
+        serde_json::from_value(json!({
+            "kind": "event",
+            "event": {
+                "sequence": sequence,
+                "type": "thread.activity-appended",
+                "aggregateId": "t1",
+                "payload": {
+                    "threadId": "t1",
+                    "activity": {
+                        "id": id, "tone": tone, "kind": kind, "summary": "cat foo.txt",
+                        "payload": { "toolCallId": "call-1" },
+                        "turnId": "turn1",
+                        "createdAt": "2026-01-01T00:00:00.000Z"
+                    }
+                }
+            }
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn activity_appended_pushes_and_dedupes() {
+        let mut state = thread_state();
+        state.apply(activity_event(11, "a1", "tool", "tool.started"));
+        state.apply(activity_event(12, "a1", "tool", "tool.started"));
+        state.apply(activity_event(13, "a2", "tool", "tool.completed"));
+        let thread = state.thread.unwrap();
+        assert_eq!(thread.activities.len(), 2);
+        assert_eq!(thread.activities[0].id, "a1");
+        assert_eq!(thread.activities[0].tone, ActivityTone::Tool);
+        assert_eq!(thread.activities[1].id, "a2");
+    }
+
+    #[test]
+    fn activity_with_unknown_tone_decodes_as_unknown() {
+        let mut state = thread_state();
+        state.apply(activity_event(11, "a1", "task-progress", "task.progress"));
+        let thread = state.thread.unwrap();
+        assert_eq!(thread.activities[0].tone, ActivityTone::Unknown);
+    }
+
+    #[test]
+    fn activity_missing_required_field_is_skipped() {
+        let mut state = thread_state();
+        // No `summary`: undecodable, must not panic and must not be added.
+        state.apply(
+            serde_json::from_value(json!({
+                "kind": "event",
+                "event": {
+                    "sequence": 11,
+                    "type": "thread.activity-appended",
+                    "aggregateId": "t1",
+                    "payload": {
+                        "threadId": "t1",
+                        "activity": {
+                            "id": "a1", "tone": "tool", "kind": "tool.started",
+                            "createdAt": "2026-01-01T00:00:00.000Z"
+                        }
+                    }
+                }
+            }))
+            .unwrap(),
+        );
+        assert!(state.thread.unwrap().activities.is_empty());
+    }
+
     #[test]
     fn shell_snapshot_then_upsert() {
         let mut shell = ShellState::default();
@@ -248,5 +337,52 @@ mod tests {
         );
         assert_eq!(shell.sequence, 4);
         assert_eq!(shell.project_threads("p1")[0].title, "Fix bug");
+    }
+
+    fn thread(id: &str, fields: serde_json::Value) -> ThreadShell {
+        let mut base = json!({
+            "id": id, "projectId": "p1", "title": id, "runtimeMode": "full-access",
+            "updatedAt": "2026-01-01T00:00:00.000Z",
+        });
+        for (key, value) in fields.as_object().unwrap() {
+            base[key] = value.clone();
+        }
+        serde_json::from_value(base).unwrap()
+    }
+
+    #[test]
+    fn settled_only_when_override_is_settled() {
+        assert!(!thread("t1", json!({})).is_settled());
+        assert!(!thread("t1", json!({ "settledOverride": "active" })).is_settled());
+        assert!(thread("t1", json!({ "settledOverride": "settled" })).is_settled());
+    }
+
+    #[test]
+    fn settled_timestamp_prefers_settled_at_then_falls_back() {
+        let stamped = thread("t1", json!({ "settledAt": "2026-02-01T00:00:00.000Z" }));
+        assert_eq!(stamped.settled_timestamp(), Some("2026-02-01T00:00:00.000Z"));
+
+        let unstamped = thread(
+            "t1",
+            json!({
+                "latestUserMessageAt": "2026-01-05T00:00:00.000Z",
+                "latestTurn": { "completedAt": "2026-01-06T00:00:00.000Z" },
+            }),
+        );
+        assert_eq!(unstamped.settled_timestamp(), Some("2026-01-06T00:00:00.000Z"));
+
+        let bare = thread("t1", json!({}));
+        assert_eq!(bare.settled_timestamp(), Some("2026-01-01T00:00:00.000Z"));
+    }
+
+    #[test]
+    fn sort_settled_threads_orders_newest_first_with_id_tiebreak() {
+        let mut threads = vec![
+            thread("b", json!({ "settledAt": "2026-01-01T00:00:00.000Z" })),
+            thread("a", json!({ "settledAt": "2026-01-02T00:00:00.000Z" })),
+            thread("c", json!({ "settledAt": "2026-01-02T00:00:00.000Z" })),
+        ];
+        sort_settled_threads(&mut threads);
+        assert_eq!(threads.iter().map(|t| t.id.as_str()).collect::<Vec<_>>(), ["a", "c", "b"]);
     }
 }

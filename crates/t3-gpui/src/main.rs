@@ -1,5 +1,6 @@
 mod app;
 mod backend;
+mod project_picker;
 mod sidebar;
 mod thread_view;
 mod transcript;
@@ -15,6 +16,7 @@ fn main() {
         .run(|cx| {
             // Must run before any component-backed view is created.
             gpui_kit::init(cx);
+            project_picker::init(cx);
             ui::apply_theme(cx);
 
             let bounds = Bounds::centered(None, size(px(1400.), px(900.)), cx);

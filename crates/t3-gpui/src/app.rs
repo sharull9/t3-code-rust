@@ -11,12 +11,22 @@ use gpui_kit::component::{
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
-use t3_client::{ShellState, ThreadShell};
+use serde_json::json;
+use t3_client::{ProjectShell, ShellState, ThreadShell};
 
 use crate::backend::{Backend, Command, Event, Status};
+use crate::project_picker::{ProjectPicker, ProjectPickerEvent};
 use crate::sidebar::{Sidebar, SidebarEvent};
 use crate::thread_view::{ThreadView, ThreadViewEvent};
 use crate::ui::{self, SIDEBAR_WIDTH, icon};
+
+/// Fallback `ModelSelection` for a project with no `defaultModelSelection`
+/// of its own. The web app resolves this from the user's last-used model,
+/// which this client doesn't track (it has no model picker yet), so a new
+/// thread in such a project may need its model changed server-side.
+fn fallback_model_selection() -> serde_json::Value {
+    json!({ "instanceId": "claudeAgent", "model": "claude-sonnet-4-5" })
+}
 
 pub struct T3App {
     backend: Backend,
@@ -27,6 +37,10 @@ pub struct T3App {
     pairing_link: Entity<InputState>,
     sidebar: Entity<Sidebar>,
     sidebar_open: bool,
+    project_picker: Entity<ProjectPicker>,
+    /// A thread just dispatched via `thread.create`, opened as soon as its
+    /// shell entry streams in (see `handle_event`'s `Event::Shell` arm).
+    pending_new_thread_id: Option<String>,
     /// Pairing screen opened by hand while already paired, to switch servers.
     switching_server: bool,
     _thread_subscription: Option<Subscription>,
@@ -36,12 +50,13 @@ pub struct T3App {
 impl T3App {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let (backend, events) = Backend::spawn();
-        Self::listen(events, cx);
+        Self::listen(events, window, cx);
 
         let pairing_link = cx.new(|cx| {
             InputState::new(window, cx).placeholder("Pairing link or token")
         });
         let sidebar = cx.new(|cx| Sidebar::new(window, cx));
+        let project_picker = cx.new(|cx| ProjectPicker::new(window, cx));
         let subscriptions = vec![
             cx.subscribe_in(
                 &pairing_link,
@@ -62,8 +77,25 @@ impl T3App {
                         this.pairing_link.update(cx, |state, cx| state.focus(window, cx));
                         cx.notify();
                     }
+                    SidebarEvent::AddProject => this.add_project(window, cx),
+                    SidebarEvent::NewThread => {
+                        let projects = this.shell.projects.clone();
+                        this.project_picker.update(cx, |picker, cx| {
+                            picker.open(projects, window, cx)
+                        });
+                    }
                 }
             }),
+            cx.subscribe_in(
+                &project_picker,
+                window,
+                |this, _, event: &ProjectPickerEvent, window, cx| match event {
+                    ProjectPickerEvent::Select(project) => {
+                        this.create_thread_in(project.clone(), window, cx)
+                    }
+                    ProjectPickerEvent::Cancel => {}
+                },
+            ),
         ];
 
         Self {
@@ -75,16 +107,22 @@ impl T3App {
             pairing_link,
             sidebar,
             sidebar_open: true,
+            project_picker,
+            pending_new_thread_id: None,
             switching_server: false,
             _thread_subscription: None,
             _subscriptions: subscriptions,
         }
     }
 
-    fn listen(mut events: UnboundedReceiver<Event>, cx: &mut Context<Self>) {
-        cx.spawn(async move |this, cx| {
+    /// Bridges backend events onto the window: spawned *with* the window
+    /// (rather than `cx.spawn`) so `handle_event` can open a thread as soon
+    /// as it streams in, which needs one to create the `ThreadView`.
+    fn listen(mut events: UnboundedReceiver<Event>, window: &mut Window, cx: &mut Context<Self>) {
+        cx.spawn_in(window, async move |this, cx| {
             while let Some(event) = events.next().await {
-                if this.update(cx, |app, cx| app.handle_event(event, cx)).is_err() {
+                if this.update_in(cx, |app, window, cx| app.handle_event(event, window, cx)).is_err()
+                {
                     break;
                 }
             }
@@ -92,7 +130,7 @@ impl T3App {
         .detach();
     }
 
-    fn handle_event(&mut self, event: Event, cx: &mut Context<Self>) {
+    fn handle_event(&mut self, event: Event, window: &mut Window, cx: &mut Context<Self>) {
         match event {
             Event::Status(status) => {
                 let connected = matches!(status, Status::Connected(_));
@@ -119,6 +157,13 @@ impl T3App {
                 self.sync_thread_shell(cx);
                 let shell = self.shell.clone();
                 self.sidebar.update(cx, |sidebar, cx| sidebar.set_shell(shell, cx));
+                // The thread this session's `thread.create` was waiting on
+                // has streamed in: open it now that the sidebar has it too.
+                if self.pending_new_thread_id.as_deref().is_some_and(|id| self.shell.thread(id).is_some())
+                {
+                    let thread_id = self.pending_new_thread_id.take().unwrap();
+                    self.open_thread(thread_id, window, cx);
+                }
             }
             Event::Thread { thread_id, item } => {
                 if let Some(thread) = &self.thread {
@@ -132,6 +177,51 @@ impl T3App {
             }
             Event::Error(message) => self.error = Some(message.into()),
         }
+        cx.notify();
+    }
+
+    /// Prompts for a folder with the native picker and dispatches
+    /// `project.create` for it. The folder's name is the project title, same
+    /// default as the web app's "Add project" flow.
+    fn add_project(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let paths = cx.prompt_for_paths(PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: Some("Add Project".into()),
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            let Ok(Ok(Some(mut paths))) = paths.await else { return };
+            let Some(path) = paths.pop() else { return };
+            let title = path
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "New project".into());
+            let workspace_root = path.to_string_lossy().into_owned();
+            let _ = this.update(cx, |app, _| {
+                app.backend.send(Command::CreateProject {
+                    id: t3_client::new_id(),
+                    title,
+                    workspace_root,
+                });
+            });
+        })
+        .detach();
+    }
+
+    /// Dispatches `thread.create` for `project`, defaults matching
+    /// `ChatView.tsx`'s new-thread flow (see `t3_client::Connection::create_thread`).
+    /// The thread opens once its shell entry streams back in.
+    fn create_thread_in(&mut self, project: ProjectShell, _window: &mut Window, cx: &mut Context<Self>) {
+        let thread_id = t3_client::new_id();
+        let model_selection = project.default_model_selection.unwrap_or_else(fallback_model_selection);
+        self.pending_new_thread_id = Some(thread_id.clone());
+        self.backend.send(Command::CreateThread {
+            id: thread_id,
+            project_id: project.id,
+            title: "New thread".into(),
+            model_selection,
+        });
         cx.notify();
     }
 
@@ -224,6 +314,7 @@ impl Render for T3App {
         };
 
         v_flex()
+            .relative()
             .size_full()
             .bg(cx.theme().background)
             .text_color(cx.theme().foreground)
@@ -245,6 +336,8 @@ impl Render for T3App {
                             .child(main),
                     ),
             )
+            // Painted last so it stacks above the sidebar and main column.
+            .child(self.project_picker.clone())
     }
 }
 
