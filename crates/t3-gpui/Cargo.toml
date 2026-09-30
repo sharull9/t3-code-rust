@@ -1,0 +1,15 @@
+[package]
+name = "t3-gpui"
+description = "Native GPUI client for T3 Code"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+dirs.workspace = true
+futures.workspace = true
+gpui-kit.workspace = true
+serde_json.workspace = true
+t3-client.workspace = true
+tokio.workspace = true
