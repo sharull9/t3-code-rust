@@ -369,6 +369,8 @@ impl ProjectPicker {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Shadows the `gpui::test` macro brought in by `use super::*`.
+    use core::prelude::v1::test;
 
     fn project(id: &str, title: &str) -> ProjectShell {
         serde_json::from_value(serde_json::json!({

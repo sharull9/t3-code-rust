@@ -24,7 +24,9 @@ use gpui_kit::component::text::TextView;
 use gpui_kit::component::{ActiveTheme as _, Sizable as _, Size, StyledExt as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
-use t3_client::{Activity, ActivityTone, Message, MessageRole, Session, ThreadState, ThreadStreamItem};
+use t3_client::{
+    Activity, ActivityTone, Message, MessageRole, Session, ThreadState, ThreadStreamItem,
+};
 
 use crate::ui::{self, CONTENT_WIDTH};
 
@@ -66,7 +68,13 @@ impl Transcript {
         cx.spawn(async move |this, cx| {
             loop {
                 cx.background_executor().timer(Duration::from_secs(1)).await;
-                if this.update(cx, |this, cx| if this.working_since.is_some() { cx.notify() }).is_err()
+                if this
+                    .update(cx, |this, cx| {
+                        if this.working_since.is_some() {
+                            cx.notify()
+                        }
+                    })
+                    .is_err()
                 {
                     return;
                 }
@@ -104,7 +112,8 @@ impl Transcript {
         self.state = ThreadState::default();
         self.rows = Rc::default();
         self.working_since = None;
-        self.scroller.update(cx, |scroller, cx| scroller.reset(0, cx));
+        self.scroller
+            .update(cx, |scroller, cx| scroller.reset(0, cx));
         cx.notify();
     }
 
@@ -200,14 +209,23 @@ impl Render for Transcript {
         let expanded = self.expanded.clone();
         let entity = cx.entity();
         let working_since = self.working_since;
-        MessageScroller::new("transcript", self.scroller.clone(), move |index, _, cx| {
-            match rows.get(index) {
-                Some(row) => column(render_row(row, index, &expanded, &entity, working_since, cx))
-                    .when(index == 0, |row| row.pt_2())
-                    .into_any_element(),
+        MessageScroller::new(
+            "transcript",
+            self.scroller.clone(),
+            move |index, _, cx| match rows.get(index) {
+                Some(row) => column(render_row(
+                    row,
+                    index,
+                    &expanded,
+                    &entity,
+                    working_since,
+                    cx,
+                ))
+                .when(index == 0, |row| row.pt_2())
+                .into_any_element(),
                 None => div().into_any_element(),
-            }
-        })
+            },
+        )
         .with_bottom_fade(theme.background)
         .size_full()
         .into_any_element()
@@ -231,12 +249,14 @@ fn centered(content: impl IntoElement, cx: &App) -> impl IntoElement {
 
 /// Centers a transcript row in the content column.
 fn column(content: impl IntoElement) -> Div {
-    div()
-        .flex()
-        .w_full()
-        .justify_center()
-        .px_6()
-        .child(div().w_full().max_w(CONTENT_WIDTH).px_1().py_2().child(content))
+    div().flex().w_full().justify_center().px_6().child(
+        div()
+            .w_full()
+            .max_w(CONTENT_WIDTH)
+            .px_1()
+            .py_2()
+            .child(content),
+    )
 }
 
 fn render_row(
@@ -304,8 +324,16 @@ fn render_thought(
     let theme = cx.theme();
     let key = thought.id.clone();
     let entity = entity.clone();
-    let chevron = if expanded { IconName::ChevronDown } else { IconName::ChevronRight };
-    let label = if thought.streaming { "Thinking" } else { "Thought" };
+    let chevron = if expanded {
+        IconName::ChevronDown
+    } else {
+        IconName::ChevronRight
+    };
+    let label = if thought.streaming {
+        "Thinking"
+    } else {
+        "Thought"
+    };
 
     let header = h_flex()
         .id(("thought-toggle", index))
@@ -329,7 +357,12 @@ fn render_thought(
         .border_color(theme.border)
         .child(header)
         .when(expanded, |column| {
-            column.child(div().text_sm().text_color(theme.muted_foreground).child(thought.text.clone()))
+            column.child(
+                div()
+                    .text_sm()
+                    .text_color(theme.muted_foreground)
+                    .child(thought.text.clone()),
+            )
         })
 }
 
@@ -346,7 +379,11 @@ fn render_activity_group(
     let theme = cx.theme();
     let key = group.key.clone();
     let entity = entity.clone();
-    let chevron = if expanded { IconName::ChevronDown } else { IconName::ChevronRight };
+    let chevron = if expanded {
+        IconName::ChevronDown
+    } else {
+        IconName::ChevronRight
+    };
     let icon_name = match group.items.as_slice() {
         [single] if single.tone != ActivityTone::Tool => activity_tone_icon(single.tone),
         _ => IconName::SquareTerminal,
@@ -372,7 +409,10 @@ fn render_activity_group(
                 .gap_1()
                 .pl_6()
                 .children(group.items.iter().map(|item| {
-                    div().text_xs().text_color(theme.muted_foreground).child(item.summary.clone())
+                    div()
+                        .text_xs()
+                        .text_color(theme.muted_foreground)
+                        .child(item.summary.clone())
                 })),
         )
     })
@@ -413,7 +453,11 @@ fn format_elapsed(elapsed: Duration) -> String {
     let total_seconds = elapsed.as_secs();
     let minutes = total_seconds / 60;
     let seconds = total_seconds % 60;
-    if minutes > 0 { format!("{minutes}m {seconds:02}s") } else { format!("{seconds}s") }
+    if minutes > 0 {
+        format!("{minutes}m {seconds:02}s")
+    } else {
+        format!("{seconds}s")
+    }
 }
 
 /// A transcript row.
@@ -488,7 +532,11 @@ fn build_rows(
         Act(usize),
     }
 
-    fn created_at<'a>(entry: Entry, messages: &'a [Message], activities: &'a [Activity]) -> &'a str {
+    fn created_at<'a>(
+        entry: Entry,
+        messages: &'a [Message],
+        activities: &'a [Activity],
+    ) -> &'a str {
         match entry {
             Entry::Msg(index) => messages[index].created_at.as_str(),
             Entry::Act(index) => activities[index].created_at.as_str(),
@@ -512,7 +560,13 @@ fn build_rows(
                 pending.push(index);
             }
             _ => {
-                flush_tool_group(&mut pending, &mut rows, activities, old_rows, &mut first_changed);
+                flush_tool_group(
+                    &mut pending,
+                    &mut rows,
+                    activities,
+                    old_rows,
+                    &mut first_changed,
+                );
                 let position = rows.len();
                 let (row, reused) = match entry {
                     Entry::Act(index) => single_activity_row(index, activities, old_rows, position),
@@ -528,18 +582,30 @@ fn build_rows(
             }
         }
     }
-    flush_tool_group(&mut pending, &mut rows, activities, old_rows, &mut first_changed);
+    flush_tool_group(
+        &mut pending,
+        &mut rows,
+        activities,
+        old_rows,
+        &mut first_changed,
+    );
 
     (rows, first_changed)
 }
 
-fn message_row(index: usize, messages: &[Message], old_rows: &[Row], position: usize) -> (Row, bool) {
+fn message_row(
+    index: usize,
+    messages: &[Message],
+    old_rows: &[Row],
+    position: usize,
+) -> (Row, bool) {
     let message = &messages[index];
-    if let Some(Row::Message(old)) = old_rows.get(position) {
-        if old.id == message.id && old.streaming == message.streaming && old.text.len() == message.text.len()
-        {
-            return (Row::Message(old.clone()), true);
-        }
+    if let Some(Row::Message(old)) = old_rows.get(position)
+        && old.id == message.id
+        && old.streaming == message.streaming
+        && old.text.len() == message.text.len()
+    {
+        return (Row::Message(old.clone()), true);
     }
     (
         Row::Message(MessageRow {
@@ -552,13 +618,19 @@ fn message_row(index: usize, messages: &[Message], old_rows: &[Row], position: u
     )
 }
 
-fn thought_row(index: usize, messages: &[Message], old_rows: &[Row], position: usize) -> (Row, bool) {
+fn thought_row(
+    index: usize,
+    messages: &[Message],
+    old_rows: &[Row],
+    position: usize,
+) -> (Row, bool) {
     let message = &messages[index];
-    if let Some(Row::Thought(old)) = old_rows.get(position) {
-        if old.id == message.id && old.streaming == message.streaming && old.text.len() == message.text.len()
-        {
-            return (Row::Thought(old.clone()), true);
-        }
+    if let Some(Row::Thought(old)) = old_rows.get(position)
+        && old.id == message.id
+        && old.streaming == message.streaming
+        && old.text.len() == message.text.len()
+    {
+        return (Row::Thought(old.clone()), true);
     }
     (
         Row::Thought(ThoughtRow {
@@ -577,10 +649,11 @@ fn single_activity_row(
     position: usize,
 ) -> (Row, bool) {
     let activity = &activities[index];
-    if let Some(Row::Activities(old)) = old_rows.get(position) {
-        if old.key == activity.id && old.items.len() == 1 {
-            return (Row::Activities(old.clone()), true);
-        }
+    if let Some(Row::Activities(old)) = old_rows.get(position)
+        && old.key == activity.id
+        && old.items.len() == 1
+    {
+        return (Row::Activities(old.clone()), true);
     }
     (
         Row::Activities(ActivityGroupRow {
@@ -606,12 +679,13 @@ fn flush_tool_group(
     }
     let position = rows.len();
     let first_id = activities[pending[0]].id.as_str();
-    if let Some(Row::Activities(old)) = old_rows.get(position) {
-        if old.key == first_id && old.items.len() == pending.len() {
-            rows.push(Row::Activities(old.clone()));
-            pending.clear();
-            return;
-        }
+    if let Some(Row::Activities(old)) = old_rows.get(position)
+        && old.key == first_id
+        && old.items.len() == pending.len()
+    {
+        rows.push(Row::Activities(old.clone()));
+        pending.clear();
+        return;
     }
     if position < old_rows.len() {
         first_changed.get_or_insert(position);
@@ -626,13 +700,18 @@ fn flush_tool_group(
             }
         })
         .collect();
-    rows.push(Row::Activities(ActivityGroupRow { key: first_id.to_owned(), items }));
+    rows.push(Row::Activities(ActivityGroupRow {
+        key: first_id.to_owned(),
+        items,
+    }));
     pending.clear();
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Shadows the `gpui::test` macro brought in by `use super::*`.
+    use core::prelude::v1::test;
 
     fn message(id: &str, role: MessageRole, created_at: &str) -> Message {
         Message {
@@ -663,7 +742,12 @@ mod tests {
             message("m1", MessageRole::User, "2026-01-01T00:00:00.000Z"),
             message("m2", MessageRole::Assistant, "2026-01-01T00:00:03.000Z"),
         ];
-        let activities = vec![activity("a1", ActivityTone::Tool, "tool.completed", "2026-01-01T00:00:01.000Z")];
+        let activities = vec![activity(
+            "a1",
+            ActivityTone::Tool,
+            "tool.completed",
+            "2026-01-01T00:00:01.000Z",
+        )];
         let (rows, _) = build_rows(&messages, &activities, &[]);
         assert_eq!(rows.len(), 3);
         assert!(matches!(&rows[0], Row::Message(m) if m.id == "m1"));
@@ -674,13 +758,30 @@ mod tests {
     #[test]
     fn groups_consecutive_tool_activities() {
         let activities = vec![
-            activity("a1", ActivityTone::Tool, "tool.started", "2026-01-01T00:00:00.000Z"),
-            activity("a2", ActivityTone::Tool, "tool.completed", "2026-01-01T00:00:01.000Z"),
-            activity("a3", ActivityTone::Tool, "tool.completed", "2026-01-01T00:00:02.000Z"),
+            activity(
+                "a1",
+                ActivityTone::Tool,
+                "tool.started",
+                "2026-01-01T00:00:00.000Z",
+            ),
+            activity(
+                "a2",
+                ActivityTone::Tool,
+                "tool.completed",
+                "2026-01-01T00:00:01.000Z",
+            ),
+            activity(
+                "a3",
+                ActivityTone::Tool,
+                "tool.completed",
+                "2026-01-01T00:00:02.000Z",
+            ),
         ];
         let (rows, _) = build_rows(&[], &activities, &[]);
         assert_eq!(rows.len(), 1);
-        let Row::Activities(group) = &rows[0] else { panic!("expected an activity group") };
+        let Row::Activities(group) = &rows[0] else {
+            panic!("expected an activity group")
+        };
         assert_eq!(group.key, "a1");
         assert_eq!(group.items.len(), 3);
     }
@@ -688,9 +789,24 @@ mod tests {
     #[test]
     fn non_tool_activity_breaks_the_group() {
         let activities = vec![
-            activity("a1", ActivityTone::Tool, "tool.started", "2026-01-01T00:00:00.000Z"),
-            activity("a2", ActivityTone::Info, "thread.settled", "2026-01-01T00:00:01.000Z"),
-            activity("a3", ActivityTone::Tool, "tool.completed", "2026-01-01T00:00:02.000Z"),
+            activity(
+                "a1",
+                ActivityTone::Tool,
+                "tool.started",
+                "2026-01-01T00:00:00.000Z",
+            ),
+            activity(
+                "a2",
+                ActivityTone::Info,
+                "thread.settled",
+                "2026-01-01T00:00:01.000Z",
+            ),
+            activity(
+                "a3",
+                ActivityTone::Tool,
+                "tool.completed",
+                "2026-01-01T00:00:02.000Z",
+            ),
         ];
         let (rows, _) = build_rows(&[], &activities, &[]);
         assert_eq!(rows.len(), 3);
@@ -701,18 +817,31 @@ mod tests {
 
     #[test]
     fn reasoning_messages_become_thought_rows() {
-        let messages = vec![message("m1", MessageRole::Reasoning, "2026-01-01T00:00:00.000Z")];
+        let messages = vec![message(
+            "m1",
+            MessageRole::Reasoning,
+            "2026-01-01T00:00:00.000Z",
+        )];
         let (rows, _) = build_rows(&messages, &[], &[]);
         assert!(matches!(&rows[0], Row::Thought(t) if t.id == "m1"));
     }
 
     #[test]
     fn unchanged_rows_reuse_the_previous_shared_string_allocation() {
-        let messages = vec![message("m1", MessageRole::Assistant, "2026-01-01T00:00:00.000Z")];
+        let mut messages = vec![message(
+            "m1",
+            MessageRole::Assistant,
+            "2026-01-01T00:00:00.000Z",
+        )];
+        // Long enough to be heap-allocated: short `SharedString`s are stored
+        // inline, so their pointer moves with the row.
+        messages[0].text = "A reply long enough to live on the heap. ".repeat(4);
         let (first, _) = build_rows(&messages, &[], &[]);
         let (second, first_changed) = build_rows(&messages, &[], &first);
         let Row::Message(a) = &first[0] else { panic!() };
-        let Row::Message(b) = &second[0] else { panic!() };
+        let Row::Message(b) = &second[0] else {
+            panic!()
+        };
         // `SharedString`'s `PartialEq` compares content, but pointer
         // stability is what unblocks `TextView`'s reparse skip, so compare
         // the underlying allocation directly.

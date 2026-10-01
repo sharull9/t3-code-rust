@@ -23,9 +23,10 @@ use crate::ui::{self, SIDEBAR_WIDTH, icon};
 /// Fallback `ModelSelection` for a project with no `defaultModelSelection`
 /// of its own. The web app resolves this from the user's last-used model,
 /// which this client doesn't track (it has no model picker yet), so a new
-/// thread in such a project may need its model changed server-side.
+/// thread in such a project may need its model changed server-side. The model
+/// is upstream's `DEFAULT_MODEL_BY_PROVIDER` for Claude (`contracts/src/model.ts`).
 fn fallback_model_selection() -> serde_json::Value {
-    json!({ "instanceId": "claudeAgent", "model": "claude-sonnet-4-5" })
+    json!({ "instanceId": "claudeAgent", "model": "claude-fable-5-1" })
 }
 
 pub struct T3App {
