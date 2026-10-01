@@ -23,6 +23,30 @@ use tokio_tungstenite::tungstenite::Message;
 use crate::RpcError;
 
 const PING_INTERVAL: Duration = Duration::from_secs(5);
+const READ_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+const CALL_TIMEOUT: Duration = Duration::from_secs(60);
+
+struct TransportTask(tokio::task::JoinHandle<()>);
+
+impl Drop for TransportTask {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+struct PendingRequest {
+    id: String,
+    outgoing: mpsc::UnboundedSender<Value>,
+    pending: PendingMap,
+}
+
+impl Drop for PendingRequest {
+    fn drop(&mut self) {
+        if self.pending.lock().unwrap().remove(&self.id).is_some() {
+            let _ = self.outgoing.send(json!({ "_tag": "Interrupt", "requestId": self.id }));
+        }
+    }
+}
 
 enum Pending {
     Unary(oneshot::Sender<Result<Value, RpcError>>),
@@ -36,6 +60,7 @@ pub struct RpcSession {
     pending: PendingMap,
     next_id: AtomicU64,
     closed: watch::Receiver<Option<String>>,
+    transport: Arc<TransportTask>,
 }
 
 impl RpcSession {
@@ -46,60 +71,63 @@ impl RpcSession {
         let pending: PendingMap = Arc::default();
         let (closed_tx, closed) = watch::channel(None);
 
-        tokio::spawn(async move {
-            while let Some(message) = outgoing_rx.recv().await {
-                if sink.send(Message::Text(message.to_string().into())).await.is_err() {
-                    break;
-                }
-            }
-            let _ = sink.close().await;
-        });
-
-        let pinger = outgoing.clone();
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(PING_INTERVAL);
-            interval.tick().await;
-            loop {
-                interval.tick().await;
-                if pinger.send(json!({ "_tag": "Ping" })).is_err() {
-                    break;
-                }
-            }
-        });
-
         let reader_pending = pending.clone();
         let acks = outgoing.clone();
-        tokio::spawn(async move {
-            let reason = loop {
-                match stream.next().await {
-                    Some(Ok(Message::Text(text))) => {
-                        handle_frame(text.as_str(), &reader_pending, &acks)
+        let pinger = outgoing.clone();
+        let transport = Arc::new(TransportTask(tokio::spawn(async move {
+            let writer = async {
+                while let Some(message) = outgoing_rx.recv().await {
+                    if let Err(error) = sink.send(Message::Text(message.to_string().into())).await {
+                        return format!("socket writer stopped: {error}");
                     }
-                    Some(Ok(Message::Binary(bytes))) => match std::str::from_utf8(&bytes) {
-                        Ok(text) => handle_frame(text, &reader_pending, &acks),
-                        Err(error) => break format!("non-utf8 frame: {error}"),
-                    },
-                    Some(Ok(Message::Close(frame))) => {
-                        break match frame {
-                            Some(frame) => format!("closed ({}): {}", frame.code, frame.reason.as_str()),
-                            None => "closed".into(),
-                        };
+                }
+                "socket writer stopped".to_owned()
+            };
+            let heartbeat = async {
+                let mut interval = tokio::time::interval(PING_INTERVAL);
+                interval.tick().await;
+                loop {
+                    interval.tick().await;
+                    if pinger.send(json!({ "_tag": "Ping" })).is_err() {
+                        return "socket writer stopped".to_owned();
                     }
-                    Some(Ok(_)) => {}
-                    Some(Err(error)) => break error.to_string(),
-                    None => break "connection closed".into(),
                 }
             };
-            fail_all(&reader_pending, RpcError::Disconnected(reason.clone()));
-            let _ = closed_tx.send(Some(reason));
-        });
+            let reader = async {
+                loop {
+                    match tokio::time::timeout(READ_IDLE_TIMEOUT, stream.next()).await {
+                        Err(_) => return "server heartbeat timed out".to_owned(),
+                        Ok(Some(Ok(Message::Text(text)))) => {
+                            handle_frame(text.as_str(), &reader_pending, &acks)
+                        }
+                        Ok(Some(Ok(Message::Binary(bytes)))) => match std::str::from_utf8(&bytes) {
+                            Ok(text) => handle_frame(text, &reader_pending, &acks),
+                            Err(error) => return format!("non-utf8 frame: {error}"),
+                        },
+                        Ok(Some(Ok(Message::Close(frame)))) => {
+                            return match frame {
+                                Some(frame) => {
+                                    format!("closed ({}): {}", frame.code, frame.reason.as_str())
+                                }
+                                None => "closed".into(),
+                            };
+                        }
+                        Ok(Some(Ok(_))) => {}
+                        Ok(Some(Err(error))) => return error.to_string(),
+                        Ok(None) => return "connection closed".to_owned(),
+                    }
+                }
+            };
+            let reason = tokio::select! {
+                reason = writer => reason,
+                reason = reader => reason,
+                reason = heartbeat => reason,
+            };
+            let _ = closed_tx.send(Some(reason.clone()));
+            fail_all(&reader_pending, RpcError::Disconnected(reason));
+        })));
 
-        Ok(Arc::new(Self {
-            outgoing,
-            pending,
-            next_id: AtomicU64::new(0),
-            closed,
-        }))
+        Ok(Arc::new(Self { outgoing, pending, next_id: AtomicU64::new(0), closed, transport }))
     }
 
     /// Resolves with the disconnect reason once the socket is gone.
@@ -119,11 +147,29 @@ impl RpcSession {
         self.closed.borrow().is_some()
     }
 
-    pub async fn call<T: DeserializeOwned>(&self, tag: &str, payload: Value) -> Result<T, RpcError> {
+    pub async fn call<T: DeserializeOwned>(
+        &self,
+        tag: &str,
+        payload: Value,
+    ) -> Result<T, RpcError> {
+        self.call_with_timeout(tag, payload, CALL_TIMEOUT).await
+    }
+
+    /// Override the default deadline for a long-running or interactive unary request.
+    pub async fn call_with_timeout<T: DeserializeOwned>(
+        &self,
+        tag: &str,
+        payload: Value,
+        timeout: Duration,
+    ) -> Result<T, RpcError> {
         let (tx, rx) = oneshot::channel();
-        self.send_request(tag, payload, Pending::Unary(tx))?;
-        let value = rx
+        let id = self.send_request(tag, payload, Pending::Unary(tx))?;
+        // Cancellation and timeout both release the slot and interrupt the server request.
+        let _request =
+            PendingRequest { id, outgoing: self.outgoing.clone(), pending: self.pending.clone() };
+        let value = tokio::time::timeout(timeout, rx)
             .await
+            .map_err(|_| RpcError::Timeout)?
             .map_err(|_| RpcError::Disconnected("request dropped".into()))??;
         serde_json::from_value(value).map_err(|error| RpcError::Decode(error.to_string()))
     }
@@ -141,15 +187,27 @@ impl RpcSession {
             outgoing: self.outgoing.clone(),
             pending: self.pending.clone(),
             _item: std::marker::PhantomData,
+            _transport: self.transport.clone(),
         })
     }
 
-    fn send_request(&self, tag: &str, payload: Value, pending: Pending) -> Result<String, RpcError> {
+    fn send_request(
+        &self,
+        tag: &str,
+        payload: Value,
+        pending: Pending,
+    ) -> Result<String, RpcError> {
         if let Some(reason) = self.closed.borrow().clone() {
             return Err(RpcError::Disconnected(reason));
         }
         let id = self.next_id.fetch_add(1, Ordering::Relaxed).to_string();
-        self.pending.lock().unwrap().insert(id.clone(), pending);
+        let mut map = self.pending.lock().unwrap();
+        // Recheck under the same lock used by disconnect cleanup.
+        if let Some(reason) = self.closed.borrow().clone() {
+            return Err(RpcError::Disconnected(reason));
+        }
+        map.insert(id.clone(), pending);
+        drop(map);
         let request = json!({
             "_tag": "Request",
             "id": id,
@@ -172,6 +230,7 @@ pub struct Subscription<T> {
     outgoing: mpsc::UnboundedSender<Value>,
     pending: PendingMap,
     _item: std::marker::PhantomData<fn() -> T>,
+    _transport: Arc<TransportTask>,
 }
 
 impl<T: DeserializeOwned> Subscription<T> {
@@ -188,9 +247,7 @@ impl<T: DeserializeOwned> Subscription<T> {
 impl<T> Drop for Subscription<T> {
     fn drop(&mut self) {
         if self.pending.lock().unwrap().remove(&self.id).is_some() {
-            let _ = self
-                .outgoing
-                .send(json!({ "_tag": "Interrupt", "requestId": self.id }));
+            let _ = self.outgoing.send(json!({ "_tag": "Interrupt", "requestId": self.id }));
         }
     }
 }
@@ -208,9 +265,9 @@ fn handle_frame(text: &str, pending: &PendingMap, acks: &mpsc::UnboundedSender<V
         return;
     };
     match decoded {
-        Value::Array(messages) => messages
-            .into_iter()
-            .for_each(|message| handle_message(message, pending, acks)),
+        Value::Array(messages) => {
+            messages.into_iter().for_each(|message| handle_message(message, pending, acks))
+        }
         message => handle_message(message, pending, acks),
     }
 }
@@ -348,5 +405,108 @@ mod tests {
         assert_eq!(item_rx.try_recv().unwrap().unwrap(), json!(1));
         assert_eq!(item_rx.try_recv().unwrap().unwrap(), json!(2));
         assert_eq!(ack_rx.try_recv().unwrap(), json!({ "_tag": "Ack", "requestId": "7" }));
+    }
+}
+
+#[cfg(test)]
+mod transport_tests {
+    use super::*;
+    use tokio::net::{TcpListener, TcpStream};
+    use tokio_tungstenite::{WebSocketStream, accept_async};
+
+    async fn connection() -> (Arc<RpcSession>, WebSocketStream<TcpStream>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            accept_async(socket).await.unwrap()
+        });
+        let client = RpcSession::connect(&format!("ws://{address}")).await.unwrap();
+        (client, server.await.unwrap())
+    }
+
+    async fn message(server: &mut WebSocketStream<TcpStream>) -> Value {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let frame = server.next().await.unwrap().unwrap();
+                if let Message::Text(text) = frame {
+                    return serde_json::from_str(&text).unwrap();
+                }
+            }
+        })
+        .await
+        .expect("expected client message")
+    }
+
+    #[tokio::test]
+    async fn cancelled_call_interrupts_server_and_releases_pending_slot() {
+        let (client, mut server) = connection().await;
+        let caller = client.clone();
+        let request =
+            tokio::spawn(async move { caller.call::<Value>("test.wait", json!({})).await });
+        let wire = message(&mut server).await;
+        assert_eq!(wire["_tag"], "Request");
+        request.abort();
+        let _ = request.await;
+        assert!(client.pending.lock().unwrap().is_empty());
+        let interrupt = message(&mut server).await;
+        assert_eq!(interrupt, json!({ "_tag": "Interrupt", "requestId": wire["id"] }));
+    }
+
+    #[tokio::test]
+    async fn deadline_interrupts_an_unanswered_call() {
+        let (client, mut server) = connection().await;
+        let caller = client.clone();
+        let request = tokio::spawn(async move {
+            caller
+                .call_with_timeout::<Value>("test.wait", json!({}), Duration::from_millis(50))
+                .await
+        });
+        let wire = message(&mut server).await;
+        assert!(matches!(request.await.unwrap(), Err(RpcError::Timeout)));
+        assert!(client.pending.lock().unwrap().is_empty());
+        assert_eq!(
+            message(&mut server).await,
+            json!({ "_tag": "Interrupt", "requestId": wire["id"] })
+        );
+    }
+
+    #[tokio::test]
+    async fn last_subscription_keeps_socket_alive_then_releases_it() {
+        let (client, mut server) = connection().await;
+        let subscription = client.subscribe::<Value>("test.stream", json!({})).unwrap();
+        let request = message(&mut server).await;
+        let transport = Arc::downgrade(&client.transport);
+        drop(client);
+        assert!(transport.upgrade().is_some());
+        drop(subscription);
+        assert!(transport.upgrade().is_none());
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while let Some(Ok(frame)) = server.next().await {
+                if let Message::Text(text) = frame {
+                    let wire: Value = serde_json::from_str(&text).unwrap();
+                    assert_eq!(wire, json!({ "_tag": "Interrupt", "requestId": request["id"] }));
+                }
+            }
+        })
+        .await
+        .expect("orphaned socket task stayed alive");
+    }
+
+    #[tokio::test]
+    async fn disconnect_fails_pending_calls_and_rejects_new_requests() {
+        let (client, mut server) = connection().await;
+        let caller = client.clone();
+        let request =
+            tokio::spawn(async move { caller.call::<Value>("test.wait", json!({})).await });
+        let _ = message(&mut server).await;
+        server.close(None).await.unwrap();
+        assert!(matches!(request.await.unwrap(), Err(RpcError::Disconnected(_))));
+        assert!(client.is_closed());
+        assert!(client.pending.lock().unwrap().is_empty());
+        assert!(matches!(
+            client.call::<Value>("test.next", json!({})).await,
+            Err(RpcError::Disconnected(_))
+        ));
     }
 }

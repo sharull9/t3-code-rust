@@ -13,12 +13,14 @@
 //! # Ok(()) }
 //! ```
 
+pub mod attachments;
 pub mod auth;
 mod error;
 pub mod pending;
 pub mod rpc;
 pub mod state;
 pub mod types;
+pub mod workspace;
 
 use std::sync::Arc;
 
@@ -31,6 +33,7 @@ pub use error::{Error, RpcError};
 pub use rpc::{RpcSession, Subscription};
 pub use state::{ShellState, ThreadState, sort_settled_threads};
 pub use types::*;
+pub use workspace::*;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum ThreadAction {
@@ -106,7 +109,12 @@ pub struct Connection {
 impl Connection {
     pub async fn connect(http: &reqwest::Client, credentials: &Credentials) -> Result<Self, Error> {
         let url = auth::websocket_url(http, credentials).await?;
-        let rpc = RpcSession::connect(url.as_str()).await?;
+        let rpc = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            RpcSession::connect(url.as_str()),
+        )
+        .await
+        .map_err(|_| RpcError::Timeout)??;
         Ok(Self { rpc })
     }
 
@@ -162,6 +170,15 @@ impl Connection {
 
     /// Start a turn on an existing thread with a plain-text user message.
     pub async fn send_message(&self, thread: &ThreadShell, text: &str) -> Result<Value, RpcError> {
+        self.send_message_with_attachments(thread, text, &[]).await
+    }
+
+    pub async fn send_message_with_attachments(
+        &self,
+        thread: &ThreadShell,
+        text: &str,
+        attachments: &[attachments::UploadedAttachment],
+    ) -> Result<Value, RpcError> {
         self.dispatch(json!({
             "type": "thread.turn.start",
             "commandId": new_id(),
@@ -170,7 +187,7 @@ impl Connection {
                 "messageId": new_id(),
                 "role": "user",
                 "text": text,
-                "attachments": [],
+                "attachments": attachments,
             },
             "runtimeMode": thread.runtime_mode,
             "interactionMode": thread.interaction_mode,
@@ -297,7 +314,8 @@ mod command_tests {
         let config: ServerConfig = serde_json::from_value(json!({ "providers": [{
             "instanceId": "my-agent", "driver": "codex", "enabled": true, "installed": true,
             "models": [{ "slug": "model-1", "name": "Model one", "isCustom": false, "capabilities": null }]
-        }], "environment": { "id": "ignored" } })).unwrap();
+        }], "environment": { "environmentId": "env-1" } })).unwrap();
+        assert_eq!(config.environment.as_ref().unwrap().environment_id, "env-1");
         assert_eq!(config.providers[0].models[0].id, "model-1");
         assert_eq!(config.providers[0].models[0].label, "Model one");
         assert!(!config.providers[0].requires_new_thread_for_model_change);

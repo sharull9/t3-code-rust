@@ -12,6 +12,9 @@ dirs.workspace = true
 futures.workspace = true
 gpui-kit.workspace = true
 serde_json.workspace = true
+serde.workspace = true
+url.workspace = true
+reqwest.workspace = true
 t3-client.workspace = true
 tokio.workspace = true
 

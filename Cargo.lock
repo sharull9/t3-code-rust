@@ -6756,9 +6756,12 @@ dependencies = [
  "dirs 6.0.0",
  "futures",
  "gpui-kit",
+ "reqwest",
+ "serde",
  "serde_json",
  "t3-client",
  "tokio",
+ "url",
 ]
 
 [[package]]

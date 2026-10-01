@@ -18,9 +18,14 @@ plan, not a claim that the whole desktop app has been ported.
 - Approval cards with provider-supplied choices and warnings, backed by
   `thread.approval.respond`. Resolved and stale requests disappear; retryable
   failures leave the request available.
-- Composer drafts retained during thread switching within the current connection.
-  Drafts clear after an accepted send, and survive rejected sends. They are not
-  yet persisted across application restarts.
+- Composer and question drafts persisted across restarts by server/environment.
+  Drafts clear after an accepted send and survive rejected sends. Saves are
+  debounced on a dedicated disk worker and flushed when the app is released.
+- File uploads with retry/removal controls, server attachment IDs on sends,
+  and message download links. Newly added files survive earlier send acknowledgements.
+- Server-side project folder browsing, file previews, Git status/diffs and branch
+  switching, and terminal commands with streamed output.
+- Live server config updates, provider availability, theme controls and app shortcuts.
 - Duplicate sends blocked while a send is pending or a turn is running.
 - Worktree versus local-checkout labels from server state.
 - Project/thread creation controls disabled while disconnected.
@@ -57,8 +62,12 @@ Three connection approaches:
 
 T3's desktop protocol already supports a reusable private bootstrap credential.
 The existing `crates/t3-client/examples/embedded.rs` demonstrates the launch and
-authentication sequence. This pass documents the production integration; it does
-not change how the application launches its backend.
+authentication sequence. Settings now starts an explicitly selected executable
+with the same private bootstrap, isolated data directory and owned process.
+Credentials remain in memory. Startup waits for readiness, reconnects refresh
+expired credentials, an exited child is restarted, and dropping the backend kills
+its owned child. This path still needs executable discovery/bundling, persisted
+startup preferences and a readable server-log view. Current stderr is discarded.
 
 ## Local backend implementation sequence
 
@@ -101,15 +110,15 @@ between managed and independently owned servers. Use isolated test data.
 2. Thread management: snooze, manual ordering and archived-thread detail previews.
    Rename, archived-thread browsing/restore and model/mode inheritance are implemented.
    Verify inherited modes against provider-specific capabilities.
-3. Composer: attachments and uploads, provider model options, slash commands,
-   persistent per-environment drafts, and keyboard shortcuts. Preserve drafts
-   during failed server switches and correlate pending commands with an environment.
-4. Workspace UI: branch/worktree creation and switching, file/diff panels,
-   editor actions and terminal tabs using existing backend RPCs and streams.
-   A remote environment needs a server-side folder browser rather than the
-   client's native folder picker.
-5. Settings and connections: provider health/authentication, config update
-   subscription, theme/settings parity and multiple environments.
+3. Composer: provider model options and slash commands remain. Uploads, persisted
+   environment-scoped drafts and shortcuts are implemented. Verify live upload/send
+   acceptance and recovery after ambiguous acknowledgements.
+4. Workspace UI: worktree/branch creation, editor integration and full terminal
+   emulation remain. Server-side files/folders, diffs, branch switching and command
+   terminals are implemented with scoped results and terminal streams.
+5. Settings and connections: provider authentication, editable preferences,
+   simultaneous environments and persisted startup/theme settings remain. Config
+   updates, provider status and theme controls are implemented.
 6. Visual acceptance: capture the original desktop and GPUI app at matching sizes,
    compare spacing/typography, and verify resize, focus, menus, scrolling and
    keyboard behavior. Exercise working, idle, failed, approval and empty states.
@@ -127,13 +136,17 @@ Inspected the upstream checkout at `792c7dd1`, dated 2026-09-30. Relevant source
 ## Validation for this pass
 
 - Workspace build and type check passed.
-- 42 tests and one documentation test passed, including approval/question
-  resolution ordering, retryable/stale failures, exact answer values, command
-  fields, offline draft retry and native form interaction.
+- 82 unit/interaction tests and one documentation test passed. They include
+  approval/question ordering, upload retry/removal, stale folder/workspace responses,
+  terminal command/stream/reconnect behavior, disk drafts and environment isolation.
+- A 720x480 native headless window verifies Ctrl+J collapses the sidebar, Ctrl+,
+  opens Settings, Escape closes it, and typing returns to the composer.
 - The read-only `session` example authenticated with the existing saved session,
-  decoded 9 providers and 56 models, and synchronized 21 projects and 305 threads. The archive query decoded 1 project
-  and 2 archived threads.
-  It did not dispatch commands or print credentials/message content.
+  decoded 9 providers and 56 models, and synchronized 21 projects and 313 threads.
+  The archive query decoded 1 project and 1 archived thread. Optional workspace
+  checks decoded server folder browsing, file listing/read, Git status, branch
+  listing and diff preview. It did not send turns, switch branches, launch terminals,
+  upload files, or print credentials/message content.
 - GPUI headless windows verify native clicks, typing, multi-question navigation,
   duplicate-submit prevention, retry, dismissal and text preservation during
   reconnect, plus rename menu navigation, error retry, offline guards, stale archive
@@ -141,3 +154,6 @@ Inspected the upstream checkout at `792c7dd1`, dated 2026-09-30. Relevant source
   reading controls before rebuilding the form.
 - Screen-level visual inspection was unavailable because the Orca desktop
   runtime was not running. Pixel-level equivalence remains unverified.
+
+See the [improvement audit](2026-10-01-improvement-audit.md) for reliability fixes,
+verification and remaining improvements across the app.

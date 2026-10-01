@@ -21,6 +21,20 @@ const MAX_BACKOFF: Duration = Duration::from_secs(30);
 
 pub enum Command {
     Pair(String),
+    StartLocal(PathBuf),
+    RefreshConfig,
+    OpenAsset(t3_client::attachments::UploadedAttachment),
+    SaveDrafts(crate::drafts::DraftStore),
+    UploadAttachment {
+        thread_id: String,
+        request_id: u64,
+        attachment: t3_client::attachments::LocalAttachment,
+    },
+    Workspace {
+        request_id: u64,
+        scope: crate::workspace::WorkspaceScope,
+        request: t3_client::WorkspaceRequest,
+    },
     OpenThread(String),
     CloseThread,
     LoadArchived(String),
@@ -31,6 +45,7 @@ pub enum Command {
     SendMessage {
         thread: ThreadShell,
         text: String,
+        attachments: Vec<t3_client::attachments::UploadedAttachment>,
     },
     Interrupt {
         thread_id: String,
@@ -66,23 +81,94 @@ pub enum Status {
 
 pub enum Event {
     Status(Status),
+    AssetUrl(Result<String, String>),
+    EnvironmentKey {
+        server: String,
+        key: String,
+    },
+    EnvironmentId {
+        server: String,
+        id: String,
+    },
+    Terminal {
+        scope: crate::workspace::WorkspaceScope,
+        item: t3_client::WorkspaceTerminalEvent,
+    },
+    DraftsLoaded(crate::drafts::DraftStore),
+    AttachmentUploaded {
+        thread_id: String,
+        local_id: String,
+        request_id: u64,
+        result: Result<t3_client::attachments::UploadedAttachment, String>,
+    },
+    WorkspaceResult {
+        request_id: u64,
+        scope: crate::workspace::WorkspaceScope,
+        result: Result<t3_client::WorkspaceResponse, String>,
+    },
+    PairFinished(bool),
+    NewThreadFinished {
+        thread_id: String,
+        success: bool,
+    },
     Shell(ShellStreamItem),
-    Thread { thread_id: String, item: ThreadStreamItem },
+    Thread {
+        thread_id: String,
+        item: ThreadStreamItem,
+    },
+    ThreadUnavailable(String),
     Error(String),
     Config(t3_client::ServerConfig),
-    Archived { request_id: String, snapshot: Option<t3_client::ShellSnapshot> },
-    ThreadActionFinished { thread_id: String, action: t3_client::ThreadAction, success: bool },
-    SendFinished { thread_id: String, text: String, success: bool },
+    Archived {
+        request_id: String,
+        snapshot: Option<t3_client::ShellSnapshot>,
+    },
+    ThreadActionFinished {
+        thread_id: String,
+        action: t3_client::ThreadAction,
+        success: bool,
+    },
+    SendFinished {
+        thread_id: String,
+        text: String,
+        success: bool,
+        attachment_ids: Vec<String>,
+    },
 }
 
 pub struct Backend {
     commands: mpsc::UnboundedSender<Command>,
+    draft_writer: Option<
+        std::sync::mpsc::Sender<(crate::drafts::DraftStore, Option<std::sync::mpsc::Sender<()>>)>,
+    >,
 }
 
 impl Backend {
     pub fn spawn() -> (Self, ui_channel::UnboundedReceiver<Event>) {
         let (commands, command_rx) = mpsc::unbounded_channel();
         let (events, event_rx) = ui_channel::unbounded();
+        let (draft_writer, draft_rx) = std::sync::mpsc::channel::<(
+            crate::drafts::DraftStore,
+            Option<std::sync::mpsc::Sender<()>>,
+        )>();
+        let draft_events = events.clone();
+        std::thread::Builder::new()
+            .name("t3-draft-writer".into())
+            .spawn(move || {
+                while let Ok((store, completion)) = draft_rx.recv() {
+                    if let Some(path) = crate::drafts::default_path() {
+                        if let Err(error) = store.save(path) {
+                            let _ = draft_events.unbounded_send(Event::Error(format!(
+                                "Could not save drafts: {error}"
+                            )));
+                        }
+                    }
+                    if let Some(completion) = completion {
+                        let _ = completion.send(());
+                    }
+                }
+            })
+            .expect("failed to start draft writer");
         std::thread::Builder::new()
             .name("t3-backend".into())
             .spawn(move || {
@@ -93,11 +179,32 @@ impl Backend {
                     .block_on(run(command_rx, Emitter(events)));
             })
             .expect("failed to spawn backend thread");
-        (Self { commands }, event_rx)
+        (Self { commands, draft_writer: Some(draft_writer) }, event_rx)
+    }
+
+    #[cfg(test)]
+    pub fn for_test() -> (Self, mpsc::UnboundedReceiver<Command>) {
+        let (commands, receiver) = mpsc::unbounded_channel();
+        (Self { commands, draft_writer: None }, receiver)
     }
 
     pub fn send(&self, command: Command) {
-        let _ = self.commands.send(command);
+        if let Command::SaveDrafts(store) = command {
+            if let Some(writer) = &self.draft_writer {
+                let _ = writer.send((store, None));
+            }
+        } else {
+            let _ = self.commands.send(command);
+        }
+    }
+
+    pub fn flush_drafts(&self, store: crate::drafts::DraftStore) {
+        if let Some(writer) = &self.draft_writer {
+            let (completion, result) = std::sync::mpsc::channel();
+            if writer.send((store, Some(completion))).is_ok() {
+                let _ = result.recv_timeout(Duration::from_secs(3));
+            }
+        }
     }
 }
 
@@ -126,25 +233,93 @@ impl Drop for TaskGuard {
 enum SessionEnd {
     Disconnected(String),
     Repair(String),
+    Local(PathBuf),
     Quit,
 }
 
 async fn run(mut commands: mpsc::UnboundedReceiver<Command>, events: Emitter) {
-    let http = reqwest::Client::new();
+    let http = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(20))
+        .build()
+        .expect("failed to create HTTP client");
+    let store = crate::drafts::default_path().map(crate::drafts::DraftStore::load).transpose();
+    match store {
+        Ok(store) => events.emit(Event::DraftsLoaded(store.unwrap_or_default())),
+        Err(error) => events.error(format!("Could not load saved drafts: {error}")),
+    }
     let mut credentials = load_credentials().filter(|c| !c.is_expired());
     let mut open_thread: Option<String> = None;
     let mut pending_pair: Option<String> = None;
+    let mut pending_local: Option<PathBuf> = None;
+    let mut managed: Option<crate::managed_server::ManagedServer> = None;
+    let mut managed_executable: Option<PathBuf> = None;
     let mut backoff = Duration::from_secs(1);
 
     loop {
+        if let Some(executable) = pending_local.take() {
+            if let Some(previous) = managed.take() {
+                let _ = previous.shutdown().await;
+                credentials = None;
+            }
+            match crate::managed_server::ManagedServer::start(executable.clone(), &http).await {
+                Ok(server) => {
+                    if let Some(previous) = managed.take() {
+                        let _ = previous.shutdown().await;
+                    }
+                    credentials = Some(server.credentials().clone());
+                    events.emit(Event::EnvironmentKey {
+                        server: server.base_url().to_string(),
+                        key: "managed-local".into(),
+                    });
+                    managed = Some(server);
+                    managed_executable = Some(executable);
+                    open_thread = None;
+                    events.emit(Event::PairFinished(true));
+                }
+                Err(error) => {
+                    events.error(format!("Local server failed: {error}"));
+                    events.emit(Event::PairFinished(false));
+                }
+            }
+        }
+        if let Some(server) = &mut managed {
+            match server.try_wait() {
+                Ok(Some(status)) => {
+                    events.error(format!("Local server exited ({status}). Restarting."));
+                    managed = None;
+                    credentials = None;
+                    pending_local = managed_executable.clone();
+                    tokio::time::sleep(backoff).await;
+                    backoff = (backoff * 2).min(MAX_BACKOFF);
+                    continue;
+                }
+                Ok(None) if server.credentials().is_expired() => {
+                    if let Err(error) = server.reauthenticate(&http).await {
+                        events.error(error);
+                    } else {
+                        credentials = Some(server.credentials().clone());
+                    }
+                }
+                _ => {}
+            }
+        }
         if let Some(link) = pending_pair.take() {
             match pair(&http, &link).await {
                 Ok(paired) => {
+                    if let Some(previous) = managed.take() {
+                        let _ = previous.shutdown().await;
+                    }
+                    managed_executable = None;
                     open_thread = None;
                     save_credentials(&paired);
                     credentials = Some(paired);
+                    events.emit(Event::PairFinished(true));
                 }
-                Err(error) => events.error(format!("Pairing failed: {error}")),
+                Err(error) => {
+                    events.error(format!("Pairing failed: {error}"));
+                    events.emit(Event::PairFinished(false));
+                }
             }
         }
 
@@ -152,6 +327,7 @@ async fn run(mut commands: mpsc::UnboundedReceiver<Command>, events: Emitter) {
             events.emit(Event::Status(Status::NeedsPairing));
             match wait_offline(&mut commands, &mut open_thread, None, &events).await {
                 Offline::Pair(link) => pending_pair = Some(link),
+                Offline::Local(path) => pending_local = Some(path),
                 Offline::Quit => return,
                 Offline::Elapsed => {}
             }
@@ -163,17 +339,52 @@ async fn run(mut commands: mpsc::UnboundedReceiver<Command>, events: Emitter) {
         let reason = match Connection::connect(&http, &current).await {
             Ok(connection) => {
                 backoff = Duration::from_secs(1);
+                if let Ok(config) = connection.server_config().await {
+                    if let Some(environment) = &config.environment {
+                        events.emit(Event::EnvironmentId {
+                            server: server.clone(),
+                            id: environment.environment_id.clone(),
+                        });
+                    }
+                    events.emit(Event::Config(config));
+                }
                 events.emit(Event::Status(Status::Connected(server.clone())));
-                match run_session(&connection, &mut commands, &events, &mut open_thread).await {
+                match run_session(
+                    &connection,
+                    &http,
+                    &current.base_url,
+                    &mut commands,
+                    &events,
+                    &mut open_thread,
+                )
+                .await
+                {
                     SessionEnd::Disconnected(reason) => reason,
                     SessionEnd::Repair(link) => {
                         pending_pair = Some(link);
+                        continue;
+                    }
+                    SessionEnd::Local(path) => {
+                        pending_local = Some(path);
                         continue;
                     }
                     SessionEnd::Quit => return,
                 }
             }
             Err(error) if error.is_unauthorized() => {
+                if let Some(server) = &mut managed {
+                    match server.reauthenticate(&http).await {
+                        Ok(()) => {
+                            credentials = Some(server.credentials().clone());
+                            continue;
+                        }
+                        Err(error) => {
+                            events.error(error);
+                            managed = None;
+                            managed_executable = None;
+                        }
+                    }
+                }
                 clear_credentials();
                 credentials = None;
                 events.error("The server rejected this client. Pair again.");
@@ -185,6 +396,7 @@ async fn run(mut commands: mpsc::UnboundedReceiver<Command>, events: Emitter) {
         events.emit(Event::Status(Status::Reconnecting { server, reason }));
         match wait_offline(&mut commands, &mut open_thread, Some(backoff), &events).await {
             Offline::Pair(link) => pending_pair = Some(link),
+            Offline::Local(path) => pending_local = Some(path),
             Offline::Quit => return,
             Offline::Elapsed => {}
         }
@@ -194,6 +406,7 @@ async fn run(mut commands: mpsc::UnboundedReceiver<Command>, events: Emitter) {
 
 enum Offline {
     Pair(String),
+    Local(PathBuf),
     Quit,
     Elapsed,
 }
@@ -218,26 +431,34 @@ async fn wait_offline(
             command = commands.recv() => match command {
                 None => return Offline::Quit,
                 Some(Command::Pair(link)) => return Offline::Pair(link),
+                Some(Command::StartLocal(path)) => return Offline::Local(path),
+                Some(Command::RefreshConfig | Command::OpenAsset(_)) => events.error("Reconnect to access the server."),
+                Some(Command::SaveDrafts(store)) => save_drafts(store, &events).await,
+                Some(Command::UploadAttachment { thread_id, request_id, attachment }) => events.emit(Event::AttachmentUploaded { thread_id, local_id: attachment.id, request_id, result: Err("Reconnect to upload this attachment.".into()) }),
+                Some(Command::Workspace { request_id, scope, .. }) => events.emit(Event::WorkspaceResult { request_id, scope, result: Err("Reconnect to use the workspace.".into()) }),
                 Some(Command::OpenThread(thread_id)) => *open_thread = Some(thread_id),
                 Some(Command::CloseThread) => *open_thread = None,
                 Some(Command::LoadArchived(request_id)) => {
                     events.emit(Event::Archived { request_id, snapshot: None });
                     events.error("Reconnect before browsing archived threads.");
                 }
-                Some(Command::SendMessage { thread, text }) => {
+                Some(Command::SendMessage { thread, text, attachments }) => {
                     events.error("Cannot send while disconnected. Your draft has been kept.");
-                    events.emit(Event::SendFinished { thread_id: thread.id, text, success: false });
+                    events.emit(Event::SendFinished { thread_id: thread.id, text, success: false, attachment_ids: attachments.iter().map(|a| a.id.clone()).collect() });
                 }
                 Some(Command::ThreadAction { thread_id, action }) => {
                     events.error("Reconnect before changing this thread or project.");
                     events.emit(Event::ThreadActionFinished { thread_id, action, success: false });
                 }
+                Some(Command::CreateThread { id, .. }) => {
+                    events.error("Reconnect before creating a thread.");
+                    events.emit(Event::NewThreadFinished { thread_id: id, success: false });
+                }
                 // These all need a live server; the UI keeps the relevant
                 // affordances disabled while offline.
                 Some(
                     Command::Interrupt { .. }
-                    | Command::CreateProject { .. }
-                    | Command::CreateThread { .. },
+                    | Command::CreateProject { .. },
                 ) => events.error("Reconnect before changing this thread or project."),
             },
         }
@@ -246,6 +467,8 @@ async fn wait_offline(
 
 async fn run_session(
     connection: &Connection,
+    http: &reqwest::Client,
+    base_url: &url::Url,
     commands: &mut mpsc::UnboundedReceiver<Command>,
     events: &Emitter,
     open_thread: &mut Option<String>,
@@ -259,30 +482,117 @@ async fn run_session(
                 config_events.error(format!("Model list unavailable: {}", describe(&error)))
             }
         }
+        if let Ok(mut updates) = config_connection
+            .rpc()
+            .subscribe::<Value>("subscribeServerConfig", serde_json::json!({}))
+        {
+            while let Some(Ok(value)) = updates.next().await {
+                let config = match value["type"].as_str() {
+                    Some("snapshot") => value.get("config"),
+                    Some("providerStatuses") => value.get("payload"),
+                    _ => None,
+                };
+                if let Some(config) = config {
+                    if let Ok(config) =
+                        serde_json::from_value::<t3_client::ServerConfig>(config.clone())
+                    {
+                        config_events.emit(Event::Config(config));
+                    }
+                }
+            }
+        }
     }));
-    let _shell = TaskGuard(tokio::spawn(forward_shell(connection.clone(), events.clone())));
+    let shell = forward_shell(connection.clone(), events.clone());
+    tokio::pin!(shell);
+    let mut operations = tokio::task::JoinSet::new();
+    let mut terminals: std::collections::HashMap<(String, String), TaskGuard> =
+        std::collections::HashMap::new();
     let mut _thread =
         open_thread.clone().map(|thread_id| spawn_thread(connection, thread_id, events));
 
     loop {
         tokio::select! {
             reason = connection.closed() => return SessionEnd::Disconnected(reason),
+            reason = &mut shell => return SessionEnd::Disconnected(reason),
+            Some(result) = operations.join_next(), if !operations.is_empty() => {
+                if let Err(error) = result { events.error(format!("Backend request stopped: {error}")); }
+            }
             command = commands.recv() => match command {
                 None => return SessionEnd::Quit,
                 Some(Command::Pair(link)) => return SessionEnd::Repair(link),
+                Some(Command::StartLocal(path)) => return SessionEnd::Local(path),
+                Some(Command::RefreshConfig) => {
+                    let connection = connection.clone(); let events = events.clone();
+                    operations.spawn(async move { match connection.server_config().await { Ok(config) => events.emit(Event::Config(config)), Err(error) => events.error(describe(&error)) } });
+                }
+                Some(Command::OpenAsset(attachment)) => {
+                    let connection = connection.clone(); let events = events.clone(); let base_url = base_url.clone();
+                    operations.spawn(async move {
+                        let result = connection.rpc().call::<Value>("assets.createUrl", serde_json::json!({ "resource": { "_tag": "attachment", "attachmentId": attachment.id, "fileName": attachment.name, "mimeType": attachment.mime_type } })).await;
+                        let result = result.map_err(|error| describe(&error)).and_then(|value| {
+                            let relative = value["relativeUrl"].as_str().ok_or_else(|| "Asset URL is missing".to_owned())?;
+                            let url = base_url.join(relative).map_err(|e| e.to_string())?;
+                            if url.origin() != base_url.origin() { return Err("Asset URL points outside this server".into()); }
+                            Ok(url.to_string())
+                        });
+                        events.emit(Event::AssetUrl(result));
+                    });
+                }
+                Some(Command::SaveDrafts(store)) => save_drafts(store, &events).await,
+                Some(Command::UploadAttachment { thread_id, request_id, attachment }) => {
+                    let connection = connection.clone(); let http = http.clone(); let base_url = base_url.clone(); let events = events.clone();
+                    operations.spawn(async move {
+                        let local_id = attachment.id.clone();
+                        let result = t3_client::attachments::upload_attachment(&connection, &http, &base_url, &attachment).await.map_err(|e| e.to_string());
+                        events.emit(Event::AttachmentUploaded { thread_id, local_id, request_id, result });
+                    });
+                }
+                Some(Command::Workspace { request_id, scope, request }) => {
+                    let connection = connection.clone(); let events = events.clone();
+                    if let t3_client::WorkspaceRequest::OpenTerminal { thread_id, terminal_id, cwd } | t3_client::WorkspaceRequest::RestartTerminal { thread_id, terminal_id, cwd } = &request {
+                        let key = (thread_id.clone(), terminal_id.clone()); let thread_id = thread_id.clone(); let terminal_id = terminal_id.clone(); let cwd = cwd.clone();
+                        terminals.insert(key,TaskGuard(tokio::spawn(async move {
+                            let result = request.execute(&connection).await.map_err(|e| describe(&e));
+                            let success = result.is_ok();
+                            events.emit(Event::WorkspaceResult { request_id, scope: scope.clone(), result });
+                            if !success { return; }
+                            match connection.subscribe_terminal(&thread_id,&terminal_id,Some(&cwd)) {
+                                Ok(mut stream) => {
+                                    let mut reason = "Terminal output stream ended. Restart to reconnect.".to_owned();
+                                    while let Some(item) = stream.next().await {
+                                        match item {
+                                            Ok(item) => events.emit(Event::Terminal { scope:scope.clone(), item }),
+                                            Err(error) => { reason = format!("Terminal output stream ended: {}", describe(&error)); break; }
+                                        }
+                                    }
+                                    events.emit(Event::Terminal { scope, item: t3_client::WorkspaceTerminalEvent::Error { thread_id, terminal_id, message: reason } });
+                                }
+                                Err(error) => events.emit(Event::Terminal { scope, item: t3_client::WorkspaceTerminalEvent::Error { thread_id, terminal_id, message: describe(&error) } }),
+                            }
+                        })));
+                    } else {
+                        if let t3_client::WorkspaceRequest::CloseTerminal { thread_id, terminal_id } = &request {
+                            if let Some(terminal_id) = terminal_id { terminals.remove(&(thread_id.clone(),terminal_id.clone())); }
+                            else { terminals.retain(|(id,_),_| id != thread_id); }
+                        }
+                        operations.spawn(async move { let result = request.execute(&connection).await.map_err(|e| describe(&e)); events.emit(Event::WorkspaceResult { request_id, scope, result }); });
+                    }
+                }
                 Some(Command::OpenThread(thread_id)) => {
+                    terminals.clear();
                     *open_thread = Some(thread_id.clone());
                     // Replacing the guard interrupts the previous thread's stream.
                     _thread = Some(spawn_thread(connection, thread_id, events));
                 }
                 Some(Command::CloseThread) => {
+                    terminals.clear();
                     *open_thread = None;
                     _thread = None;
                 }
                 Some(Command::LoadArchived(request_id)) => {
                     let connection = connection.clone();
                     let events = events.clone();
-                    tokio::spawn(async move {
+                    operations.spawn(async move {
                         let snapshot = match connection.archived_shell().await {
                             Ok(snapshot) => Some(snapshot),
                             Err(error) => {
@@ -296,7 +606,7 @@ async fn run_session(
                 Some(Command::ThreadAction { thread_id, action }) => {
                     let connection = connection.clone();
                     let events = events.clone();
-                    tokio::spawn(async move {
+                    operations.spawn(async move {
                         let result = connection.dispatch(action.command(&thread_id)).await;
                         let success = result.is_ok();
                         if let Err(error) = result {
@@ -305,22 +615,22 @@ async fn run_session(
                         events.emit(Event::ThreadActionFinished { thread_id, action, success });
                     });
                 }
-                Some(Command::SendMessage { thread, text }) => {
+                Some(Command::SendMessage { thread, text, attachments }) => {
                     let connection = connection.clone();
                     let events = events.clone();
-                    tokio::spawn(async move {
-                        let result = connection.send_message(&thread, &text).await;
+                    operations.spawn(async move {
+                        let result = connection.send_message_with_attachments(&thread, &text, &attachments).await;
                         let success = result.is_ok();
                         if let Err(error) = result {
                             events.error(format!("Send failed: {}", describe(&error)));
                         }
-                        events.emit(Event::SendFinished { thread_id: thread.id, text, success });
+                        events.emit(Event::SendFinished { thread_id: thread.id, text, success, attachment_ids: attachments.iter().map(|a| a.id.clone()).collect() });
                     });
                 }
                 Some(Command::Interrupt { thread_id, turn_id }) => {
                     let connection = connection.clone();
                     let events = events.clone();
-                    tokio::spawn(async move {
+                    operations.spawn(async move {
                         if let Err(error) = connection.interrupt(&thread_id, turn_id.as_deref()).await {
                             events.error(format!("Stop failed: {}", describe(&error)));
                         }
@@ -329,7 +639,7 @@ async fn run_session(
                 Some(Command::CreateProject { id, title, workspace_root }) => {
                     let connection = connection.clone();
                     let events = events.clone();
-                    tokio::spawn(async move {
+                    operations.spawn(async move {
                         if let Err(error) = connection.create_project(&id, &title, &workspace_root).await
                         {
                             events.error(format!("Add project failed: {}", describe(&error)));
@@ -339,12 +649,11 @@ async fn run_session(
                 Some(Command::CreateThread { id, project_id, title, model_selection, runtime_mode, interaction_mode }) => {
                     let connection = connection.clone();
                     let events = events.clone();
-                    tokio::spawn(async move {
-                        if let Err(error) =
-                            connection.create_thread(&id, &project_id, &title, model_selection, &runtime_mode, &interaction_mode).await
-                        {
-                            events.error(format!("New thread failed: {}", describe(&error)));
-                        }
+                    operations.spawn(async move {
+                        let result = connection.create_thread(&id, &project_id, &title, model_selection, &runtime_mode, &interaction_mode).await;
+                        let success = result.is_ok();
+                        if let Err(error) = result { events.error(format!("New thread failed: {}", describe(&error))); }
+                        events.emit(Event::NewThreadFinished { thread_id: id, success });
                     });
                 }
             },
@@ -352,18 +661,19 @@ async fn run_session(
     }
 }
 
-async fn forward_shell(connection: Connection, events: Emitter) {
+async fn forward_shell(connection: Connection, events: Emitter) -> String {
     let mut stream = match connection.subscribe_shell() {
         Ok(stream) => stream,
-        Err(error) => return events.error(format!("Shell subscription failed: {error}")),
+        Err(error) => return format!("Shell subscription failed: {error}"),
     };
     while let Some(item) = stream.next().await {
         match item {
             Ok(item) => events.emit(Event::Shell(item)),
             Err(RpcError::Decode(error)) => eprintln!("skipping shell item: {error}"),
-            Err(error) => return events.error(format!("Shell stream ended: {}", describe(&error))),
+            Err(error) => return format!("Shell stream ended: {}", describe(&error)),
         }
     }
+    "Shell stream ended".into()
 }
 
 fn spawn_thread(connection: &Connection, thread_id: String, events: &Emitter) -> TaskGuard {
@@ -375,18 +685,37 @@ fn spawn_thread(connection: &Connection, thread_id: String, events: &Emitter) ->
         // `turnLimit` means to the server).
         let mut stream = match connection.subscribe_thread(&thread_id, None) {
             Ok(stream) => stream,
-            Err(error) => return events.error(format!("Thread subscription failed: {error}")),
+            Err(error) => {
+                events.error(format!("Thread subscription failed: {error}"));
+                events.emit(Event::ThreadUnavailable(thread_id));
+                return;
+            }
         };
         while let Some(item) = stream.next().await {
             match item {
                 Ok(item) => events.emit(Event::Thread { thread_id: thread_id.clone(), item }),
                 Err(RpcError::Decode(error)) => eprintln!("skipping thread item: {error}"),
                 Err(error) => {
-                    return events.error(format!("Thread stream ended: {}", describe(&error)));
+                    events.error(format!("Thread stream ended: {}", describe(&error)));
+                    events.emit(Event::ThreadUnavailable(thread_id));
+                    return;
                 }
             }
         }
+        events.error("Thread stream ended. Select the thread again to retry.");
+        events.emit(Event::ThreadUnavailable(thread_id));
     }))
+}
+
+async fn save_drafts(store: crate::drafts::DraftStore, events: &Emitter) {
+    let Some(path) = crate::drafts::default_path() else {
+        return;
+    };
+    match tokio::task::spawn_blocking(move || store.save(path)).await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => events.error(format!("Could not save drafts: {error}")),
+        Err(error) => events.error(format!("Draft save stopped: {error}")),
+    }
 }
 
 async fn pair(http: &reqwest::Client, link: &str) -> Result<Credentials, t3_client::Error> {
@@ -442,13 +771,44 @@ mod tests {
     use futures::StreamExt as _;
 
     #[tokio::test]
+    async fn offline_thread_creation_reports_failure_and_releases_waiter() {
+        let (commands, mut receiver) = mpsc::unbounded_channel();
+        let (events, mut output) = ui_channel::unbounded();
+        commands
+            .send(Command::CreateThread {
+                id: "new-thread".into(),
+                project_id: "project".into(),
+                title: "New thread".into(),
+                model_selection: serde_json::json!({}),
+                runtime_mode: "full-access".into(),
+                interaction_mode: "default".into(),
+            })
+            .unwrap();
+        drop(commands);
+        assert!(matches!(
+            wait_offline(&mut receiver, &mut None, None, &Emitter(events)).await,
+            Offline::Quit
+        ));
+        assert!(matches!(output.next().await, Some(Event::Error(_))));
+        assert!(
+            matches!(output.next().await, Some(Event::NewThreadFinished { thread_id, success: false }) if thread_id == "new-thread")
+        );
+    }
+
+    #[tokio::test]
     async fn offline_send_returns_failure_so_composer_can_retry() {
         let (commands, mut command_rx) = mpsc::unbounded_channel();
         let (events, mut event_rx) = ui_channel::unbounded();
         let thread: ThreadShell = serde_json::from_value(serde_json::json!({
             "id": "thread-1", "projectId": "project-1", "title": "Test", "runtimeMode": "full-access"
         })).unwrap();
-        commands.send(Command::SendMessage { thread, text: "Keep this draft".into() }).unwrap();
+        commands
+            .send(Command::SendMessage {
+                thread,
+                text: "Keep this draft".into(),
+                attachments: vec![],
+            })
+            .unwrap();
         drop(commands);
         let mut open_thread = None;
         assert!(matches!(
@@ -457,7 +817,7 @@ mod tests {
         ));
         assert!(matches!(event_rx.next().await, Some(Event::Error(_))));
         assert!(
-            matches!(event_rx.next().await, Some(Event::SendFinished { thread_id, text, success: false }) if thread_id == "thread-1" && text == "Keep this draft")
+            matches!(event_rx.next().await, Some(Event::SendFinished { thread_id, text, success: false, .. }) if thread_id == "thread-1" && text == "Keep this draft")
         );
     }
 

@@ -114,7 +114,15 @@ pub struct ThreadShell {
 #[derive(Debug, Clone, Deserialize)]
 pub struct ServerConfig {
     #[serde(default)]
+    pub environment: Option<ServerEnvironment>,
+    #[serde(default)]
     pub providers: Vec<ServerProvider>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ServerEnvironment {
+    pub environment_id: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -227,6 +235,8 @@ pub enum MessageRole {
 #[serde(rename_all = "camelCase")]
 pub struct Message {
     pub id: String,
+    #[serde(default)]
+    pub attachments: Vec<crate::attachments::UploadedAttachment>,
     pub role: MessageRole,
     pub text: String,
     #[serde(default)]
@@ -316,6 +326,8 @@ pub enum ThreadStreamItem {
 #[serde(rename_all = "camelCase")]
 pub struct MessageSentPayload {
     pub message_id: String,
+    #[serde(default)]
+    pub attachments: Vec<crate::attachments::UploadedAttachment>,
     pub role: MessageRole,
     pub text: String,
     #[serde(default)]

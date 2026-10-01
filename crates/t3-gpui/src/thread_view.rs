@@ -15,13 +15,18 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use t3_client::{Session, ThreadShell, ThreadStreamItem};
 
-use crate::transcript::Transcript;
+use crate::attachments::{AttachmentPanel, AttachmentPanelEvent};
+use crate::transcript::{Transcript, TranscriptEvent};
 use crate::ui::{self, CONTENT_WIDTH};
 use crate::user_input::{UserInputEvent, UserInputPanel};
 
 pub enum ThreadViewEvent {
-    Send(String),
+    Send(String, Vec<t3_client::attachments::UploadedAttachment>),
+    DraftChanged(String),
+    QuestionDraftsChanged(crate::user_input::QuestionDrafts),
+    Attachment(AttachmentPanelEvent),
     Stop,
+    OpenAttachment(t3_client::attachments::UploadedAttachment),
     Update(t3_client::ThreadAction),
 }
 
@@ -38,6 +43,7 @@ pub struct ThreadView {
     approvals: Vec<t3_client::pending::PendingApproval>,
     pending_update: Option<t3_client::ThreadAction>,
     user_input: Entity<UserInputPanel>,
+    attachments: Entity<AttachmentPanel>,
     thread_loaded: bool,
     _subscriptions: Vec<Subscription>,
 }
@@ -45,9 +51,21 @@ pub struct ThreadView {
 impl EventEmitter<ThreadViewEvent> for ThreadView {}
 
 impl ThreadView {
+    #[cfg(test)]
     pub fn new(
         thread_id: String,
         user_input: Entity<UserInputPanel>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let attachments = cx.new(AttachmentPanel::new);
+        Self::new_with_attachments(thread_id, user_input, attachments, window, cx)
+    }
+
+    pub fn new_with_attachments(
+        thread_id: String,
+        user_input: Entity<UserInputPanel>,
+        attachments: Entity<AttachmentPanel>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -60,8 +78,13 @@ impl ThreadView {
         });
         let mut subscriptions =
             vec![cx.subscribe_in(&composer, window, |this, _, event: &InputEvent, window, cx| {
-                if let InputEvent::PressEnter { shift: false, .. } = event {
-                    this.submit(window, cx);
+                match event {
+                    InputEvent::PressEnter { shift: false, .. } => this.submit(window, cx),
+                    InputEvent::Change => {
+                        cx.emit(ThreadViewEvent::DraftChanged(this.draft(cx)));
+                        cx.notify();
+                    }
+                    _ => {}
                 }
             })];
         user_input.update(cx, |panel, cx| panel.set_connected(false, cx));
@@ -69,6 +92,9 @@ impl ThreadView {
             &user_input,
             window,
             |this, _, event: &UserInputEvent, window, cx| match event {
+                UserInputEvent::DraftChanged(drafts) => {
+                    cx.emit(ThreadViewEvent::QuestionDraftsChanged(drafts.clone()))
+                }
                 UserInputEvent::Respond(action) => cx.emit(ThreadViewEvent::Update(action.clone())),
                 UserInputEvent::DisplacedText(text) => {
                     let draft = this.draft(cx);
@@ -81,6 +107,14 @@ impl ThreadView {
                 }
             },
         ));
+        subscriptions.push(cx.subscribe(&transcript, |_, _, event: &TranscriptEvent, cx| {
+            let TranscriptEvent::OpenAttachment(attachment) = event;
+            cx.emit(ThreadViewEvent::OpenAttachment(attachment.clone()));
+        }));
+        subscriptions.push(cx.subscribe(&attachments, |_, _, event: &AttachmentPanelEvent, cx| {
+            cx.emit(ThreadViewEvent::Attachment(event.clone()))
+        }));
+        subscriptions.push(cx.observe(&attachments, |_, _, cx| cx.notify()));
         composer.update(cx, |state, cx| state.focus(window, cx));
 
         Self {
@@ -94,6 +128,7 @@ impl ThreadView {
             approvals: Vec::new(),
             pending_update: None,
             user_input,
+            attachments,
             thread_loaded: false,
             _subscriptions: subscriptions,
         }
@@ -101,6 +136,14 @@ impl ThreadView {
 
     pub fn thread_id(&self) -> &str {
         &self.thread_id
+    }
+
+    pub fn is_ready(&self) -> bool {
+        self.connected && self.thread_loaded
+    }
+
+    pub fn focus_composer(&self, window: &mut Window, cx: &mut Context<Self>) {
+        self.composer.update(cx, |composer, cx| composer.focus(window, cx));
     }
 
     pub fn draft(&self, cx: &App) -> String {
@@ -198,6 +241,10 @@ impl ThreadView {
     pub fn set_connected(&mut self, connected: bool, cx: &mut Context<Self>) {
         self.user_input
             .update(cx, |panel, cx| panel.set_connected(connected && self.thread_loaded, cx));
+        if !connected {
+            self.sending = false;
+            self.pending_update = None;
+        }
         if self.connected != connected {
             self.connected = connected;
             cx.notify();
@@ -227,6 +274,7 @@ impl ThreadView {
                 cx.notify();
             }
             self.thread_loaded = true;
+            self.attachments.update(cx, |panel, cx| panel.set_connected(self.connected, cx));
         }
         if self.approvals != approvals || working != self.is_working(cx) {
             self.approvals = approvals;
@@ -243,8 +291,10 @@ impl ThreadView {
 
     fn submit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let text = self.composer.read(cx).value().trim().to_owned();
-        if text.is_empty()
+        if (text.is_empty() && self.attachments.read(cx).uploaded_attachments().is_empty())
+            || !self.attachments.read(cx).can_send()
             || !self.connected
+            || !self.thread_loaded
             || self.sending
             || self.pending_update.is_some()
             || (self.thread_loaded && self.user_input.read(cx).has_requests())
@@ -255,7 +305,7 @@ impl ThreadView {
         let _ = window;
         self.sending = true;
         cx.notify();
-        cx.emit(ThreadViewEvent::Send(text));
+        cx.emit(ThreadViewEvent::Send(text, self.attachments.read(cx).uploaded_attachments()));
     }
 }
 
@@ -284,12 +334,14 @@ impl Render for ThreadView {
         let providers = self.providers.clone();
         let view = cx.entity().downgrade();
         let settings_disabled = !self.connected
+            || !self.thread_loaded
             || working
             || self.sending
             || self.pending_update.is_some()
             || shell.is_none();
         let model_picker = Button::new("model-picker").ghost().small()
-            .label(model_label).icon(Icon::new(IconName::Bot).xsmall())
+            .label(model_label.clone()).tooltip(model_label).max_w(px(220.))
+            .icon(Icon::new(IconName::Bot).xsmall())
             .disabled(settings_disabled).dropdown_menu(move |mut menu, _, _| {
                 for provider in &providers {
                     if !provider.enabled || !provider.installed || provider.availability.as_deref() == Some("unavailable") { continue; }
@@ -319,38 +371,84 @@ impl Render for ThreadView {
         let transcript =
             self.transcript.clone().cached(StyleRefinement::default().flex_1().min_h_0());
 
-        let action = div()
-            .id(if working { "stop" } else { "send" })
-            .flex()
-            .flex_shrink_0()
-            .items_center()
-            .justify_center()
+        let action = Button::new(if working { "stop" } else { "send" })
+            .ghost()
+            .small()
             .size_8()
             .rounded_full()
+            .icon(Icon::new(if working { IconName::Square } else { IconName::ArrowUp }).small())
+            .tooltip(if working { "Stop response" } else { "Send message" })
             .text_color(theme.primary_foreground)
-            .map(|button| {
-                if working {
-                    button.bg(theme.danger).child(Icon::new(IconName::Square).xsmall()).on_click(
-                        cx.listener(|this, _, _, cx| {
-                            if this.connected {
-                                cx.emit(ThreadViewEvent::Stop);
-                            }
-                        }),
-                    )
-                } else {
-                    button
-                        .bg(theme.primary)
-                        .hover(|style| style.bg(theme.primary_hover))
-                        .child(Icon::new(IconName::ArrowUp).small())
-                        .on_click(cx.listener(|this, _, window, cx| this.submit(window, cx)))
-                }
-            })
-            .when(
+            .bg(if working { theme.danger } else { theme.primary })
+            .disabled(
                 !self.connected
                     || (!working
-                        && (self.sending || has_user_input || self.pending_update.is_some())),
-                |button| button.opacity(0.4),
-            );
+                        && (!self.thread_loaded
+                            || self.sending
+                            || has_user_input
+                            || self.pending_update.is_some()
+                            || !self.attachments.read(cx).can_send()
+                            || (self.draft(cx).trim().is_empty()
+                                && self.attachments.read(cx).uploaded_attachments().is_empty()))),
+            )
+            .on_click(cx.listener(move |this, _, window, cx| {
+                if working {
+                    if this.connected {
+                        cx.emit(ThreadViewEvent::Stop);
+                    }
+                } else {
+                    this.submit(window, cx);
+                }
+            }));
+
+        let attach_files = Button::new("attach-files")
+            .ghost()
+            .small()
+            .icon(Icon::new(IconName::Paperclip).xsmall())
+            .accessibility_label("Attach files")
+            .tooltip("Attach files")
+            .disabled(!self.connected || !self.thread_loaded)
+            .on_click(cx.listener(|_, _, _, cx| {
+                cx.emit(ThreadViewEvent::Attachment(AttachmentPanelEvent::ChooseFiles));
+            }));
+        let has_attachments = !self.attachments.read(cx).is_empty();
+        let mode_controls = h_flex()
+            .flex_1()
+            .min_w_0()
+            .flex_wrap()
+            .items_center()
+            .gap_1()
+            .child(attach_files)
+            .child(separator(cx))
+            .child(model_picker)
+            .child(separator(cx))
+            .child(self.mode_picker(
+                "runtime-picker",
+                runtime_icon,
+                runtime_label,
+                shell.map_or("", |t| t.runtime_mode.as_str()),
+                true,
+                settings_disabled,
+                cx,
+            ))
+            .child(separator(cx))
+            .child(self.mode_picker(
+                "interaction-picker",
+                mode_icon,
+                mode_label,
+                shell.map_or("", |t| t.interaction_mode.as_str()),
+                false,
+                settings_disabled,
+                cx,
+            ));
+        let trailing_controls = h_flex()
+            .flex_none()
+            .items_center()
+            .gap_1()
+            .when(working, |row| {
+                row.child(div().mr_1().child(ui::loader("composer-working", Size::Small)))
+            })
+            .child(action);
 
         let composer = v_flex()
             .w_full()
@@ -359,38 +457,28 @@ impl Render for ThreadView {
             .border_1()
             .border_color(theme.border)
             .bg(theme.secondary)
-            .child(div().px_2().pt_2().child(Textarea::new(&self.composer).appearance(false)))
+            .when(has_attachments, |composer| {
+                composer.child(div().px_3().pt_2().child(self.attachments.clone()))
+            })
+            .child(
+                div().px_3().pt_1().child(
+                    Textarea::new(&self.composer)
+                        .accessibility_id("composer")
+                        .aria_label("Message")
+                        .appearance(false),
+                ),
+            )
             .child(
                 h_flex()
+                    .w_full()
+                    .flex_wrap()
+                    .items_center()
+                    .justify_between()
                     .gap_1()
-                    .px_2()
+                    .px_3()
                     .pb_2()
-                    .child(model_picker)
-                    .child(separator(cx))
-                    .child(self.mode_picker(
-                        "runtime-picker",
-                        runtime_icon,
-                        runtime_label,
-                        shell.map_or("", |t| t.runtime_mode.as_str()),
-                        true,
-                        settings_disabled,
-                        cx,
-                    ))
-                    .child(separator(cx))
-                    .child(self.mode_picker(
-                        "interaction-picker",
-                        mode_icon,
-                        mode_label,
-                        shell.map_or("", |t| t.interaction_mode.as_str()),
-                        false,
-                        settings_disabled,
-                        cx,
-                    ))
-                    .child(div().flex_1())
-                    .when(working, |row| {
-                        row.child(div().mr_1().child(ui::loader("composer-working", Size::Small)))
-                    })
-                    .child(action),
+                    .child(mode_controls)
+                    .child(trailing_controls),
             );
 
         let footer = h_flex()
@@ -567,5 +655,170 @@ fn session_render_state_eq(a: Option<&Session>, b: Option<&Session>) -> bool {
                 && a.last_error == b.last_error
         }
         _ => false,
+    }
+}
+
+#[cfg(test)]
+mod composer_tests {
+    use super::*;
+    use core::prelude::v1::test;
+    use gpui_kit::test::TestWindowExt as _;
+    use serde_json::json;
+    use std::{cell::RefCell, rc::Rc};
+
+    fn snapshot() -> ThreadStreamItem {
+        serde_json::from_value(json!({ "kind": "snapshot", "snapshot": {
+            "snapshotSequence": 1, "thread": { "id": "thread-1", "projectId": "project-1", "title": "Test", "messages": [], "activities": [] }
+        } })).unwrap()
+    }
+
+    #[gpui_kit::test]
+    fn sending_waits_for_detail_and_preserves_edits_and_failed_drafts(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let (handle, view) = cx.update(|cx| {
+            gpui_kit::open_window(
+                WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(Bounds {
+                        origin: Point::default(),
+                        size: size(px(1000.), px(700.)),
+                    })),
+                    ..Default::default()
+                },
+                cx,
+                |window, cx| {
+                    let panel = cx.new(UserInputPanel::new);
+                    cx.new(|cx| ThreadView::new("thread-1".into(), panel, window, cx))
+                },
+            )
+            .unwrap()
+        });
+        let sent = Rc::new(RefCell::new(Vec::new()));
+        let capture = sent.clone();
+        let _subscription = cx.update(|cx| {
+            cx.subscribe(&view, move |_, event: &ThreadViewEvent, _| {
+                if let ThreadViewEvent::Send(text, _) = event {
+                    capture.borrow_mut().push(text.clone());
+                }
+            })
+        });
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            let composer_id = view.read(cx).composer.entity_id();
+            window.click(("input", composer_id), cx);
+            window.input("First message", cx);
+            window.click("send", cx);
+            assert!(!view.read(cx).sending);
+            view.update(cx, |view, cx| view.apply(snapshot(), window, cx));
+            window.render_frame(cx);
+            window.click("send", cx);
+            window.click("send", cx);
+            assert!(view.read(cx).sending);
+        })
+        .unwrap();
+        assert_eq!(*sent.borrow(), vec!["First message".to_owned()]);
+        cx.update_window(handle, |_, window, cx| {
+            let composer_id = view.read(cx).composer.entity_id();
+            window.click(("input", composer_id), cx);
+            window.input(" plus edits", cx);
+            view.update(cx, |view, cx| view.send_finished("First message", true, window, cx));
+            assert!(view.read(cx).draft(cx).contains("plus edits"));
+            window.render_frame(cx);
+            window.click("send", cx);
+            let draft = view.read(cx).draft(cx);
+            view.update(cx, |view, cx| view.send_finished(draft.trim(), false, window, cx));
+            assert_eq!(view.read(cx).draft(cx), draft);
+            view.update(cx, |view, cx| view.set_connected(false, cx));
+            window.render_frame(cx);
+            window.click("send", cx);
+            assert!(!view.read(cx).sending);
+            assert_eq!(view.read(cx).draft(cx), draft);
+            view.update(cx, |view, cx| {
+                view.reset(cx);
+                view.set_connected(true, cx);
+            });
+            window.render_frame(cx);
+            window.click("send", cx);
+            assert!(!view.read(cx).sending);
+        })
+        .unwrap();
+        assert_eq!(sent.borrow().len(), 2);
+    }
+
+    #[gpui_kit::test]
+    fn attachment_picker_is_in_toolbar_and_disabled_until_thread_is_ready(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let (handle, view) = cx.update(|cx| {
+            gpui_kit::open_window(
+                WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(Bounds {
+                        origin: Point::default(),
+                        size: size(px(1000.), px(700.)),
+                    })),
+                    ..Default::default()
+                },
+                cx,
+                |window, cx| {
+                    let panel = cx.new(UserInputPanel::new);
+                    cx.new(|cx| ThreadView::new("thread-1".into(), panel, window, cx))
+                },
+            )
+            .unwrap()
+        });
+        let attachment_events = Rc::new(RefCell::new(Vec::new()));
+        let capture = attachment_events.clone();
+        let _subscription = cx.update(|cx| {
+            cx.subscribe(&view, move |_, event: &ThreadViewEvent, _| {
+                if let ThreadViewEvent::Attachment(event) = event {
+                    capture.borrow_mut().push(matches!(event, AttachmentPanelEvent::ChooseFiles));
+                }
+            })
+        });
+
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            window.click("attach-files", cx);
+            view.update(cx, |view, cx| view.apply(snapshot(), window, cx));
+            window.render_frame(cx);
+            window.click("attach-files", cx);
+            view.update(cx, |view, cx| view.set_connected(false, cx));
+            window.render_frame(cx);
+            window.click("attach-files", cx);
+        })
+        .unwrap();
+        assert_eq!(*attachment_events.borrow(), [true]);
+    }
+
+    #[gpui_kit::test]
+    fn send_action_stays_inside_a_narrow_composer(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let (handle, view) = cx.update(|cx| {
+            gpui_kit::open_window(
+                WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(Bounds {
+                        origin: Point::default(),
+                        size: size(px(384.), px(700.)),
+                    })),
+                    ..Default::default()
+                },
+                cx,
+                |window, cx| {
+                    let panel = cx.new(UserInputPanel::new);
+                    cx.new(|cx| ThreadView::new("thread-1".into(), panel, window, cx))
+                },
+            )
+            .unwrap()
+        });
+
+        cx.update_window(handle, |_, window, cx| {
+            view.update(cx, |view, cx| view.apply(snapshot(), window, cx));
+            window.render_frame(cx);
+            let send = window.find("send").bounds();
+            assert!(send.origin.x + send.size.width <= px(384.));
+            assert!(window.find("attach-files").visible());
+            assert!(window.find("model-picker").visible());
+            assert!(window.find("runtime-picker").visible());
+            assert!(window.find("interaction-picker").visible());
+        })
+        .unwrap();
     }
 }

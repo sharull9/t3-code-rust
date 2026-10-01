@@ -36,6 +36,9 @@ pub enum RpcError {
     #[error("rpc defect: {0}")]
     Defect(Value),
 
+    #[error("rpc request timed out")]
+    Timeout,
+
     #[error("rpc interrupted")]
     Interrupted,
 

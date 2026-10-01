@@ -25,6 +25,7 @@ use crate::ui::{self, SIDEBAR_WIDTH, icon};
 
 pub enum SidebarEvent {
     OpenThread(String),
+    OpenSettings,
     LoadArchived(String),
     SwitchServer,
     AddProject,
@@ -338,6 +339,7 @@ impl Render for Sidebar {
             .w(SIDEBAR_WIDTH)
             .flex_shrink_0()
             .h_full()
+            .min_h_0()
             .bg(theme.sidebar)
             .border_r_1()
             .border_color(theme.sidebar_border)
@@ -352,6 +354,26 @@ impl Render for Sidebar {
                             icon(IconName::Search).small().text_color(theme.muted_foreground),
                         ),
                     ))
+                    .child(
+                        Button::new("archive-toggle")
+                            .ghost()
+                            .small()
+                            .when(self.archive_mode, |button| button.primary())
+                            .icon(icon(IconName::Archive))
+                            .tooltip(if self.archive_mode {
+                                "Show active threads"
+                            } else {
+                                "Show archived threads"
+                            })
+                            .disabled(!matches!(self.status, Status::Connected(_)))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.archive_mode = !this.archive_mode;
+                                if this.archive_mode {
+                                    this.load_archived(cx);
+                                }
+                                cx.notify();
+                            })),
+                    )
                     .child(
                         Button::new("add-project")
                             .ghost()
@@ -375,43 +397,33 @@ impl Render for Sidebar {
                             })),
                     ),
             )
-            .child(
-                h_flex()
-                    .px_3()
-                    .pb_2()
-                    .gap_2()
-                    .child(
-                        Button::new("archive-toggle")
-                            .ghost()
-                            .xsmall()
-                            .label(if self.archive_mode {
-                                "Back to threads"
-                            } else {
-                                "Archived threads"
-                            })
-                            .disabled(!matches!(self.status, Status::Connected(_)))
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.archive_mode = !this.archive_mode;
-                                if this.archive_mode {
-                                    this.load_archived(cx);
-                                }
-                                cx.notify();
-                            })),
-                    )
-                    .when(self.archive_mode, |row| {
-                        row.child(
+            .when(self.archive_mode, |sidebar| {
+                sidebar.child(
+                    h_flex()
+                        .px_3()
+                        .pb_2()
+                        .items_center()
+                        .justify_between()
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(theme.muted_foreground)
+                                .child("ARCHIVED THREADS"),
+                        )
+                        .child(
                             Button::new("archive-refresh")
                                 .ghost()
                                 .xsmall()
-                                .label("Refresh")
+                                .icon(icon(IconName::RefreshCw))
+                                .tooltip("Refresh archived threads")
                                 .disabled(
                                     self.archive_request.is_some()
                                         || !matches!(self.status, Status::Connected(_)),
                                 )
                                 .on_click(cx.listener(|this, _, _, cx| this.load_archived(cx))),
-                        )
-                    }),
-            )
+                        ),
+                )
+            })
             .when(self.renaming.is_some(), |sidebar| {
                 sidebar.child(
                     v_flex()
@@ -514,7 +526,17 @@ impl Render for Sidebar {
                                     cx.emit(SidebarEvent::SwitchServer);
                                 })),
                         )
-                    }),
+                    })
+                    .child(
+                        Button::new("sidebar-settings")
+                            .ghost()
+                            .small()
+                            .icon(icon(IconName::Settings))
+                            .tooltip("Settings")
+                            .on_click(cx.listener(|_, _, _, cx| {
+                                cx.emit(SidebarEvent::OpenSettings);
+                            })),
+                    ),
             )
     }
 }
@@ -636,6 +658,7 @@ impl Sidebar {
 
         v_flex()
             .id((list, ix))
+            .test_support()
             .gap_1()
             .px_3()
             .py_2()
@@ -781,6 +804,54 @@ mod interaction_tests {
             )
             .unwrap()
         })
+    }
+
+    #[gpui_kit::test]
+    fn active_threads_scroll_without_moving_the_settings_footer(cx: &mut TestAppContext) {
+        let (handle, sidebar) = sidebar(cx);
+        cx.update_window(handle, |_, window, cx| {
+            sidebar.update(cx, |sidebar, cx| {
+                let mut shell = ShellState::default();
+                shell.threads =
+                    (0..40).map(|index| thread(&format!("thread-{index:02}"), false)).collect();
+                sidebar.set_shell(shell, cx);
+            });
+            window.render_frame(cx);
+            let first = window.find(("active-thread", 0usize)).bounds();
+            let footer = window.find("sidebar-settings").bounds();
+            window.scroll(
+                ("active-thread", 0usize),
+                ScrollDelta::Pixels(point(px(0.), px(-240.))),
+                cx,
+            );
+            let scrolled = window.try_find(("active-thread", 0usize));
+            assert!(
+                scrolled.is_none_or(|row| !row.visible() || row.bounds().origin.y < first.origin.y)
+            );
+            assert!(window.find("sidebar-settings").visible());
+            assert_eq!(window.find("sidebar-settings").bounds(), footer);
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn sidebar_settings_button_emits_open_event(cx: &mut TestAppContext) {
+        let (handle, sidebar) = sidebar(cx);
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let capture = events.clone();
+        let _subscription = cx.update(|cx| {
+            cx.subscribe(&sidebar, move |_, event: &SidebarEvent, _| {
+                if matches!(event, SidebarEvent::OpenSettings) {
+                    capture.borrow_mut().push(());
+                }
+            })
+        });
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            window.click("sidebar-settings", cx);
+        })
+        .unwrap();
+        assert_eq!(events.borrow().len(), 1);
     }
 
     #[gpui_kit::test]

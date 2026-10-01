@@ -140,7 +140,9 @@ impl ProjectPicker {
     }
 
     fn select_slot(&mut self, index: usize, cx: &mut Context<Self>) {
-        let Some(project) = self.filtered.get(index).cloned() else { return };
+        let Some(project) = self.filtered.get(index).cloned() else {
+            return;
+        };
         self.open = false;
         cx.emit(ProjectPickerEvent::Select(project));
         cx.notify();
@@ -215,9 +217,8 @@ impl Render for ProjectPicker {
             .absolute()
             .inset_0()
             .flex()
-            .items_start()
+            .items_center()
             .justify_center()
-            .pt(px(140.))
             .bg(ui::hex(0x000000).opacity(0.5))
             .on_click(cx.listener(|this, _, _, cx| {
                 this.open = false;
@@ -227,6 +228,7 @@ impl Render for ProjectPicker {
             .child(
                 v_flex()
                     .id("project-picker-panel")
+                    .test_support()
                     .key_context(CONTEXT)
                     .track_focus(&self.focus_handle)
                     .on_action(cx.listener(Self::on_cancel))
@@ -245,7 +247,11 @@ impl Render for ProjectPicker {
                     // Swallow clicks on the panel so they don't bubble to the backdrop's close handler.
                     .on_click(|_, _, cx| cx.stop_propagation())
                     .w(px(480.))
-                    .max_h(px(420.))
+                    // A flex child needs a definite parent height to reserve
+                    // space for rows. max_h alone leaves this panel content-sized
+                    // and collapses the project list to zero height.
+                    .h(px(440.))
+                    .max_h(px(460.))
                     .rounded_xl()
                     .border_1()
                     .border_color(theme.border)
@@ -253,6 +259,7 @@ impl Render for ProjectPicker {
                     .shadow_lg()
                     .child(
                         h_flex()
+                            .flex_shrink_0()
                             .gap_2()
                             .px_3()
                             .py_2()
@@ -274,19 +281,21 @@ impl Render for ProjectPicker {
                     )
                     .child(
                         div()
+                            .flex_shrink_0()
                             .px_2()
                             .pt_2()
+                            .pb_1()
                             .text_xs()
                             .font_semibold()
                             .text_color(theme.muted_foreground)
-                            .child("Projects"),
+                            .child(format!("Projects  ·  {}", self.filtered.len())),
                     )
                     .child(
                         div()
-                            .id("project-picker-list")
                             .flex_1()
                             .min_h_0()
                             .overflow_y_scrollbar()
+                            .id("project-picker-list")
                             .px_2()
                             .py_1()
                             .child(v_flex().gap_0p5().children(rows).when(empty, |list| {
@@ -296,12 +305,17 @@ impl Render for ProjectPicker {
                                         .py_4()
                                         .text_sm()
                                         .text_color(theme.muted_foreground)
-                                        .child("No matching projects"),
+                                        .child(if self.all.is_empty() {
+                                            "No projects are available on this server"
+                                        } else {
+                                            "No matching projects"
+                                        }),
                                 )
                             })),
                     )
                     .child(
                         h_flex()
+                            .flex_shrink_0()
                             .gap_3()
                             .px_3()
                             .py_2()
@@ -310,6 +324,7 @@ impl Render for ProjectPicker {
                             .text_xs()
                             .text_color(theme.muted_foreground)
                             .child("↑ ↓ Navigate")
+                            .child("Ctrl+1–9 Quick select")
                             .child("Enter Select")
                             .child("Esc Close"),
                     ),
@@ -319,13 +334,19 @@ impl Render for ProjectPicker {
 }
 
 impl ProjectPicker {
-    fn render_row(&self, ix: usize, project: &ProjectShell, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_row(
+        &self,
+        ix: usize,
+        project: &ProjectShell,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         let theme = cx.theme();
         let selected = ix == self.selected;
         let project_id = project.id.clone();
 
         h_flex()
             .id(("project-picker-row", ix))
+            .test_support()
             .gap_2()
             .px_2()
             .py_2()
@@ -351,7 +372,7 @@ impl ProjectPicker {
                             .text_xs()
                             .truncate()
                             .text_color(theme.muted_foreground)
-                            .child(format!("Local · {}", project.workspace_root)),
+                            .child(format!("Workspace · {}", project.workspace_root)),
                     ),
             )
             .when(ix < SLOT_COUNT, |row| {

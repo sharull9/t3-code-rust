@@ -59,9 +59,7 @@ impl PairingLink {
                 .map(|(_, value)| value.into_owned())
         });
         let from_query = || {
-            url.query_pairs()
-                .find(|(key, _)| key == "token")
-                .map(|(_, value)| value.into_owned())
+            url.query_pairs().find(|(key, _)| key == "token").map(|(_, value)| value.into_owned())
         };
         let token = from_fragment
             .or_else(from_query)
@@ -164,7 +162,10 @@ pub async fn pair(
 }
 
 /// Mint a short-lived WebSocket ticket and return the full `/ws` URL.
-pub async fn websocket_url(http: &reqwest::Client, credentials: &Credentials) -> Result<Url, Error> {
+pub async fn websocket_url(
+    http: &reqwest::Client,
+    credentials: &Credentials,
+) -> Result<Url, Error> {
     let response = http
         .post(credentials.base_url.join("/api/auth/websocket-ticket")?)
         .header(reqwest::header::AUTHORIZATION, credentials.authorization())
@@ -180,7 +181,9 @@ pub async fn websocket_url(http: &reqwest::Client, credentials: &Credentials) ->
     Ok(url)
 }
 
-async fn read_json<T: serde::de::DeserializeOwned>(response: reqwest::Response) -> Result<T, Error> {
+async fn read_json<T: serde::de::DeserializeOwned>(
+    response: reqwest::Response,
+) -> Result<T, Error> {
     let status = response.status();
     if status.is_success() {
         return Ok(response.json().await?);
@@ -212,8 +215,7 @@ mod tests {
 
     #[test]
     fn bare_token_uses_default_server() {
-        let link = PairingLink::parse("  7NB9KZSDLQLW 
-").unwrap();
+        let link = PairingLink::parse("  7NB9KZSDLQLW \n").unwrap();
         assert_eq!(link.base_url.as_str(), PairingLink::DEFAULT_SERVER);
         assert_eq!(link.token, "7NB9KZSDLQLW");
     }
