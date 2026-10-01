@@ -82,6 +82,9 @@ impl T3App {
                         this.project_picker
                             .update(cx, |picker, cx| picker.open(projects, window, cx));
                     }
+                    SidebarEvent::LoadArchived(request_id) => {
+                        this.backend.send(Command::LoadArchived(request_id.clone()))
+                    }
                     SidebarEvent::ThreadAction(thread_id, action) => {
                         this.backend.send(Command::ThreadAction {
                             thread_id: thread_id.clone(),
@@ -210,7 +213,14 @@ impl T3App {
                     thread.update(cx, |view, cx| view.set_providers(self.providers.clone(), cx));
                 }
             }
+            Event::Archived { request_id, snapshot } => {
+                self.sidebar
+                    .update(cx, |sidebar, cx| sidebar.set_archived(&request_id, snapshot, cx));
+            }
             Event::ThreadActionFinished { thread_id, action, success } => {
+                self.sidebar.update(cx, |sidebar, cx| {
+                    sidebar.action_finished(&thread_id, &action, success, cx)
+                });
                 if let Some(panel) = self.question_panels.get(&thread_id) {
                     panel.update(cx, |panel, cx| panel.response_finished(&action, success, cx));
                 }
@@ -278,6 +288,13 @@ impl T3App {
         cx: &mut Context<Self>,
     ) {
         let thread_id = t3_client::new_id();
+        let current = self.open_thread_shell(cx);
+        let runtime_mode = current
+            .map(|thread| thread.runtime_mode.clone())
+            .unwrap_or_else(|| "full-access".into());
+        let interaction_mode = current
+            .map(|thread| thread.interaction_mode.clone())
+            .unwrap_or_else(|| "default".into());
         let model_selection = project
             .default_model_selection
             .or_else(|| {
@@ -306,6 +323,8 @@ impl T3App {
             project_id: project.id,
             title: "New thread".into(),
             model_selection,
+            runtime_mode,
+            interaction_mode,
         });
         cx.notify();
     }
@@ -391,7 +410,7 @@ impl T3App {
         self.sending.clear();
         self.providers.clear();
         self.pending_new_thread_id = None;
-        self.sidebar.update(cx, |sidebar, cx| sidebar.set_open_thread(None, cx));
+        self.sidebar.update(cx, |sidebar, cx| sidebar.reset_environment(cx));
         self.backend.send(Command::Pair(link));
         cx.notify();
     }

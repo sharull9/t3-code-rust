@@ -8,7 +8,13 @@ plan, not a claim that the whole desktop app has been ported.
 
 - Model menus populated from `server.getConfig`, routed by provider `instanceId`.
 - Runtime and Build/Plan menus backed by the corresponding orchestration commands.
-- Pin/unpin, settle/move to active, and archive actions in sidebar thread menus.
+- Pin/unpin, settle/move to active, archive and rename actions in sidebar thread menus.
+- A searchable archived-thread shelf fetched from `orchestration.getArchivedShellSnapshot`,
+  with refresh and restore controls. Failed requests can be retried; late query results
+  cannot override a newer archive query or a live restored-thread entry.
+- Rename drafts retained after errors and duplicate submissions blocked.
+- New threads inherit the current runtime and interaction modes. Destination-project
+  model defaults take precedence, then the current model, then server defaults.
 - Approval cards with provider-supplied choices and warnings, backed by
   `thread.approval.respond`. Resolved and stale requests disappear; retryable
   failures leave the request available.
@@ -92,9 +98,9 @@ between managed and independently owned servers. Use isolated test data.
 1. Question-form polish: attachments, option number shortcuts, collapse/expand,
    and the web client's delayed automatic advance for single choices. Core
    answer submission, navigation, Enter-to-advance and dismissal are implemented.
-2. Thread management: rename, archived-thread browser/unarchive, snooze, ordering,
-   and new-thread defaults. Carry model/mode selections from the current thread,
-   subject to destination-project defaults and server capabilities.
+2. Thread management: snooze, manual ordering and archived-thread detail previews.
+   Rename, archived-thread browsing/restore and model/mode inheritance are implemented.
+   Verify inherited modes against provider-specific capabilities.
 3. Composer: attachments and uploads, provider model options, slash commands,
    persistent per-environment drafts, and keyboard shortcuts. Preserve drafts
    during failed server switches and correlate pending commands with an environment.
@@ -121,15 +127,17 @@ Inspected the upstream checkout at `792c7dd1`, dated 2026-09-30. Relevant source
 ## Validation for this pass
 
 - Workspace build and type check passed.
-- 40 tests and one documentation test passed, including approval/question
+- 42 tests and one documentation test passed, including approval/question
   resolution ordering, retryable/stale failures, exact answer values, command
   fields, offline draft retry and native form interaction.
 - The read-only `session` example authenticated with the existing saved session,
-  decoded 9 providers and 56 models, and synchronized 21 projects and 300 threads.
+  decoded 9 providers and 56 models, and synchronized 21 projects and 305 threads. The archive query decoded 1 project
+  and 2 archived threads.
   It did not dispatch commands or print credentials/message content.
 - GPUI headless windows verify native clicks, typing, multi-question navigation,
   duplicate-submit prevention, retry, dismissal and text preservation during
-  reconnect. These tests caught a same-update input callback race, fixed by
+  reconnect, plus rename menu navigation, error retry, offline guards, stale archive
+  queries and duplicate restore prevention. These tests caught a same-update input callback race, fixed by
   reading controls before rebuilding the form.
 - Screen-level visual inspection was unavailable because the Orca desktop
   runtime was not running. Pixel-level equivalence remains unverified.

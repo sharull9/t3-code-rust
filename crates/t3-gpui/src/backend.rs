@@ -23,6 +23,7 @@ pub enum Command {
     Pair(String),
     OpenThread(String),
     CloseThread,
+    LoadArchived(String),
     ThreadAction {
         thread_id: String,
         action: t3_client::ThreadAction,
@@ -50,6 +51,8 @@ pub enum Command {
         project_id: String,
         title: String,
         model_selection: Value,
+        runtime_mode: String,
+        interaction_mode: String,
     },
 }
 
@@ -67,6 +70,7 @@ pub enum Event {
     Thread { thread_id: String, item: ThreadStreamItem },
     Error(String),
     Config(t3_client::ServerConfig),
+    Archived { request_id: String, snapshot: Option<t3_client::ShellSnapshot> },
     ThreadActionFinished { thread_id: String, action: t3_client::ThreadAction, success: bool },
     SendFinished { thread_id: String, text: String, success: bool },
 }
@@ -216,6 +220,10 @@ async fn wait_offline(
                 Some(Command::Pair(link)) => return Offline::Pair(link),
                 Some(Command::OpenThread(thread_id)) => *open_thread = Some(thread_id),
                 Some(Command::CloseThread) => *open_thread = None,
+                Some(Command::LoadArchived(request_id)) => {
+                    events.emit(Event::Archived { request_id, snapshot: None });
+                    events.error("Reconnect before browsing archived threads.");
+                }
                 Some(Command::SendMessage { thread, text }) => {
                     events.error("Cannot send while disconnected. Your draft has been kept.");
                     events.emit(Event::SendFinished { thread_id: thread.id, text, success: false });
@@ -271,6 +279,20 @@ async fn run_session(
                     *open_thread = None;
                     _thread = None;
                 }
+                Some(Command::LoadArchived(request_id)) => {
+                    let connection = connection.clone();
+                    let events = events.clone();
+                    tokio::spawn(async move {
+                        let snapshot = match connection.archived_shell().await {
+                            Ok(snapshot) => Some(snapshot),
+                            Err(error) => {
+                                events.error(format!("Archive unavailable: {}", describe(&error)));
+                                None
+                            }
+                        };
+                        events.emit(Event::Archived { request_id, snapshot });
+                    });
+                }
                 Some(Command::ThreadAction { thread_id, action }) => {
                     let connection = connection.clone();
                     let events = events.clone();
@@ -314,12 +336,12 @@ async fn run_session(
                         }
                     });
                 }
-                Some(Command::CreateThread { id, project_id, title, model_selection }) => {
+                Some(Command::CreateThread { id, project_id, title, model_selection, runtime_mode, interaction_mode }) => {
                     let connection = connection.clone();
                     let events = events.clone();
                     tokio::spawn(async move {
                         if let Err(error) =
-                            connection.create_thread(&id, &project_id, &title, model_selection).await
+                            connection.create_thread(&id, &project_id, &title, model_selection, &runtime_mode, &interaction_mode).await
                         {
                             events.error(format!("New thread failed: {}", describe(&error)));
                         }

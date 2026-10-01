@@ -67,6 +67,7 @@ cargo run -p t3-client --example session -- <path-to-credentials.json>
 | Socket ticket | `POST /api/auth/websocket-ticket` |
 | RPC | `GET /ws?wsTicket=…`, Effect RPC with JSON messages |
 | Projects/threads | `orchestration.subscribeShell` (stream) |
+| Archived threads | `orchestration.getArchivedShellSnapshot` (on demand) |
 | Thread detail | `orchestration.subscribeThread` (stream, full history) |
 | Send / stop | `orchestration.dispatchCommand` with `thread.turn.start` / `thread.turn.interrupt` |
 
@@ -78,7 +79,10 @@ to decode are skipped, so newer servers keep working until a change touches a fi
 
 Diffs, terminals, attachments, model options, multiple environments,
 DPoP-bound tokens, and relay/T3 Connect. Model selection, runtime/Build/Plan modes,
-project/thread creation, approval responses, user-input questions, and pin/settle/archive actions are supported.
+project/thread creation, approval responses, user-input questions, and pin/settle/archive/restore/rename actions are supported.
+Archived threads have a searchable shelf with refresh and restore controls.
+New threads inherit the current runtime and interaction modes; destination-project
+model defaults take priority over the current model.
 Drafts survive thread switching and rejected sends within the current connection;
 they are not yet saved across app restarts.
 Question forms support single/multiple choices, custom answers and dismissal for

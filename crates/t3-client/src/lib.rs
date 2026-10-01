@@ -37,6 +37,8 @@ pub enum ThreadAction {
     Pin(bool),
     Settle(bool),
     Archive,
+    Unarchive,
+    Rename(String),
     RuntimeMode(String),
     InteractionMode(String),
     Model(Value),
@@ -53,6 +55,8 @@ impl ThreadAction {
             Self::Settle(true) => "thread.settle",
             Self::Settle(false) => "thread.unsettle",
             Self::Archive => "thread.archive",
+            Self::Unarchive => "thread.unarchive",
+            Self::Rename(_) => "thread.meta.update",
             Self::RuntimeMode(_) => "thread.runtime-mode.set",
             Self::InteractionMode(_) => "thread.interaction-mode.set",
             Self::Model(_) => "thread.meta.update",
@@ -72,6 +76,7 @@ impl ThreadAction {
                 command["createdAt"] = json!(now_iso());
             }
             Self::Model(model) => command["modelSelection"] = model.clone(),
+            Self::Rename(title) => command["title"] = json!(title.trim()),
             Self::Approval { request_id, decision } => {
                 command["requestId"] = json!(request_id);
                 command["decision"] = json!(decision);
@@ -111,6 +116,12 @@ impl Connection {
 
     pub async fn server_config(&self) -> Result<ServerConfig, RpcError> {
         let value = self.rpc.call("server.getConfig", json!({})).await?;
+        serde_json::from_value(value).map_err(|error| RpcError::Decode(error.to_string()))
+    }
+
+    /// Archived summaries are fetched separately from the live shell stream.
+    pub async fn archived_shell(&self) -> Result<ShellSnapshot, RpcError> {
+        let value = self.rpc.call("orchestration.getArchivedShellSnapshot", json!({})).await?;
         serde_json::from_value(value).map_err(|error| RpcError::Decode(error.to_string()))
     }
 
@@ -207,16 +218,15 @@ impl Connection {
     }
 
     /// `thread.create` (see `orchestration.ts`'s `ThreadCreateCommand`).
-    /// Mirrors the defaults `ChatView.tsx` sends for a fresh thread:
-    /// `DEFAULT_RUNTIME_MODE` ("full-access"), the "default" interaction
-    /// mode, and no branch/worktree. `model_selection` should be the
-    /// project's `defaultModelSelection` when it has one.
+    /// Carries the selected model and modes, with no branch/worktree.
     pub async fn create_thread(
         &self,
         thread_id: &str,
         project_id: &str,
         title: &str,
         model_selection: Value,
+        runtime_mode: &str,
+        interaction_mode: &str,
     ) -> Result<Value, RpcError> {
         self.dispatch(json!({
             "type": "thread.create",
@@ -225,8 +235,8 @@ impl Connection {
             "projectId": project_id,
             "title": title,
             "modelSelection": model_selection,
-            "runtimeMode": "full-access",
-            "interactionMode": "default",
+            "runtimeMode": runtime_mode,
+            "interactionMode": interaction_mode,
             "branch": null,
             "worktreePath": null,
             "createdAt": now_iso(),
@@ -257,6 +267,13 @@ mod command_tests {
         assert_eq!(command["threadId"], "thread-1");
         assert!(uuid::Uuid::parse_str(command["commandId"].as_str().unwrap()).is_ok());
         assert!(ThreadAction::Archive.command("thread-1").get("reason").is_none());
+        let restore = ThreadAction::Unarchive.command("thread-1");
+        assert_eq!(restore["type"], "thread.unarchive");
+        assert_eq!(restore["threadId"], "thread-1");
+        let rename = ThreadAction::Rename("  New title  ".into()).command("thread-1");
+        assert_eq!(rename["type"], "thread.meta.update");
+        assert_eq!(rename["title"], "New title");
+        assert!(rename.get("modelSelection").is_none());
     }
 
     #[test]
