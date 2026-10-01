@@ -10,8 +10,10 @@
 use std::collections::HashMap;
 
 use gpui_kit::assets::IconName;
+use gpui_kit::component::Disableable as _;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
+use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
 use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::component::{ActiveTheme as _, Sizable as _, Size, StyledExt as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
@@ -26,6 +28,7 @@ pub enum SidebarEvent {
     SwitchServer,
     AddProject,
     NewThread,
+    ThreadAction(String, t3_client::ThreadAction),
 }
 
 pub struct Sidebar {
@@ -184,23 +187,18 @@ impl Render for Sidebar {
                     .px_3()
                     .pt_1()
                     .pb_2()
-                    .child(
-                        div().flex_1().min_w_0().child(
-                            Input::new(&self.search)
-                                .small()
-                                .appearance(false)
-                                .cleanable(true)
-                                .prefix(
-                                    icon(IconName::Search).small().text_color(theme.muted_foreground),
-                                ),
+                    .child(div().flex_1().min_w_0().child(
+                        Input::new(&self.search).small().appearance(false).cleanable(true).prefix(
+                            icon(IconName::Search).small().text_color(theme.muted_foreground),
                         ),
-                    )
+                    ))
                     .child(
                         Button::new("add-project")
                             .ghost()
                             .small()
                             .icon(icon(IconName::FolderPlus))
                             .tooltip("Add project")
+                            .disabled(!matches!(self.status, Status::Connected(_)))
                             .on_click(cx.listener(|_, _, _, cx| {
                                 cx.emit(SidebarEvent::AddProject);
                             })),
@@ -211,40 +209,35 @@ impl Render for Sidebar {
                             .small()
                             .icon(icon(IconName::SquarePen))
                             .tooltip("New thread")
+                            .disabled(!matches!(self.status, Status::Connected(_)))
                             .on_click(cx.listener(|_, _, _, cx| {
                                 cx.emit(SidebarEvent::NewThread);
                             })),
                     ),
             )
             .child(
-                div()
-                    .id("thread-list")
-                    .flex_1()
-                    .min_h_0()
-                    .px_2()
-                    .overflow_y_scrollbar()
-                    .child(
-                        v_flex()
-                            .gap_0p5()
-                            .pb_2()
-                            .children(active_cards)
-                            .children(divider)
-                            .children(settled_cards)
-                            .when(empty, |list| {
-                                list.child(
-                                    div()
-                                        .px_3()
-                                        .py_4()
-                                        .text_sm()
-                                        .text_color(theme.muted_foreground)
-                                        .child(if self.shell.threads.is_empty() {
-                                            "No threads yet"
-                                        } else {
-                                            "No matching threads"
-                                        }),
-                                )
-                            }),
-                    ),
+                div().id("thread-list").flex_1().min_h_0().px_2().overflow_y_scrollbar().child(
+                    v_flex()
+                        .gap_0p5()
+                        .pb_2()
+                        .children(active_cards)
+                        .children(divider)
+                        .children(settled_cards)
+                        .when(empty, |list| {
+                            list.child(
+                                div()
+                                    .px_3()
+                                    .py_4()
+                                    .text_sm()
+                                    .text_color(theme.muted_foreground)
+                                    .child(if self.shell.threads.is_empty() {
+                                        "No threads yet"
+                                    } else {
+                                        "No matching threads"
+                                    }),
+                            )
+                        }),
+                ),
             )
             .child(
                 h_flex()
@@ -285,7 +278,11 @@ impl Sidebar {
     /// list in place, same as the T3 desktop app's shelf.
     fn render_settled_divider(&self, expanded: bool, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
-        let label = if expanded { "Settled".to_owned() } else { format!("Settled ({})", self.settled.len()) };
+        let label = if expanded {
+            "Settled".to_owned()
+        } else {
+            format!("Settled ({})", self.settled.len())
+        };
 
         h_flex()
             .id("settled-divider")
@@ -302,7 +299,9 @@ impl Sidebar {
             }))
             .child(label)
             .child(div().flex_1().h(px(1.)).bg(theme.sidebar_border))
-            .child(icon(if expanded { IconName::ChevronUp } else { IconName::ChevronDown }).xsmall())
+            .child(
+                icon(if expanded { IconName::ChevronUp } else { IconName::ChevronDown }).xsmall(),
+            )
     }
 
     fn render_thread_card(
@@ -316,6 +315,37 @@ impl Sidebar {
         let theme = cx.theme();
         let project = self.projects.get(&thread.project_id);
         let thread_id = thread.id.clone();
+        let menu_view = cx.entity().downgrade();
+        let menu_thread_id = thread.id.clone();
+        let pinned = thread.pinned_at.is_some();
+        let settled = thread.is_settled();
+        let connected = matches!(self.status, Status::Connected(_));
+        let menu = Button::new(("thread-menu", ix))
+            .ghost()
+            .xsmall()
+            .icon(icon(IconName::Ellipsis))
+            .tooltip("Thread actions")
+            .disabled(!connected)
+            .on_click(|_, _, cx| cx.stop_propagation())
+            .dropdown_menu(move |mut menu, _, _| {
+                for (label, action) in [
+                    (if pinned { "Unpin" } else { "Pin" }, t3_client::ThreadAction::Pin(!pinned)),
+                    (
+                        if settled { "Move to active" } else { "Settle" },
+                        t3_client::ThreadAction::Settle(!settled),
+                    ),
+                    ("Archive", t3_client::ThreadAction::Archive),
+                ] {
+                    let view = menu_view.clone();
+                    let id = menu_thread_id.clone();
+                    menu = menu.item(PopupMenuItem::new(label).on_click(move |_, _, cx| {
+                        let _ = view.update(cx, |_, cx| {
+                            cx.emit(SidebarEvent::ThreadAction(id.clone(), action.clone()))
+                        });
+                    }));
+                }
+                menu
+            });
         // Distinct from `list` so the loader's id never collides with the
         // card's own id (both would otherwise share `(list, ix)`).
         let working_key: &'static str =
@@ -366,7 +396,11 @@ impl Sidebar {
                         )
                     })
                     .when(project.is_none(), |row| row.child(div().flex_1()))
-                    .child(trailing),
+                    .child(trailing)
+                    .when(pinned, |row| {
+                        row.child(icon(IconName::Pin).xsmall().text_color(theme.muted_foreground))
+                    })
+                    .child(menu),
             )
             .child(
                 div()

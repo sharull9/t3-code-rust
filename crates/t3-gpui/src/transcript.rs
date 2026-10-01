@@ -103,6 +103,14 @@ impl Transcript {
         self.state.thread.as_ref().and_then(|t| t.branch.as_deref())
     }
 
+    pub fn approvals(&self) -> Vec<t3_client::pending::PendingApproval> {
+        self.state.thread.as_ref().map(|thread| t3_client::pending::approvals(&thread.activities)).unwrap_or_default()
+    }
+
+    pub fn user_inputs(&self) -> Option<Vec<t3_client::pending::PendingUserInput>> {
+        self.state.thread.as_ref().map(|thread| t3_client::pending::user_inputs(&thread.activities))
+    }
+
     fn is_working(&self) -> bool {
         self.session().is_some_and(Session::is_working)
     }
@@ -731,6 +739,7 @@ mod tests {
             tone,
             kind: kind.to_owned(),
             summary: format!("summary-{id}"),
+            payload: serde_json::Value::Null,
             turn_id: None,
             created_at: created_at.to_owned(),
         }

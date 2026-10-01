@@ -14,3 +14,6 @@ gpui-kit.workspace = true
 serde_json.workspace = true
 t3-client.workspace = true
 tokio.workspace = true
+
+[dev-dependencies]
+gpui-kit = { workspace = true, features = ["test-support"] }

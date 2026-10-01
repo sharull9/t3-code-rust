@@ -12,6 +12,7 @@ use gpui_kit::component::{
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use serde_json::json;
+use std::collections::{HashMap, HashSet};
 use t3_client::{ProjectShell, ShellState, ThreadShell};
 
 use crate::backend::{Backend, Command, Event, Status};
@@ -19,12 +20,10 @@ use crate::project_picker::{ProjectPicker, ProjectPickerEvent};
 use crate::sidebar::{Sidebar, SidebarEvent};
 use crate::thread_view::{ThreadView, ThreadViewEvent};
 use crate::ui::{self, SIDEBAR_WIDTH, icon};
+use crate::user_input::UserInputPanel;
 
-/// Fallback `ModelSelection` for a project with no `defaultModelSelection`
-/// of its own. The web app resolves this from the user's last-used model,
-/// which this client doesn't track (it has no model picker yet), so a new
-/// thread in such a project may need its model changed server-side. The model
-/// is upstream's `DEFAULT_MODEL_BY_PROVIDER` for Claude (`contracts/src/model.ts`).
+/// Compatibility fallback when neither the project, current thread nor server
+/// config supplies a model. Prefer server-advertised models above this value.
 fn fallback_model_selection() -> serde_json::Value {
     json!({ "instanceId": "claudeAgent", "model": "claude-fable-5-1" })
 }
@@ -44,6 +43,10 @@ pub struct T3App {
     pending_new_thread_id: Option<String>,
     /// Pairing screen opened by hand while already paired, to switch servers.
     switching_server: bool,
+    providers: Vec<t3_client::ServerProvider>,
+    drafts: HashMap<String, String>,
+    question_panels: HashMap<String, Entity<UserInputPanel>>,
+    sending: HashSet<String>,
     _thread_subscription: Option<Subscription>,
     _subscriptions: Vec<Subscription>,
 }
@@ -53,21 +56,16 @@ impl T3App {
         let (backend, events) = Backend::spawn();
         Self::listen(events, window, cx);
 
-        let pairing_link = cx.new(|cx| {
-            InputState::new(window, cx).placeholder("Pairing link or token")
-        });
+        let pairing_link =
+            cx.new(|cx| InputState::new(window, cx).placeholder("Pairing link or token"));
         let sidebar = cx.new(|cx| Sidebar::new(window, cx));
         let project_picker = cx.new(|cx| ProjectPicker::new(window, cx));
         let subscriptions = vec![
-            cx.subscribe_in(
-                &pairing_link,
-                window,
-                |this, _, event: &InputEvent, window, cx| {
-                    if matches!(event, InputEvent::PressEnter { .. }) {
-                        this.pair(window, cx);
-                    }
-                },
-            ),
+            cx.subscribe_in(&pairing_link, window, |this, _, event: &InputEvent, window, cx| {
+                if matches!(event, InputEvent::PressEnter { .. }) {
+                    this.pair(window, cx);
+                }
+            }),
             cx.subscribe_in(&sidebar, window, |this, _, event: &SidebarEvent, window, cx| {
                 match event {
                     SidebarEvent::OpenThread(thread_id) => {
@@ -81,8 +79,13 @@ impl T3App {
                     SidebarEvent::AddProject => this.add_project(window, cx),
                     SidebarEvent::NewThread => {
                         let projects = this.shell.projects.clone();
-                        this.project_picker.update(cx, |picker, cx| {
-                            picker.open(projects, window, cx)
+                        this.project_picker
+                            .update(cx, |picker, cx| picker.open(projects, window, cx));
+                    }
+                    SidebarEvent::ThreadAction(thread_id, action) => {
+                        this.backend.send(Command::ThreadAction {
+                            thread_id: thread_id.clone(),
+                            action: action.clone(),
                         });
                     }
                 }
@@ -111,6 +114,10 @@ impl T3App {
             project_picker,
             pending_new_thread_id: None,
             switching_server: false,
+            providers: Vec::new(),
+            drafts: HashMap::new(),
+            question_panels: HashMap::new(),
+            sending: HashSet::new(),
             _thread_subscription: None,
             _subscriptions: subscriptions,
         }
@@ -122,7 +129,9 @@ impl T3App {
     fn listen(mut events: UnboundedReceiver<Event>, window: &mut Window, cx: &mut Context<Self>) {
         cx.spawn_in(window, async move |this, cx| {
             while let Some(event) = events.next().await {
-                if this.update_in(cx, |app, window, cx| app.handle_event(event, window, cx)).is_err()
+                if this
+                    .update_in(cx, |app, window, cx| app.handle_event(event, window, cx))
+                    .is_err()
                 {
                     break;
                 }
@@ -155,12 +164,30 @@ impl T3App {
             }
             Event::Shell(item) => {
                 self.shell.apply(item);
+                if self.thread.as_ref().is_some_and(|thread| {
+                    self.shell
+                        .thread(thread.read(cx).thread_id())
+                        .is_none_or(|thread| thread.archived_at.is_some())
+                }) && self.shell.synchronized
+                {
+                    if let Some(thread) = &self.thread {
+                        let view = thread.read(cx);
+                        self.drafts.insert(view.thread_id().to_owned(), view.draft(cx));
+                    }
+                    self.thread = None;
+                    self.backend.send(Command::CloseThread);
+                    self._thread_subscription = None;
+                    self.sidebar.update(cx, |sidebar, cx| sidebar.set_open_thread(None, cx));
+                }
                 self.sync_thread_shell(cx);
                 let shell = self.shell.clone();
                 self.sidebar.update(cx, |sidebar, cx| sidebar.set_shell(shell, cx));
                 // The thread this session's `thread.create` was waiting on
                 // has streamed in: open it now that the sidebar has it too.
-                if self.pending_new_thread_id.as_deref().is_some_and(|id| self.shell.thread(id).is_some())
+                if self
+                    .pending_new_thread_id
+                    .as_deref()
+                    .is_some_and(|id| self.shell.thread(id).is_some())
                 {
                     let thread_id = self.pending_new_thread_id.take().unwrap();
                     self.open_thread(thread_id, window, cx);
@@ -171,12 +198,41 @@ impl T3App {
                     thread.update(cx, |view, cx| {
                         // A late item from the previously open thread is stale.
                         if view.thread_id() == thread_id {
-                            view.apply(item, cx);
+                            view.apply(item, window, cx);
                         }
                     });
                 }
             }
             Event::Error(message) => self.error = Some(message.into()),
+            Event::Config(config) => {
+                self.providers = config.providers;
+                if let Some(thread) = &self.thread {
+                    thread.update(cx, |view, cx| view.set_providers(self.providers.clone(), cx));
+                }
+            }
+            Event::ThreadActionFinished { thread_id, action, success } => {
+                if let Some(panel) = self.question_panels.get(&thread_id) {
+                    panel.update(cx, |panel, cx| panel.response_finished(&action, success, cx));
+                }
+                if let Some(thread) = &self.thread {
+                    if thread.read(cx).thread_id() == thread_id {
+                        thread.update(cx, |view, cx| view.update_finished(&action, success, cx));
+                    }
+                }
+            }
+            Event::SendFinished { thread_id, text, success } => {
+                self.sending.remove(&thread_id);
+                if success && self.drafts.get(&thread_id).is_some_and(|draft| draft.trim() == text)
+                {
+                    self.drafts.remove(&thread_id);
+                }
+                if let Some(thread) = &self.thread {
+                    if thread.read(cx).thread_id() == thread_id {
+                        thread
+                            .update(cx, |view, cx| view.send_finished(&text, success, window, cx));
+                    }
+                }
+            }
         }
         cx.notify();
     }
@@ -192,7 +248,9 @@ impl T3App {
             prompt: Some("Add Project".into()),
         });
         cx.spawn_in(window, async move |this, cx| {
-            let Ok(Ok(Some(mut paths))) = paths.await else { return };
+            let Ok(Ok(Some(mut paths))) = paths.await else {
+                return;
+            };
             let Some(path) = paths.pop() else { return };
             let title = path
                 .file_name()
@@ -213,9 +271,35 @@ impl T3App {
     /// Dispatches `thread.create` for `project`, defaults matching
     /// `ChatView.tsx`'s new-thread flow (see `t3_client::Connection::create_thread`).
     /// The thread opens once its shell entry streams back in.
-    fn create_thread_in(&mut self, project: ProjectShell, _window: &mut Window, cx: &mut Context<Self>) {
+    fn create_thread_in(
+        &mut self,
+        project: ProjectShell,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let thread_id = t3_client::new_id();
-        let model_selection = project.default_model_selection.unwrap_or_else(fallback_model_selection);
+        let model_selection = project
+            .default_model_selection
+            .or_else(|| {
+                self.open_thread_shell(cx).and_then(|thread| thread.model_selection.clone())
+            })
+            .or_else(|| {
+                self.providers.iter().find_map(|provider| {
+                    if !provider.enabled
+                        || !provider.installed
+                        || provider.availability.as_deref() == Some("unavailable")
+                    {
+                        return None;
+                    }
+                    let model = provider
+                        .models
+                        .iter()
+                        .find(|model| model.is_default)
+                        .or_else(|| provider.models.first())?;
+                    Some(json!({ "instanceId": provider.instance_id, "model": model.id }))
+                })
+            })
+            .unwrap_or_else(fallback_model_selection);
         self.pending_new_thread_id = Some(thread_id.clone());
         self.backend.send(Command::CreateThread {
             id: thread_id,
@@ -237,18 +321,32 @@ impl T3App {
         if self.thread.as_ref().is_some_and(|t| t.read(cx).thread_id() == thread_id) {
             return;
         }
+        if let Some(thread) = &self.thread {
+            let view = thread.read(cx);
+            self.drafts.insert(view.thread_id().to_owned(), view.draft(cx));
+        }
         let connected = matches!(self.status, Status::Connected(_));
+        let panel = self
+            .question_panels
+            .entry(thread_id.clone())
+            .or_insert_with(|| cx.new(UserInputPanel::new))
+            .clone();
         let view = cx.new(|cx| {
-            let mut view = ThreadView::new(thread_id.clone(), window, cx);
+            let mut view = ThreadView::new(thread_id.clone(), panel, window, cx);
             view.set_connected(connected, cx);
+            view.set_providers(self.providers.clone(), cx);
+            view.restore_draft(
+                self.drafts.get(&thread_id).map_or("", String::as_str),
+                self.sending.contains(&thread_id),
+                window,
+                cx,
+            );
             view
         });
         self._thread_subscription = Some(cx.subscribe(&view, Self::on_thread_event));
         self.thread = Some(view);
         self.sync_thread_shell(cx);
-        self.sidebar.update(cx, |sidebar, cx| {
-            sidebar.set_open_thread(Some(thread_id.clone()), cx)
-        });
+        self.sidebar.update(cx, |sidebar, cx| sidebar.set_open_thread(Some(thread_id.clone()), cx));
         self.backend.send(Command::OpenThread(thread_id));
         cx.notify();
     }
@@ -264,10 +362,13 @@ impl T3App {
             return cx.notify();
         };
         match event {
-            ThreadViewEvent::Send(text) => self.backend.send(Command::SendMessage {
-                thread,
-                text: text.clone(),
-            }),
+            ThreadViewEvent::Send(text) => {
+                self.sending.insert(thread.id.clone());
+                self.backend.send(Command::SendMessage { thread, text: text.clone() });
+            }
+            ThreadViewEvent::Update(action) => self
+                .backend
+                .send(Command::ThreadAction { thread_id: thread.id, action: action.clone() }),
             ThreadViewEvent::Stop => {
                 let turn_id = thread.session.as_ref().and_then(|s| s.active_turn_id.clone());
                 self.backend.send(Command::Interrupt { thread_id: thread.id, turn_id });
@@ -283,6 +384,14 @@ impl T3App {
         self.pairing_link.update(cx, |state, cx| state.set_value("", window, cx));
         self.error = None;
         self.switching_server = false;
+        self.thread = None;
+        self._thread_subscription = None;
+        self.drafts.clear();
+        self.question_panels.clear();
+        self.sending.clear();
+        self.providers.clear();
+        self.pending_new_thread_id = None;
+        self.sidebar.update(cx, |sidebar, cx| sidebar.set_open_thread(None, cx));
         self.backend.send(Command::Pair(link));
         cx.notify();
     }
@@ -362,13 +471,16 @@ impl T3App {
             .child(toggle)
             .child(div().text_sm().font_semibold().child("T3 Code"))
             .when(self.sidebar_open, |brand| {
-                brand.w(SIDEBAR_WIDTH).bg(theme.sidebar).border_r_1().border_color(theme.sidebar_border)
+                brand
+                    .w(SIDEBAR_WIDTH)
+                    .bg(theme.sidebar)
+                    .border_r_1()
+                    .border_color(theme.sidebar_border)
             });
 
         let shell = self.open_thread_shell(cx);
-        let project = shell.and_then(|thread| {
-            self.shell.projects.iter().find(|p| p.id == thread.project_id)
-        });
+        let project =
+            shell.and_then(|thread| self.shell.projects.iter().find(|p| p.id == thread.project_id));
         let breadcrumb = h_flex()
             .gap_2()
             .px_4()
@@ -383,9 +495,7 @@ impl T3App {
                 row.child(div().min_w_0().truncate().font_semibold().child(thread.title.clone()))
             });
 
-        TitleBar::new()
-            .pl_0()
-            .child(h_flex().h_full().min_w_0().child(brand).child(breadcrumb))
+        TitleBar::new().pl_0().child(h_flex().h_full().min_w_0().child(brand).child(breadcrumb))
     }
 
     fn render_pairing(&self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {

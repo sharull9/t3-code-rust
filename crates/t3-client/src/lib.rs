@@ -15,6 +15,7 @@
 
 pub mod auth;
 mod error;
+pub mod pending;
 pub mod rpc;
 pub mod state;
 pub mod types;
@@ -30,6 +31,66 @@ pub use error::{Error, RpcError};
 pub use rpc::{RpcSession, Subscription};
 pub use state::{ShellState, ThreadState, sort_settled_threads};
 pub use types::*;
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum ThreadAction {
+    Pin(bool),
+    Settle(bool),
+    Archive,
+    RuntimeMode(String),
+    InteractionMode(String),
+    Model(Value),
+    Approval { request_id: String, decision: String },
+    UserInput { request_id: String, answers: Value },
+    DismissUserInput { request_id: String },
+}
+
+impl ThreadAction {
+    pub fn command(&self, thread_id: &str) -> Value {
+        let kind = match self {
+            Self::Pin(true) => "thread.pin",
+            Self::Pin(false) => "thread.unpin",
+            Self::Settle(true) => "thread.settle",
+            Self::Settle(false) => "thread.unsettle",
+            Self::Archive => "thread.archive",
+            Self::RuntimeMode(_) => "thread.runtime-mode.set",
+            Self::InteractionMode(_) => "thread.interaction-mode.set",
+            Self::Model(_) => "thread.meta.update",
+            Self::Approval { .. } => "thread.approval.respond",
+            Self::UserInput { .. } => "thread.user-input.respond",
+            Self::DismissUserInput { .. } => "thread.user-input.dismiss",
+        };
+        let mut command = json!({ "type": kind, "commandId": new_id(), "threadId": thread_id });
+        match self {
+            Self::Settle(false) => command["reason"] = json!("user"),
+            Self::RuntimeMode(mode) => {
+                command["runtimeMode"] = json!(mode);
+                command["createdAt"] = json!(now_iso());
+            }
+            Self::InteractionMode(mode) => {
+                command["interactionMode"] = json!(mode);
+                command["createdAt"] = json!(now_iso());
+            }
+            Self::Model(model) => command["modelSelection"] = model.clone(),
+            Self::Approval { request_id, decision } => {
+                command["requestId"] = json!(request_id);
+                command["decision"] = json!(decision);
+                command["createdAt"] = json!(now_iso());
+            }
+            Self::UserInput { request_id, answers } => {
+                command["requestId"] = json!(request_id);
+                command["answers"] = answers.clone();
+                command["createdAt"] = json!(now_iso());
+            }
+            Self::DismissUserInput { request_id } => {
+                command["requestId"] = json!(request_id);
+                command["createdAt"] = json!(now_iso());
+            }
+            _ => {}
+        }
+        command
+    }
+}
 
 /// An authenticated RPC session with one environment.
 #[derive(Clone)]
@@ -48,16 +109,18 @@ impl Connection {
         &self.rpc
     }
 
+    pub async fn server_config(&self) -> Result<ServerConfig, RpcError> {
+        let value = self.rpc.call("server.getConfig", json!({})).await?;
+        serde_json::from_value(value).map_err(|error| RpcError::Decode(error.to_string()))
+    }
+
     pub async fn closed(&self) -> String {
         self.rpc.closed().await
     }
 
     /// Projects and thread summaries: a snapshot, then live upserts/removals.
     pub fn subscribe_shell(&self) -> Result<Subscription<ShellStreamItem>, RpcError> {
-        self.rpc.subscribe(
-            methods::SUBSCRIBE_SHELL,
-            json!({ "requestCompletionMarker": true }),
-        )
+        self.rpc.subscribe(methods::SUBSCRIBE_SHELL, json!({ "requestCompletionMarker": true }))
     }
 
     /// One thread's detail: a snapshot, then events. `turn_limit` bounds the
@@ -105,7 +168,11 @@ impl Connection {
         .await
     }
 
-    pub async fn interrupt(&self, thread_id: &str, turn_id: Option<&str>) -> Result<Value, RpcError> {
+    pub async fn interrupt(
+        &self,
+        thread_id: &str,
+        turn_id: Option<&str>,
+    ) -> Result<Value, RpcError> {
         let mut command = json!({
             "type": "thread.turn.interrupt",
             "commandId": new_id(),
@@ -176,4 +243,62 @@ pub fn new_id() -> String {
 
 fn now_iso() -> String {
     chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+}
+
+#[cfg(test)]
+mod command_tests {
+    use super::*;
+
+    #[test]
+    fn lifecycle_commands_follow_contract_required_fields() {
+        let command = ThreadAction::Settle(false).command("thread-1");
+        assert_eq!(command["type"], "thread.unsettle");
+        assert_eq!(command["reason"], "user");
+        assert_eq!(command["threadId"], "thread-1");
+        assert!(uuid::Uuid::parse_str(command["commandId"].as_str().unwrap()).is_ok());
+        assert!(ThreadAction::Archive.command("thread-1").get("reason").is_none());
+    }
+
+    #[test]
+    fn settings_commands_keep_instance_routing_and_mode_timestamps() {
+        let model = json!({ "instanceId": "custom-codex", "model": "model-1", "options": { "effort": "high" } });
+        assert_eq!(ThreadAction::Model(model.clone()).command("thread-1")["modelSelection"], model);
+        for action in [
+            ThreadAction::RuntimeMode("approval-required".into()),
+            ThreadAction::InteractionMode("plan".into()),
+        ] {
+            let command = action.command("thread-1");
+            assert!(
+                chrono::DateTime::parse_from_rfc3339(command["createdAt"].as_str().unwrap())
+                    .is_ok()
+            );
+        }
+    }
+
+    #[test]
+    fn server_models_decode_upstream_wire_names_and_optional_metadata() {
+        let config: ServerConfig = serde_json::from_value(json!({ "providers": [{
+            "instanceId": "my-agent", "driver": "codex", "enabled": true, "installed": true,
+            "models": [{ "slug": "model-1", "name": "Model one", "isCustom": false, "capabilities": null }]
+        }], "environment": { "id": "ignored" } })).unwrap();
+        assert_eq!(config.providers[0].models[0].id, "model-1");
+        assert_eq!(config.providers[0].models[0].label, "Model one");
+        assert!(!config.providers[0].requires_new_thread_for_model_change);
+    }
+
+    #[test]
+    fn question_commands_preserve_answers_and_use_distinct_dismiss_operation() {
+        let answers =
+            json!({ " exact question ": [" exact value ", "B"], "text": "Written answer" });
+        let command =
+            ThreadAction::UserInput { request_id: "request-1".into(), answers: answers.clone() }
+                .command("thread-1");
+        assert_eq!(command["type"], "thread.user-input.respond");
+        assert_eq!(command["requestId"], "request-1");
+        assert_eq!(command["answers"], answers);
+        let dismiss =
+            ThreadAction::DismissUserInput { request_id: "request-1".into() }.command("thread-1");
+        assert_eq!(dismiss["type"], "thread.user-input.dismiss");
+        assert!(dismiss.get("answers").is_none());
+    }
 }

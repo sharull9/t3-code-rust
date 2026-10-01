@@ -67,6 +67,10 @@ pub struct ThreadShell {
     pub id: String,
     pub project_id: String,
     pub title: String,
+    #[serde(default)]
+    pub model_selection: Option<Value>,
+    #[serde(default)]
+    pub worktree_path: Option<String>,
     /// `RuntimeMode`: "approval-required" | "auto-accept-edits" | "auto" | "full-access".
     pub runtime_mode: String,
     /// `ProviderInteractionMode`: "default" | "plan".
@@ -104,6 +108,40 @@ pub struct ThreadShell {
     pub latest_user_message_at: Option<String>,
     #[serde(default)]
     pub latest_turn: Option<LatestTurn>,
+}
+
+/// Configured instances and model IDs come from the connected server.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ServerConfig {
+    #[serde(default)]
+    pub providers: Vec<ServerProvider>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ServerProvider {
+    pub instance_id: String,
+    pub driver: String,
+    #[serde(default)]
+    pub display_name: Option<String>,
+    pub enabled: bool,
+    pub installed: bool,
+    #[serde(default)]
+    pub availability: Option<String>,
+    #[serde(default)]
+    pub requires_new_thread_for_model_change: bool,
+    #[serde(default)]
+    pub models: Vec<ServerModel>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ServerModel {
+    #[serde(rename = "slug")]
+    pub id: String,
+    #[serde(rename = "name")]
+    pub label: String,
+    #[serde(default, rename = "isDefault")]
+    pub is_default: bool,
 }
 
 fn default_interaction_mode() -> String {
@@ -214,7 +252,7 @@ pub enum ActivityTone {
 
 /// `OrchestrationThreadActivity`. `kind` and `payload` stay loosely typed on
 /// the wire (new tool lifecycle kinds must keep decoding); this client only
-/// renders `summary`, so `payload` itself is dropped rather than modeled.
+/// renders `summary` and reads approval details from the opaque `payload`.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Activity {
@@ -225,6 +263,8 @@ pub struct Activity {
     #[serde(default)]
     pub turn_id: Option<String>,
     pub created_at: String,
+    #[serde(default)]
+    pub payload: Value,
 }
 
 #[derive(Debug, Clone, Deserialize)]

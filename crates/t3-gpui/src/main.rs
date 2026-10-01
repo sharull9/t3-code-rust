@@ -5,6 +5,7 @@ mod sidebar;
 mod thread_view;
 mod transcript;
 mod ui;
+mod user_input;
 
 use gpui_kit::component::TitleBar;
 use gpui_kit::*;
