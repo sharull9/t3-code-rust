@@ -4,7 +4,8 @@
 //! keeps selected paths and upload state, emits work requests, and accepts
 //! completion only when its request id still matches the row.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime};
 
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::{ActiveTheme as _, Disableable as _, Sizable as _, h_flex, v_flex};
@@ -162,7 +163,13 @@ impl AttachmentPanel {
 
     pub fn remove(&mut self, local_id: &str, cx: &mut Context<Self>) {
         let before = self.rows.len();
-        self.rows.retain(|row| row.attachment.id != local_id);
+        self.rows.retain(|row| {
+            let keep = row.attachment.id != local_id;
+            if !keep {
+                discard_pasted(&row.attachment.path);
+            }
+            keep
+        });
         if self.rows.len() != before {
             cx.notify();
         }
@@ -201,7 +208,11 @@ impl AttachmentPanel {
             return;
         };
         row.status = match result {
-            Ok(uploaded) => AttachmentStatus::Uploaded(uploaded),
+            Ok(uploaded) => {
+                // The server has the bytes; a failed upload keeps its copy for retry.
+                discard_pasted(&row.attachment.path);
+                AttachmentStatus::Uploaded(uploaded)
+            }
             Err(error) => AttachmentStatus::Failed(error),
         };
         cx.notify();
@@ -210,6 +221,76 @@ impl AttachmentPanel {
     fn allocate_request_id(&mut self) -> u64 {
         self.next_request_id = self.next_request_id.wrapping_add(1).max(1);
         self.next_request_id
+    }
+}
+
+/// Unsent pastes older than this are removed the next time an image is pasted.
+const PASTED_MAX_AGE: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+
+fn pasted_dir() -> PathBuf {
+    dirs::data_local_dir().unwrap_or_else(std::env::temp_dir).join("t3-gpui").join("pasted")
+}
+
+/// Writes a pasted clipboard image where the tray can upload it from. The
+/// server accepts PNG, JPEG, WebP and GIF images, so other bitmaps (Windows
+/// screenshots arrive as BMP) are converted to PNG.
+pub fn save_pasted_image(image: &Image) -> Result<PathBuf, String> {
+    save_pasted_image_in(&pasted_dir(), image)
+}
+
+fn save_pasted_image_in(directory: &Path, image: &Image) -> Result<PathBuf, String> {
+    let (extension, bytes) = match image.format {
+        ImageFormat::Png => ("png", image.bytes.clone()),
+        ImageFormat::Jpeg => ("jpg", image.bytes.clone()),
+        ImageFormat::Webp => ("webp", image.bytes.clone()),
+        ImageFormat::Gif => ("gif", image.bytes.clone()),
+        ImageFormat::Svg => {
+            return Err("SVG images can't be pasted. Attach the file instead.".into());
+        }
+        _ => ("png", to_png(&image.bytes)?),
+    };
+    std::fs::create_dir_all(directory).map_err(|error| error.to_string())?;
+    prune_pasted(directory);
+    let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S");
+    let mut path = directory.join(format!("pasted-image-{stamp}.{extension}"));
+    let mut n = 1;
+    while path.exists() {
+        n += 1;
+        path = directory.join(format!("pasted-image-{stamp}-{n}.{extension}"));
+    }
+    std::fs::write(&path, bytes).map_err(|error| error.to_string())?;
+    Ok(path)
+}
+
+fn to_png(bytes: &[u8]) -> Result<Vec<u8>, String> {
+    let decoded = image::load_from_memory(bytes)
+        .map_err(|error| format!("unsupported image data ({error})"))?;
+    let mut png = std::io::Cursor::new(Vec::new());
+    decoded
+        .write_to(&mut png, image::ImageFormat::Png)
+        .map_err(|error| format!("could not convert the image to PNG ({error})"))?;
+    Ok(png.into_inner())
+}
+
+/// Removes old pastes left behind by drafts that were never sent.
+fn prune_pasted(directory: &Path) {
+    let Ok(entries) = std::fs::read_dir(directory) else { return };
+    let now = SystemTime::now();
+    for entry in entries.flatten() {
+        let old = entry
+            .metadata()
+            .and_then(|metadata| metadata.modified())
+            .is_ok_and(|modified| now.duration_since(modified).unwrap_or_default() > PASTED_MAX_AGE);
+        if old {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
+/// Deletes `path` if it is a paste this app saved; chosen files are never touched.
+fn discard_pasted(path: &Path) {
+    if path.parent() == Some(pasted_dir().as_path()) {
+        let _ = std::fs::remove_file(path);
     }
 }
 
@@ -426,5 +507,30 @@ mod tests {
             assert!(matches!(&rows[0].status, AttachmentStatus::Uploading));
         })
         .unwrap();
+    }
+}
+
+#[cfg(test)]
+mod pasted_tests {
+    use super::*;
+    use core::prelude::v1::test;
+
+    fn bmp() -> Vec<u8> {
+        let mut bytes = std::io::Cursor::new(Vec::new());
+        image::RgbImage::new(2, 2).write_to(&mut bytes, image::ImageFormat::Bmp).unwrap();
+        bytes.into_inner()
+    }
+
+    #[test]
+    fn bitmaps_become_png_images_and_svg_is_refused() {
+        let directory = std::env::temp_dir().join(format!("t3-gpui-paste-{}", std::process::id()));
+        let image = Image { format: ImageFormat::Bmp, bytes: bmp(), id: 1 };
+        let path = save_pasted_image_in(&directory, &image).unwrap();
+        assert_eq!(path.extension().and_then(|e| e.to_str()), Some("png"));
+        let attachment = LocalAttachment::from_path(&path).unwrap();
+        assert_eq!(attachment.kind, t3_client::attachments::AttachmentKind::Image);
+        let svg = Image { format: ImageFormat::Svg, bytes: b"<svg/>".to_vec(), id: 2 };
+        assert!(save_pasted_image_in(&directory, &svg).is_err());
+        let _ = std::fs::remove_dir_all(directory);
     }
 }

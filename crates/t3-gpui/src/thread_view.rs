@@ -71,6 +71,10 @@ pub struct ThreadView {
     /// until the cursor leaves that word.
     dismissed_mention: Option<usize>,
     next_file_search: u64,
+    /// Names of the skills the composer can chip; a draft restored before
+    /// they arrived is chipped again once they change.
+    skill_names: Vec<String>,
+    retokenize_pending: bool,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -183,6 +187,8 @@ impl ThreadView {
             mention: None,
             dismissed_mention: None,
             next_file_search: 0,
+            skill_names: Vec::new(),
+            retokenize_pending: false,
             _subscriptions: subscriptions,
         }
     }
@@ -234,6 +240,47 @@ impl ThreadView {
             (self.providers.clone(), self.selection(), self.is_started(cx));
         self.model_picker
             .update(cx, |picker, cx| picker.set_context(providers, selection, started, cx));
+        let skill_names: Vec<String> = self
+            .selected_provider()
+            .map(|provider| provider.invocable_skills(self.cwd.as_deref()))
+            .unwrap_or_default()
+            .into_iter()
+            .map(|skill| skill.name.clone())
+            .collect();
+        if skill_names != self.skill_names {
+            self.skill_names = skill_names;
+            self.retokenize_pending = true;
+            cx.notify();
+        }
+    }
+
+    /// Chips the mentions in the composer that are still plain text, such
+    /// as `$skill` in a draft restored before the provider's skills arrived.
+    /// Existing chips and the cursor stay where they are.
+    fn retokenize(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let content = self.tokenized(&self.draft(cx));
+        let existing = self.composer.read(cx).tokens().to_vec();
+        let missing: Vec<_> = content
+            .tokens()
+            .iter()
+            .filter(|span| {
+                !existing.iter().any(|chip| {
+                    chip.range().start < span.range().end && span.range().start < chip.range().end
+                })
+            })
+            .cloned()
+            .collect();
+        if missing.is_empty() {
+            return;
+        }
+        self.composer.update(cx, |state, cx| {
+            let selection = state.selected_range();
+            for span in missing.iter().rev() {
+                let _ = state.replace_range_with_token(span.range(), span.token().clone(), window, cx);
+            }
+            // A chip's text equals the text it replaces, so offsets are unchanged.
+            state.set_selected_range(selection, cx);
+        });
     }
 
     pub fn thread_id(&self) -> &str {
@@ -596,11 +643,15 @@ impl ThreadView {
         }
         // Office apps put a picture of copied text beside the text itself;
         // only a bare image is an image paste.
-        if files.is_empty()
-            && text.is_none_or(|text| text.trim().is_empty())
-            && let Some(image) = image
-        {
-            match save_pasted_image(image) {
+        let image = image.filter(|_| files.is_empty() && text.is_none_or(|t| t.trim().is_empty()));
+        if (!files.is_empty() || image.is_some()) && !(self.connected && self.thread_loaded) {
+            cx.emit(ThreadViewEvent::Attachment(AttachmentPanelEvent::Rejected(
+                "Wait for the thread to connect before pasting files or images.".into(),
+            )));
+            return true;
+        }
+        if let Some(image) = image {
+            match crate::attachments::save_pasted_image(image) {
                 Ok(path) => files.push(path),
                 Err(error) => {
                     cx.emit(ThreadViewEvent::Attachment(AttachmentPanelEvent::Rejected(format!(
@@ -611,9 +662,7 @@ impl ThreadView {
             }
         }
         if !files.is_empty() {
-            if self.connected && self.thread_loaded {
-                self.attachments.update(cx, |panel, cx| panel.add_paths(files, cx));
-            }
+            self.attachments.update(cx, |panel, cx| panel.add_paths(files, cx));
             return true;
         }
         let Some(text) = text else { return false };
@@ -647,6 +696,9 @@ impl ThreadView {
 
 impl Render for ThreadView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if std::mem::take(&mut self.retokenize_pending) {
+            cx.defer_in(window, |this, window, cx| this.retokenize(window, cx));
+        }
         let theme = cx.theme();
         let working = self.is_working(cx);
         let has_user_input = self.thread_loaded && self.user_input.read(cx).has_requests();
@@ -1071,34 +1123,6 @@ fn clean_pasted_text(text: &str) -> String {
     text.replace("\r\n", "\n").replace('\r', "\n").replace(['\u{a0}', '\u{202f}'], " ")
 }
 
-/// Writes a pasted image where the attachment tray can upload it from.
-fn save_pasted_image(image: &Image) -> std::io::Result<std::path::PathBuf> {
-    let extension = match image.format {
-        ImageFormat::Png => "png",
-        ImageFormat::Jpeg => "jpg",
-        ImageFormat::Webp => "webp",
-        ImageFormat::Gif => "gif",
-        ImageFormat::Svg => "svg",
-        ImageFormat::Bmp => "bmp",
-        ImageFormat::Tiff => "tiff",
-        _ => "png",
-    };
-    let directory = dirs::data_local_dir()
-        .unwrap_or_else(std::env::temp_dir)
-        .join("t3-gpui")
-        .join("pasted");
-    std::fs::create_dir_all(&directory)?;
-    let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S");
-    let mut path = directory.join(format!("pasted-image-{stamp}.{extension}"));
-    let mut n = 1;
-    while path.exists() {
-        n += 1;
-        path = directory.join(format!("pasted-image-{stamp}-{n}.{extension}"));
-    }
-    std::fs::write(&path, &image.bytes)?;
-    Ok(path)
-}
-
 /// Compares the [`ThreadShell`] fields this view actually renders
 /// (`render`'s branch/provider/runtime/mode/session-error chips and
 /// `is_working`'s working spinner), so `set_shell` can skip `cx.notify()`
@@ -1385,6 +1409,79 @@ mod composer_tests {
             assert_eq!(tokens[0].token().label().as_ref(), "a b.md");
         })
         .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn skills_in_a_restored_draft_become_chips_once_the_provider_arrives(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let (handle, view) = cx.update(|cx| {
+            gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+                let panel = cx.new(UserInputPanel::new);
+                cx.new(|cx| ThreadView::new("thread-1".into(), panel, window, cx))
+            })
+            .unwrap()
+        });
+        let shell: ThreadShell = serde_json::from_value(json!({
+            "id": "thread-1", "projectId": "project-1", "title": "T", "runtimeMode": "full-access",
+            "createdAt": "2026-10-01T00:00:00Z", "updatedAt": "2026-10-01T00:00:00Z",
+            "modelSelection": { "instanceId": "claude-a", "model": "opus" }
+        }))
+        .unwrap();
+        let providers: Vec<t3_client::ServerProvider> = serde_json::from_value(json!([
+            {"instanceId":"claude-a","driver":"claudeAgent","enabled":true,"installed":true,
+             "models":[{"slug":"opus","name":"Opus"}],
+             "skills":[{"name":"fallow","path":"/s/fallow","enabled":true}]}
+        ]))
+        .unwrap();
+        cx.update_window(handle, |_, window, cx| {
+            view.update(cx, |view, cx| view.restore_draft("run $fallow on @src/a.ts now", false, window, cx));
+            assert_eq!(view.read(cx).composer.read(cx).tokens().len(), 1, "skills are unknown yet");
+            view.update(cx, |view, cx| {
+                view.set_shell(Some(shell), cx);
+                view.set_providers(providers, cx);
+            });
+            window.render_frame(cx);
+        })
+        .unwrap();
+        cx.update_window(handle, |_, _, cx| {
+            let tokens = view.read(cx).composer.read(cx).tokens().to_vec();
+            let labels: Vec<_> = tokens.iter().map(|t| t.token().label().to_string()).collect();
+            assert_eq!(labels, ["Fallow", "a.ts"]);
+            assert_eq!(view.read(cx).draft(cx), "run $fallow on @src/a.ts now");
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn pasting_files_before_the_thread_is_ready_reports_an_error(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let (handle, view) = cx.update(|cx| {
+            gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+                let panel = cx.new(UserInputPanel::new);
+                cx.new(|cx| ThreadView::new("thread-1".into(), panel, window, cx))
+            })
+            .unwrap()
+        });
+        let rejected = Rc::new(RefCell::new(Vec::new()));
+        let capture = rejected.clone();
+        let _subscription = cx.update(|cx| {
+            cx.subscribe(&view, move |_, event: &ThreadViewEvent, _| {
+                if let ThreadViewEvent::Attachment(AttachmentPanelEvent::Rejected(message)) = event {
+                    capture.borrow_mut().push(message.clone());
+                }
+            })
+        });
+        cx.update_window(handle, |_, window, cx| {
+            let item = ClipboardItem {
+                entries: vec![ClipboardEntry::ExternalPaths(ExternalPaths(
+                    vec![std::path::PathBuf::from("C:/missing/file.txt")].into(),
+                ))],
+            };
+            let handled = view.update(cx, |view, cx| view.paste(&item, window, cx));
+            assert!(handled);
+        })
+        .unwrap();
+        assert_eq!(rejected.borrow().len(), 1, "the paste is reported, not silently dropped");
     }
 
     #[test]
