@@ -1,5 +1,5 @@
-//! Small app-wide preferences that are not tied to a server: favorite models
-//! and the appearance. Stored beside the drafts as `prefs.json`.
+//! Small app-wide preferences that are not tied to a server: favorite and
+//! hidden models, and the appearance. Stored beside the drafts as `prefs.json`.
 
 use std::path::PathBuf;
 
@@ -11,6 +11,8 @@ use serde::{Deserialize, Serialize};
 pub struct Prefs {
     /// `"<instanceId>/<model>"` keys, in the order they were starred.
     pub favorite_models: Vec<String>,
+    /// `"<instanceId>/<model>"` keys left out of the model picker.
+    pub hidden_models: Vec<String>,
     pub light_theme: bool,
 }
 
@@ -41,7 +43,8 @@ impl Prefs {
     pub fn update(cx: &mut App, change: impl FnOnce(&mut Self)) {
         let mut prefs = Self::global(cx).clone();
         change(&mut prefs);
-        if let Some(path) = path() {
+        // Tests change preferences without touching the user's saved file.
+        if let Some(path) = path().filter(|_| !cfg!(test)) {
             let saved = path
                 .parent()
                 .map_or(Ok(()), std::fs::create_dir_all)
@@ -63,6 +66,31 @@ impl Prefs {
             }
         });
     }
+
+    pub fn is_hidden(&self, instance_id: &str, model: &str) -> bool {
+        self.hidden_models.contains(&favorite_key(instance_id, model))
+    }
+
+    pub fn set_model_hidden(cx: &mut App, instance_id: &str, model: &str, hidden: bool) {
+        Self::set_models_hidden(cx, instance_id, [model], hidden);
+    }
+
+    /// Shows or hides several models of one instance in a single save.
+    pub fn set_models_hidden<'a>(
+        cx: &mut App,
+        instance_id: &str,
+        models: impl IntoIterator<Item = &'a str>,
+        hidden: bool,
+    ) {
+        let keys: Vec<String> = models.into_iter().map(|model| favorite_key(instance_id, model)).collect();
+        Self::update(cx, |prefs| {
+            prefs.hidden_models.retain(|key| !keys.contains(key));
+            if hidden {
+                prefs.hidden_models.extend(keys);
+            }
+        });
+    }
 }
 
-static EMPTY: Prefs = Prefs { favorite_models: Vec::new(), light_theme: false };
+static EMPTY: Prefs =
+    Prefs { favorite_models: Vec::new(), hidden_models: Vec::new(), light_theme: false };

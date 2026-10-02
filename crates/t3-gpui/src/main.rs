@@ -6,6 +6,7 @@ mod drafts;
 mod fonts;
 mod limits_view;
 mod managed_server;
+mod mentions;
 mod model_picker;
 mod prefs;
 mod provider_logo;

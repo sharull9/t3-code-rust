@@ -206,6 +206,9 @@ pub enum WorkspaceRequest {
     RestartTerminal { thread_id: String, terminal_id: String, cwd: String },
     WriteTerminal { thread_id: String, terminal_id: String, data: String },
     CloseTerminal { thread_id: String, terminal_id: Option<String> },
+    /// `projects.searchEntries`: fuzzy file search for `@` mentions. An empty
+    /// query returns recently used entries.
+    SearchEntries { cwd: String, query: String, limit: u32 },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -217,6 +220,7 @@ pub enum WorkspaceResponse {
     DiffPreview(WorkspaceDiffPreview),
     BrowseDirectories(WorkspaceBrowseResult),
     Terminal(WorkspaceTerminal),
+    Entries(WorkspaceDirectory),
     Ack,
 }
 
@@ -281,6 +285,11 @@ impl WorkspaceRequest {
                 close_terminal_payload(thread_id, terminal_id.as_deref()),
                 ResponseKind::Ack,
             ),
+            Self::SearchEntries { cwd, query, limit } => (
+                "projects.searchEntries",
+                json!({ "cwd": cwd, "query": query.trim(), "limit": limit }),
+                ResponseKind::Entries,
+            ),
         };
         let value: Value = connection.rpc().call(method, payload).await?;
         match response {
@@ -293,6 +302,7 @@ impl WorkspaceRequest {
                 decode(value).map(WorkspaceResponse::BrowseDirectories)
             }
             ResponseKind::Terminal => decode(value).map(WorkspaceResponse::Terminal),
+            ResponseKind::Entries => decode(value).map(WorkspaceResponse::Entries),
             ResponseKind::Ack => Ok(WorkspaceResponse::Ack),
         }
     }
@@ -307,6 +317,7 @@ enum ResponseKind {
     DiffPreview,
     BrowseDirectories,
     Terminal,
+    Entries,
     Ack,
 }
 
