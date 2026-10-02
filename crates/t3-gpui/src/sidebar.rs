@@ -1,6 +1,6 @@
 //! Thread sidebar: search, thread list and connection status.
 //!
-//! Lives in its own entity so the "Working" loader's per-frame redraws (see
+//! Lives in its own entity so the "Working" loaders' per-frame redraws (see
 //! `Window::request_animation_frame`) dirty only this view and its ancestors;
 //! the open thread is a cached sibling and is not re-rendered. The
 //! filtered/sorted thread list and the project lookup are cached here too, so
@@ -28,6 +28,7 @@ pub enum SidebarEvent {
     OpenDraft(String),
     DiscardDraft(String),
     OpenSettings,
+    ToggleUsage,
     LoadArchived(String),
     SwitchServer,
     AddProject,
@@ -54,10 +55,15 @@ pub struct Sidebar {
     shell: ShellState,
     status: Status,
     open_thread_id: Option<String>,
-    /// Unarchived, un-settled threads matching the search query: pinned
-    /// first, then most recently updated. Recomputed only when `shell` or
-    /// the query changes.
+    /// Unarchived, un-settled, idle threads matching the search query:
+    /// pinned first, then most recently updated. Recomputed only when
+    /// `shell` or the query changes.
     active: Vec<ThreadShell>,
+    /// Matching threads with a turn running, most recently updated first.
+    /// Shown in their own collapsible shelf above "Settled".
+    working: Vec<ThreadShell>,
+    working_expanded: bool,
+    usage_open: bool,
     /// Unarchived, settled threads matching the search query (see
     /// `ThreadShell::is_settled`), newest-settled first. Collapsed behind
     /// the "Settled (N)" divider until `settled_expanded` or the user is
@@ -115,6 +121,9 @@ impl Sidebar {
             status: Status::Connecting(String::new()),
             open_thread_id: None,
             active: Vec::new(),
+            working: Vec::new(),
+            working_expanded: true,
+            usage_open: false,
             settled: Vec::new(),
             settled_expanded: false,
             projects: HashMap::new(),
@@ -182,6 +191,11 @@ impl Sidebar {
             self.unsent = unsent;
             cx.notify();
         }
+    }
+
+    pub fn set_usage_open(&mut self, open: bool, cx: &mut Context<Self>) {
+        self.usage_open = open;
+        cx.notify();
     }
 
     pub fn set_open_thread(&mut self, thread_id: Option<String>, cx: &mut Context<Self>) {
@@ -273,7 +287,7 @@ impl Sidebar {
         cx.notify();
     }
 
-    /// Rebuilds `active`, `settled` and `projects` from `shell` and the
+    /// Rebuilds `active`, `working`, `settled` and `projects` from `shell` and the
     /// search query. Search matches across both: a settled thread that
     /// matches still needs to be findable, it's just collapsed by default
     /// (see `render`, which expands the shelf while searching).
@@ -296,14 +310,17 @@ impl Sidebar {
             })
             .collect();
 
-        let mut active: Vec<ThreadShell> =
-            matching.iter().filter(|t| !t.is_settled()).map(|t| (*t).clone()).collect();
-        // Working threads lead under their own header, like T3's sidebar.
-        let working = |t: &ThreadShell| matches!(thread_badge(t), Some(Badge::Working));
+        let is_working = |t: &ThreadShell| matches!(thread_badge(t), Some(Badge::Working));
+        let (mut working, mut active): (Vec<ThreadShell>, Vec<ThreadShell>) = matching
+            .iter()
+            .filter(|t| !t.is_settled())
+            .map(|t| (*t).clone())
+            .partition(|t| is_working(t));
+        working.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
         active.sort_by(|a, b| {
-            working(b)
-                .cmp(&working(a))
-                .then_with(|| b.pinned_at.is_some().cmp(&a.pinned_at.is_some()))
+            b.pinned_at
+                .is_some()
+                .cmp(&a.pinned_at.is_some())
                 .then_with(|| b.updated_at.cmp(&a.updated_at))
         });
 
@@ -312,6 +329,7 @@ impl Sidebar {
         sort_settled_threads(&mut settled);
 
         self.active = active;
+        self.working = working;
         self.settled = settled;
         cx.notify();
     }
@@ -337,26 +355,32 @@ impl Render for Sidebar {
                 .map(|(ix, draft)| self.render_draft_card(ix, draft, cx).into_any_element())
                 .collect()
         };
-        let working_count = self
+        let mut active_cards: Vec<_> = self
             .active
             .iter()
-            .take_while(|thread| matches!(thread_badge(thread), Some(Badge::Working)))
-            .count();
-        let mut active_cards: Vec<_> = Vec::with_capacity(self.active.len() + 2);
-        for (ix, thread) in self.active.iter().enumerate() {
-            if ix == 0 && working_count > 0 {
-                active_cards.push(section_header("Working", cx).into_any_element());
-            }
-            if ix == working_count && working_count > 0 {
-                active_cards.push(section_header("Recent", cx).into_any_element());
-            }
-            let active = self.open_thread_id.as_deref() == Some(thread.id.as_str());
-            active_cards
-                .push(self.render_thread_card("active-thread", ix, thread, active, cx).into_any_element());
-        }
-        // Searching surfaces settled matches too, rather than making the
-        // user expand the shelf first to find what they typed for.
+            .enumerate()
+            .map(|(ix, thread)| {
+                let active = self.open_thread_id.as_deref() == Some(thread.id.as_str());
+                self.render_thread_card("active-thread", ix, thread, active, cx).into_any_element()
+            })
+            .collect();
+        // Searching surfaces collapsed matches too, rather than making the
+        // user expand a shelf first to find what they typed for.
         let searching = !self.search.read(cx).value().trim().is_empty();
+        let working_expanded = self.working_expanded || searching;
+        let working_cards: Vec<_> = if working_expanded && !self.archive_mode {
+            self.working
+                .iter()
+                .enumerate()
+                .map(|(ix, thread)| {
+                    let active = self.open_thread_id.as_deref() == Some(thread.id.as_str());
+                    self.render_thread_card("working-thread", ix, thread, active, cx)
+                        .into_any_element()
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
         let settled_expanded = self.settled_expanded || searching;
         let mut settled_cards: Vec<_> = if settled_expanded {
             self.settled
@@ -393,11 +417,16 @@ impl Render for Sidebar {
         }
         let empty = active_cards.is_empty()
             && draft_cards.is_empty()
-            && (self.archive_mode || self.settled.is_empty());
-        let divider = (!self.archive_mode && !self.settled.is_empty())
-            .then(|| self.render_settled_divider(settled_expanded, cx).into_any_element());
-        // The shelf sits at the bottom of the sidebar; open, it takes at
-        // most 40% of the window's height and scrolls on its own.
+            && (self.archive_mode || (self.settled.is_empty() && self.working.is_empty()));
+        let working_divider = (!self.archive_mode && !self.working.is_empty()).then(|| {
+            self.render_shelf_divider(Shelf::Working, working_expanded, cx).into_any_element()
+        });
+        let divider = (!self.archive_mode && !self.settled.is_empty()).then(|| {
+            self.render_shelf_divider(Shelf::Settled, settled_expanded, cx).into_any_element()
+        });
+        // The shelves sit at the bottom of the sidebar; open, each takes a
+        // capped share of the window's height and scrolls on its own.
+        let working_max_h = window.viewport_size().height * 0.3;
         let settled_max_h = window.viewport_size().height * 0.4;
 
         let theme = cx.theme();
@@ -575,6 +604,28 @@ impl Render for Sidebar {
                         }),
                 ),
             )
+            .when_some(working_divider, |sidebar, divider| {
+                sidebar.child(
+                    v_flex()
+                        .flex_none()
+                        .px_2()
+                        .pt_1()
+                        .border_t_1()
+                        .border_color(theme.sidebar_border)
+                        .child(divider)
+                        .when(!working_cards.is_empty(), |shelf| {
+                            shelf.child(
+                                div()
+                                    .id("working-list")
+                                    .max_h(working_max_h)
+                                    .overflow_y_scrollbar()
+                                    .child(
+                                        v_flex().gap_0p5().pb_2().children(working_cards),
+                                    ),
+                            )
+                        }),
+                )
+            })
             .when_some(divider, |sidebar, divider| {
                 sidebar.child(
                     v_flex()
@@ -635,25 +686,42 @@ impl Render for Sidebar {
                             .on_click(cx.listener(|_, _, _, cx| {
                                 cx.emit(SidebarEvent::OpenSettings);
                             })),
+                    )
+                    .child(
+                        Button::new("sidebar-usage")
+                            .ghost()
+                            .small()
+                            .when(self.usage_open, |button| button.primary())
+                            .icon(icon(IconName::ChartNoAxesColumn))
+                            .tooltip("Usage")
+                            .on_click(cx.listener(|_, _, _, cx| {
+                                cx.emit(SidebarEvent::ToggleUsage);
+                            })),
                     ),
             )
     }
 }
 
 impl Sidebar {
-    /// The collapsed "Settled (N)" divider: label, a thin rule, and a
-    /// chevron that flips to expand. Expanding reveals the full settled
+    /// A shelf's divider, such as the collapsed "Settled (N)": label, a thin
+    /// rule, and a chevron that flips to expand. Expanding reveals the full
     /// list in place, same as the T3 desktop app's shelf.
-    fn render_settled_divider(&self, expanded: bool, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_shelf_divider(
+        &self,
+        shelf: Shelf,
+        expanded: bool,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         let theme = cx.theme();
-        let label = if expanded {
-            "Settled".to_owned()
-        } else {
-            format!("Settled ({})", self.settled.len())
+        let (id, name, count) = match shelf {
+            Shelf::Working => ("working-divider", "Working", self.working.len()),
+            Shelf::Settled => ("settled-divider", "Settled", self.settled.len()),
         };
+        let label = if expanded { name.to_owned() } else { format!("{name} ({count})") };
 
         h_flex()
-            .id("settled-divider")
+            .id(id)
+            .test_support()
             .gap_2()
             .items_center()
             .px_3()
@@ -661,8 +729,11 @@ impl Sidebar {
             .cursor_pointer()
             .text_xs()
             .text_color(theme.muted_foreground)
-            .on_click(cx.listener(|this, _, _, cx| {
-                this.settled_expanded = !this.settled_expanded;
+            .on_click(cx.listener(move |this, _, _, cx| {
+                match shelf {
+                    Shelf::Working => this.working_expanded = !this.working_expanded,
+                    Shelf::Settled => this.settled_expanded = !this.settled_expanded,
+                }
                 cx.notify();
             }))
             .child(label)
@@ -809,8 +880,11 @@ impl Sidebar {
             });
         // Distinct from `list` so the loader's id never collides with the
         // card's own id (both would otherwise share `(list, ix)`).
-        let working_key: &'static str =
-            if list == "active-thread" { "active-working" } else { "settled-working" };
+        let working_key: &'static str = match list {
+            "active-thread" => "active-working",
+            "working-thread" => "working-working",
+            _ => "settled-working",
+        };
 
         let trailing = match thread_badge(thread) {
             Some(badge) => h_flex()
@@ -978,19 +1052,11 @@ impl Badge {
     }
 }
 
-/// A small uppercase-free section label with a rule, like "Settled (N)".
-fn section_header(label: &'static str, cx: &App) -> impl IntoElement {
-    let theme = cx.theme();
-    h_flex()
-        .gap_2()
-        .items_center()
-        .px_3()
-        .pt_2()
-        .pb_1()
-        .text_xs()
-        .text_color(theme.muted_foreground)
-        .child(label)
-        .child(div().flex_1().h(px(1.)).bg(theme.sidebar_border))
+/// The collapsible lists at the bottom of the sidebar.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Shelf {
+    Working,
+    Settled,
 }
 
 /// When the running turn started, for the "Working 7m" label.
@@ -1072,6 +1138,49 @@ mod interaction_tests {
             assert_eq!(window.find("sidebar-settings").bounds(), footer);
         })
         .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn working_threads_sit_in_a_collapsible_shelf_above_settled(cx: &mut TestAppContext) {
+        let (handle, sidebar) = sidebar(cx);
+        let events = Rc::new(RefCell::new(0));
+        let capture = events.clone();
+        let _subscription = cx.update(|cx| {
+            cx.subscribe(&sidebar, move |_, event: &SidebarEvent, _| {
+                if matches!(event, SidebarEvent::ToggleUsage) {
+                    *capture.borrow_mut() += 1;
+                }
+            })
+        });
+        cx.update_window(handle, |_, window, cx| {
+            sidebar.update(cx, |sidebar, cx| {
+                let mut running = thread("running", false);
+                running.session = serde_json::from_value(json!({ "status": "running" })).unwrap();
+                let mut settled = thread("settled", false);
+                settled.settled_override = Some("settled".into());
+                let shell = ShellState {
+                    threads: vec![thread("idle", false), running, settled],
+                    ..Default::default()
+                };
+                sidebar.set_shell(shell, cx);
+                assert_eq!(sidebar.active.len(), 1);
+                assert_eq!(sidebar.working.len(), 1);
+            });
+            window.render_frame(cx);
+            assert!(window.find(("working-thread", 0usize)).visible());
+            let working = window.find("working-divider").bounds();
+            let settled = window.find("settled-divider").bounds();
+            assert!(working.origin.y < settled.origin.y);
+            assert!(window.find(("active-thread", 0usize)).bounds().origin.y < working.origin.y);
+
+            window.click("working-divider", cx);
+            window.render_frame(cx);
+            assert!(window.try_find(("working-thread", 0usize)).is_none());
+
+            window.click("sidebar-usage", cx);
+        })
+        .unwrap();
+        assert_eq!(*events.borrow(), 1);
     }
 
     #[gpui_kit::test]

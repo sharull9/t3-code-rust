@@ -26,6 +26,7 @@ use crate::settings::{SettingsEvent, SettingsPanel};
 use crate::sidebar::{Sidebar, SidebarEvent};
 use crate::thread_view::{ThreadView, ThreadViewEvent};
 use crate::ui::{self, SIDEBAR_WIDTH, icon};
+use crate::usage::{UsageEvent, UsageView};
 use crate::user_input::UserInputPanel;
 use crate::workspace::{WorkspaceEvent, WorkspacePanel, WorkspaceScope};
 
@@ -81,6 +82,9 @@ pub struct T3App {
     workspace_open: bool,
     directory_picker: Entity<DirectoryPicker>,
     settings: Entity<SettingsPanel>,
+    usage: Entity<UsageView>,
+    /// The usage page replaces the open thread in the main column.
+    usage_open: bool,
     question_panels: HashMap<String, Entity<UserInputPanel>>,
     sending: HashSet<String>,
     _thread_subscription: Option<Subscription>,
@@ -108,6 +112,7 @@ impl T3App {
         let workspace = cx.new(|cx| WorkspacePanel::new(window, cx));
         let directory_picker = cx.new(|cx| DirectoryPicker::new(window, cx));
         let settings = cx.new(SettingsPanel::new);
+        let usage = cx.new(UsageView::new);
         cx.on_release(|this, cx| {
             this.capture_current_drafts(cx);
             this.backend.flush_drafts(this.draft_store.clone());
@@ -185,6 +190,11 @@ impl T3App {
                 }
                 cx.notify();
             }),
+            cx.subscribe(&usage, |this, _, event: &UsageEvent, _| {
+                let UsageEvent::Load { request_id, window } = event;
+                this.backend
+                    .send(Command::LoadUsage { request_id: *request_id, window: window.clone() });
+            }),
             cx.subscribe(&workspace, |this, _, event: &WorkspaceEvent, _| {
                 let WorkspaceEvent::Request { request_id, scope, request } = event;
                 this.backend.send(Command::Workspace {
@@ -216,6 +226,7 @@ impl T3App {
                         this.settings.update(cx, |panel, cx| panel.toggle_open(cx));
                         cx.notify();
                     }
+                    SidebarEvent::ToggleUsage => this.set_usage_open(!this.usage_open, cx),
                     SidebarEvent::AddProject => this.add_project(window, cx),
                     SidebarEvent::NewThread => {
                         let projects = this.shell.projects.clone();
@@ -272,6 +283,8 @@ impl T3App {
             workspace_open: false,
             directory_picker,
             settings,
+            usage,
+            usage_open: false,
             question_panels: HashMap::new(),
             sending: HashSet::new(),
             _thread_subscription: None,
@@ -362,6 +375,7 @@ impl T3App {
                         sidebar.reset_environment(cx);
                         sidebar.set_shell(ShellState::default(), cx);
                     });
+                    self.usage.update(cx, |usage, cx| usage.reset(cx));
                 }
             }
             Event::NewThreadFinished { thread_id, success } => {
@@ -373,6 +387,13 @@ impl T3App {
                 let connected = matches!(status, Status::Connected(_));
                 self.settings.update(cx, |panel, cx| panel.set_connected(connected, cx));
                 self.workspace.update(cx, |panel, cx| panel.set_connected(connected, cx));
+                let usage_open = self.usage_open;
+                self.usage.update(cx, |usage, cx| {
+                    usage.set_connected(connected, cx);
+                    if connected && usage_open {
+                        usage.ensure_fresh(cx);
+                    }
+                });
                 if !connected {
                     self.directory_picker.update(cx, |picker, cx| picker.close(cx));
                 }
@@ -500,6 +521,9 @@ impl T3App {
                 if let Some(thread) = &self.thread {
                     thread.update(cx, |view, cx| view.set_providers(self.providers.clone(), cx));
                 }
+            }
+            Event::Usage { request_id, result } => {
+                self.usage.update(cx, |usage, cx| usage.finish(request_id, result, cx));
             }
             Event::Archived { request_id, snapshot } => {
                 self.sidebar
@@ -635,6 +659,7 @@ impl T3App {
 
     /// Shows a draft thread in place of the open thread.
     fn open_draft(&mut self, draft_id: String, window: &mut Window, cx: &mut Context<Self>) {
+        self.set_usage_open(false, cx);
         let Some(draft) = self.draft_threads.iter().find(|draft| draft.id == draft_id).cloned()
         else {
             return;
@@ -759,6 +784,7 @@ impl T3App {
     }
 
     fn open_thread(&mut self, thread_id: String, window: &mut Window, cx: &mut Context<Self>) {
+        self.set_usage_open(false, cx);
         if let Some(thread) = &self.thread {
             if thread.read(cx).thread_id() == thread_id && !thread.read(cx).is_draft() {
                 if !thread.read(cx).is_ready() && matches!(self.status, Status::Connected(_)) {
@@ -1004,6 +1030,18 @@ impl T3App {
         }));
     }
 
+    fn set_usage_open(&mut self, open: bool, cx: &mut Context<Self>) {
+        if self.usage_open == open {
+            return;
+        }
+        self.usage_open = open;
+        if open {
+            self.usage.update(cx, |usage, cx| usage.ensure_fresh(cx));
+        }
+        self.sidebar.update(cx, |sidebar, cx| sidebar.set_usage_open(open, cx));
+        cx.notify();
+    }
+
     fn toggle_workspace(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.workspace_open = !self.workspace_open;
         if self.workspace_open {
@@ -1037,6 +1075,8 @@ impl Render for T3App {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let main = if self.status == Status::NeedsPairing || self.switching_server {
             self.render_pairing(window, cx).into_any_element()
+        } else if self.usage_open {
+            self.usage.clone().into_any_element()
         } else if let Some(thread) = &self.thread {
             // Cached: `T3App` re-renders on plenty of events (shell deltas,
             // status changes) that have nothing to do with this thread. Skip
@@ -1176,7 +1216,7 @@ impl T3App {
                     .border_r_1()
                     .border_color(theme.sidebar_border)
             });
-        let shell = self.open_thread_shell(cx);
+        let shell = self.open_thread_shell(cx).filter(|_| !self.usage_open);
         let project =
             shell.and_then(|thread| self.shell.projects.iter().find(|p| p.id == thread.project_id));
         let breadcrumb = h_flex()
@@ -1206,7 +1246,8 @@ impl T3App {
                         .font_semibold()
                         .child(ui::display_title(&thread.title)),
                 )
-            });
+            })
+            .when(self.usage_open, |row| row.child(div().font_semibold().child("Usage")));
         let controls = h_flex()
             .gap_1()
             .px_2()
