@@ -139,7 +139,7 @@ Acceptance: workflows operate against a remote environment whose paths do not ex
 1. Complete Git workflow actions, generated commit/PR text and source-control settings. Port split/stacked diffs, whitespace filtering, file/turn diff review and review context.
 2. Add PR workspace and linked-review panels, checks, comments/replies/resolution/reactions, reviews, reviewers/labels, viewed-file tracking and host-supported actions. Support GitHub, GitLab, Forgejo/Gitea, Bitbucket and Azure DevOps according to server capability.
 3. Implement multi-link and stack state with the upstream compatibility rules: multi-link when `threadPullRequests` is true; legacy metadata linking when only `threadPullRequestLinking` is true; no linking action when neither is advertised. Add merge/rebase confirmations and uncertain-result recovery.
-4. Expand Usage with rates/overrides, subscription limits, deduplicated accounts, reset-credit actions and CLIProxyAPI sources. Complete pooled/multi-environment summaries after P9.
+4. Complete Usage rates/overrides, reset-credit redemption and quota-source editing. The native Cost/Tokens/Limits tabs now show subscription limits, deduplicated native/CLIProxyAPI accounts, pooled remaining quotas, reset countdowns, pace, reset-credit balances and probe errors. Complete pooled history and multi-environment summaries after P9.
 
 Acceptance: the server owns host credentials and mutations. Never retry a mutation on another environment automatically when its result is uncertain. New and old linking formats work with their corresponding fixtures. Usage rates and failed partial saves agree with upstream behavior.
 

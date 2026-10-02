@@ -171,6 +171,7 @@ impl SettingsPage {
                     h_flex()
                         .gap_2()
                         .items_center()
+                        .child(crate::provider_logo::logo(&provider.driver, px(18.), theme.foreground))
                         .child(
                             div()
                                 .flex_1()

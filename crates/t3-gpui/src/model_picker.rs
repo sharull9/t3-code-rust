@@ -325,17 +325,12 @@ slot_handler!(on_slot_7, SelectSlot7, 6);
 slot_handler!(on_slot_8, SelectSlot8, 7);
 slot_handler!(on_slot_9, SelectSlot9, 8);
 
-/// A provider instance's mark: its driver glyph with a colored initials badge,
+/// A provider instance's SVG logo with a colored initials badge,
 /// so two instances of one driver stay distinguishable.
 pub fn provider_mark(instance_id: &str, driver: &str, name: &str, size: Pixels) -> Div {
     let color = ui::project_color(instance_id);
     // Readable even on the smallest marks.
     let badge_text = if size * 0.45 < px(7.) { px(7.) } else { size * 0.45 };
-    let glyph = match driver {
-        "claudeAgent" | "claude" => IconName::Asterisk,
-        "codex" => IconName::Aperture,
-        _ => IconName::Bot,
-    };
     div()
         .relative()
         .flex()
@@ -343,7 +338,7 @@ pub fn provider_mark(instance_id: &str, driver: &str, name: &str, size: Pixels) 
         .items_center()
         .justify_center()
         .size(size)
-        .child(icon(glyph).size(size * 0.8).text_color(color))
+        .child(crate::provider_logo::logo(driver, size * 0.8, color))
         .child(
             div()
                 .absolute()

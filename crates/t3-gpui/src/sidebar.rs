@@ -693,6 +693,8 @@ impl Render for Sidebar {
                             .small()
                             .when(self.usage_open, |button| button.primary())
                             .icon(icon(IconName::ChartNoAxesColumn))
+                            .label("Usage")
+                            .accessibility_label("Usage: cost, tokens and subscription limits")
                             .tooltip("Usage")
                             .on_click(cx.listener(|_, _, _, cx| {
                                 cx.emit(SidebarEvent::ToggleUsage);

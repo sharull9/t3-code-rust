@@ -19,6 +19,12 @@ use tokio::sync::mpsc;
 const CLIENT_LABEL: &str = "T3 GPUI";
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
 
+async fn refresh_providers(connection: &Connection) -> Result<Vec<t3_client::ServerProvider>, String> {
+    let value = connection.rpc().call::<Value>("server.refreshProviders", serde_json::json!({ "refreshModels": false }))
+        .await.map_err(|error| describe(&error))?;
+    serde_json::from_value(value["providers"].clone()).map_err(|error| error.to_string())
+}
+
 pub enum Command {
     Pair(String),
     StartLocal(PathBuf),
@@ -42,6 +48,7 @@ pub enum Command {
         request_id: u64,
         window: t3_client::UsageWindow,
     },
+    LoadLimits { request_id: u64 },
     ThreadAction {
         thread_id: String,
         action: t3_client::ThreadAction,
@@ -123,6 +130,8 @@ pub enum Event {
     ThreadUnavailable(String),
     Error(String),
     Config(t3_client::ServerConfig),
+    Providers(Vec<t3_client::ServerProvider>),
+    LimitsFinished { request_id: u64, result: Result<(), String> },
     Archived {
         request_id: String,
         snapshot: Option<t3_client::ShellSnapshot>,
@@ -453,6 +462,7 @@ async fn wait_offline(
                 Some(Command::LoadUsage { request_id, .. }) => {
                     events.emit(Event::Usage { request_id, result: Err("Reconnect to see usage.".into()) });
                 }
+                Some(Command::LoadLimits { request_id }) => events.emit(Event::LimitsFinished { request_id, result: Err("Reconnect to see limits.".into()) }),
                 Some(Command::SendMessage { thread, text, attachments }) => {
                     events.error("Cannot send while disconnected. Your draft has been kept.");
                     events.emit(Event::SendFinished { thread_id: thread.id, text, success: false, attachment_ids: attachments.iter().map(|a| a.id.clone()).collect() });
@@ -488,28 +498,21 @@ async fn run_session(
     let config_connection = connection.clone();
     let config_events = events.clone();
     let _config = TaskGuard(tokio::spawn(async move {
+        let mut current = None;
         match config_connection.server_config().await {
-            Ok(config) => config_events.emit(Event::Config(config)),
+            Ok(config) => { current = Some(config.clone()); config_events.emit(Event::Config(config)); },
             Err(error) => {
                 config_events.error(format!("Model list unavailable: {}", describe(&error)))
             }
         }
         if let Ok(mut updates) = config_connection
             .rpc()
-            .subscribe::<Value>("subscribeServerConfig", serde_json::json!({}))
+            .subscribe::<Value>("subscribeServerConfig", serde_json::json!({ "usageLimitSources": true }))
         {
             while let Some(Ok(value)) = updates.next().await {
-                let config = match value["type"].as_str() {
-                    Some("snapshot") => value.get("config"),
-                    Some("providerStatuses") => value.get("payload"),
-                    _ => None,
-                };
-                if let Some(config) = config {
-                    if let Ok(config) =
-                        serde_json::from_value::<t3_client::ServerConfig>(config.clone())
-                    {
-                        config_events.emit(Event::Config(config));
-                    }
+                if t3_client::quotas::apply_config_event(&mut current, value).unwrap_or(false)
+                    && let Some(config) = &current {
+                    config_events.emit(Event::Config(config.clone()));
                 }
             }
         }
@@ -535,7 +538,14 @@ async fn run_session(
                 Some(Command::StartLocal(path)) => return SessionEnd::Local(path),
                 Some(Command::RefreshConfig) => {
                     let connection = connection.clone(); let events = events.clone();
-                    operations.spawn(async move { match connection.server_config().await { Ok(config) => events.emit(Event::Config(config)), Err(error) => events.error(describe(&error)) } });
+                    operations.spawn(async move { match refresh_providers(&connection).await { Ok(providers) => events.emit(Event::Providers(providers)), Err(error) => events.error(error) } });
+                }
+                Some(Command::LoadLimits { request_id }) => {
+                    let connection = connection.clone(); let events = events.clone();
+                    operations.spawn(async move {
+                        let result = refresh_providers(&connection).await.map(|providers| events.emit(Event::Providers(providers)));
+                        events.emit(Event::LimitsFinished { request_id, result });
+                    });
                 }
                 Some(Command::OpenAsset(attachment)) => {
                     let connection = connection.clone(); let events = events.clone(); let base_url = base_url.clone();

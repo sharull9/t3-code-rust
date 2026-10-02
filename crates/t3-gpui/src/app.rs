@@ -193,9 +193,10 @@ impl T3App {
                 cx.notify();
             }),
             cx.subscribe(&usage, |this, _, event: &UsageEvent, _| {
-                let UsageEvent::Load { request_id, window } = event;
-                this.backend
-                    .send(Command::LoadUsage { request_id: *request_id, window: window.clone() });
+                match event {
+                    UsageEvent::Load { request_id, window } => this.backend.send(Command::LoadUsage { request_id: *request_id, window: window.clone() }),
+                    UsageEvent::LoadLimits { request_id } => this.backend.send(Command::LoadLimits { request_id: *request_id }),
+                }
             }),
             cx.subscribe(&workspace, |this, _, event: &WorkspaceEvent, _| {
                 let WorkspaceEvent::Request { request_id, scope, request } = event;
@@ -524,7 +525,12 @@ impl T3App {
             }
             Event::Error(message) => self.error = Some(message.into()),
             Event::Config(config) => {
-                self.providers = config.providers;
+                self.usage.update(cx, |usage, cx| usage.set_config(config.clone(), cx));
+                self.handle_event(Event::Providers(config.providers), window, cx);
+            }
+            Event::Providers(providers) => {
+                self.providers = providers;
+                self.usage.update(cx, |usage, cx| usage.set_providers(self.providers.clone(), cx));
                 self.settings
                     .update(cx, |panel, cx| panel.set_providers(self.providers.clone(), cx));
                 self.sidebar
@@ -535,6 +541,9 @@ impl T3App {
             }
             Event::Usage { request_id, result } => {
                 self.usage.update(cx, |usage, cx| usage.finish(request_id, result, cx));
+            }
+            Event::LimitsFinished { request_id, result } => {
+                self.usage.update(cx, |usage, cx| usage.finish_limits(request_id, result, cx));
             }
             Event::Archived { request_id, snapshot } => {
                 self.sidebar
@@ -1118,6 +1127,8 @@ impl T3App {
 impl Render for T3App {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let settings_open = self.settings.read(cx).is_open();
+        let usage_active = self.usage_open && !settings_open && !self.switching_server;
+        self.usage.update(cx, |usage, _| usage.set_active(usage_active));
         let main = if settings_open {
             self.settings.clone().into_any_element()
         } else if self.status == Status::NeedsPairing || self.switching_server {

@@ -93,7 +93,18 @@ streamed output. Project creation browses folders on the server. Ctrl+N creates 
 thread, Ctrl+B toggles the sidebar, Ctrl+L focuses the composer, and Ctrl+, opens
 Settings. Question cards support Ctrl+1 through Ctrl+9 for choices.
 
-Settings shows provider availability and model counts, refreshes server config,
+The sidebar's **Usage** button opens Cost, Tokens and Limits tabs. Cost and Tokens
+offer 7/30/90-day history. Limits shows pooled subscription quota, account bars,
+reset countdowns, pace and reported reset credits from provider instances and
+configured quota sources. It refreshes every five minutes while visible. Failed
+refreshes retain the last report; reset-credit redemption and multi-environment
+usage remain pending.
+
+The app embeds Geist for interface text, Geist Mono for code and terminals, and
+SVG provider logos. No system font installation is required. Asset sources and
+font licensing are in [assets/README.md](crates/t3-gpui/assets/README.md).
+
+Settings shows provider availability and model counts, refreshes provider status,
 and switches dark/light appearance. **Local server** lets you select a compatible
 T3 server executable: the app starts it with a private stdin bootstrap, a separate
 `t3-gpui/server` data directory, and in-memory credentials. No pasted pairing link

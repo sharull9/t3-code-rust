@@ -1,6 +1,6 @@
 # Upstream contract parity inventory
 
-Upstream revision `54084ae1e6c32809db040e4fa571c80fdf2d8ae4`, inspected 2026-10-02. Native baseline `f7c4677`, plus the full Settings page in this turn.
+Upstream revision `54084ae1e6c32809db040e4fa571c80fdf2d8ae4`, inspected 2026-10-02. Native baseline `f7c4677`, plus the full Settings page and Usage Limits migration on this date.
 
 This checklist accompanies the [migration plan](2026-10-02-full-t3-code-migration.md). It is extracted from the public method registries and selected authoritative schemas, rather than inferred from menu labels.
 
@@ -87,7 +87,7 @@ Top-level schema fields are listed below. Their nested payloads, provider-specif
 | [`device.action`](https://github.com/pingdotgg/t3code/blob/54084ae1e6c32809db040e4fa571c80fdf2d8ae4/packages/contracts/src/rpc.ts) | No reference found | P8 |
 | [`server.probe`](https://github.com/pingdotgg/t3code/blob/54084ae1e6c32809db040e4fa571c80fdf2d8ae4/packages/contracts/src/rpc.ts) | No reference found | P1 |
 | [`server.getConfig`](https://github.com/pingdotgg/t3code/blob/54084ae1e6c32809db040e4fa571c80fdf2d8ae4/packages/contracts/src/rpc.ts) | Present; verify workflow | P1 |
-| [`server.refreshProviders`](https://github.com/pingdotgg/t3code/blob/54084ae1e6c32809db040e4fa571c80fdf2d8ae4/packages/contracts/src/rpc.ts) | No reference found | P4 |
+| [`server.refreshProviders`](https://github.com/pingdotgg/t3code/blob/54084ae1e6c32809db040e4fa571c80fdf2d8ae4/packages/contracts/src/rpc.ts) | Present; verify workflow | P4 |
 | [`server.updateProvider`](https://github.com/pingdotgg/t3code/blob/54084ae1e6c32809db040e4fa571c80fdf2d8ae4/packages/contracts/src/rpc.ts) | No reference found | P4 |
 | [`server.updateServer`](https://github.com/pingdotgg/t3code/blob/54084ae1e6c32809db040e4fa571c80fdf2d8ae4/packages/contracts/src/rpc.ts) | No reference found | P10 |
 | [`server.updateServerWithProgress`](https://github.com/pingdotgg/t3code/blob/54084ae1e6c32809db040e4fa571c80fdf2d8ae4/packages/contracts/src/rpc.ts) | No reference found | P10 |

@@ -86,11 +86,8 @@ pub fn apply_theme(light: bool, cx: &mut App) {
     let (mode, p) = if light { (ThemeMode::Light, &LIGHT) } else { (ThemeMode::Dark, &DARK) };
     Theme::change(mode, None, cx);
     let theme = Theme::global_mut(cx);
-    #[cfg(windows)]
-    {
-        theme.font_family = "Bahnschrift".into();
-        theme.mono_font_family = "Consolas".into();
-    }
+    theme.font_family = "Geist".into();
+    theme.mono_font_family = "Geist Mono".into();
     let accent = hex(p.accent);
     theme.background = hex(p.background);
     theme.foreground = hex(p.foreground);
