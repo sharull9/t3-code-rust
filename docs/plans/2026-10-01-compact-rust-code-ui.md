@@ -1,5 +1,10 @@
 # Compact Rust code desktop UI
 
+The [October 2 migration plan](2026-10-02-full-t3-code-migration.md) supersedes
+this document's sidebar settings placement and 40% height limit. Settings now
+occupies the main area with category navigation. The other compact UI decisions
+below remain the record of the earlier change.
+
 The supplied screenshots identify excess timeline spacing, oversized Copy controls,
 a collapsed project list, and an empty folder-browser request. This pass keeps the
 native desktop structure and makes its controls compact and predictable.

@@ -93,7 +93,18 @@ streamed output. Project creation browses folders on the server. Ctrl+N creates 
 thread, Ctrl+B toggles the sidebar, Ctrl+L focuses the composer, and Ctrl+, opens
 Settings. Question cards support Ctrl+1 through Ctrl+9 for choices.
 
-Settings shows provider availability and model counts, refreshes server config,
+The sidebar's **Usage** button opens Cost, Tokens and Limits tabs. Cost and Tokens
+offer 7/30/90-day history. Limits shows pooled subscription quota, account bars,
+reset countdowns, pace and reported reset credits from provider instances and
+configured quota sources. It refreshes every five minutes while visible. Failed
+refreshes retain the last report; reset-credit redemption and multi-environment
+usage remain pending.
+
+The app embeds Geist for interface text, Geist Mono for code and terminals, and
+SVG provider logos. No system font installation is required. Asset sources and
+font licensing are in [assets/README.md](crates/t3-gpui/assets/README.md).
+
+Settings shows provider availability and model counts, refreshes provider status,
 and switches dark/light appearance. **Local server** lets you select a compatible
 T3 server executable: the app starts it with a private stdin bootstrap, a separate
 `t3-gpui/server` data directory, and in-memory credentials. No pasted pairing link
@@ -101,11 +112,18 @@ is needed for that session. Server discovery, bundling and automatic local start
 on the next app launch are still pending.
 
 The compact desktop UI groups tool calls between messages, with expandable per-call
-details and icon-only copy controls. Settings opens at the bottom of the sidebar,
-capped at 40% of the window height. Thread lists and settings scroll independently.
+details and icon-only copy controls. Settings opens as a full page in the main area,
+with Appearance, Providers, Connections and Keyboard sections. Back, Escape or
+Ctrl+, returns to the previous view and preserves the current draft. Categories
+use a rail on wide windows and tabs on narrow windows.
 See the [compact UI changes](docs/plans/2026-10-01-compact-rust-code-ui.md).
 
 ## Remaining parity work
+
+The [full migration plan](docs/plans/2026-10-02-full-t3-code-migration.md) compares
+the native app with upstream T3 Code at `54084ae1` and orders the remaining work
+into ten phases. Its [contract inventory](docs/plans/2026-10-02-upstream-parity-inventory.md)
+tracks all 153 public RPC methods and the settings/capability fields at that revision.
 
 Slash commands, provider-specific model options, message edit/retry and plan actions,
 worktree creation, full terminal emulation, provider authentication/preferences,

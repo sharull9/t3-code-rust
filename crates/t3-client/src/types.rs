@@ -111,18 +111,23 @@ pub struct ThreadShell {
 }
 
 /// Configured instances and model IDs come from the connected server.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ServerConfig {
     #[serde(default)]
     pub environment: Option<ServerEnvironment>,
     #[serde(default)]
     pub providers: Vec<ServerProvider>,
+    #[serde(default)]
+    pub usage_limit_sources: Vec<crate::quotas::LimitSource>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ServerEnvironment {
     pub environment_id: String,
+    #[serde(default)]
+    pub capabilities: Value,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -140,6 +145,10 @@ pub struct ServerProvider {
     pub requires_new_thread_for_model_change: bool,
     #[serde(default)]
     pub models: Vec<ServerModel>,
+    #[serde(default)]
+    pub auth: crate::quotas::ProviderAuth,
+    #[serde(default)]
+    pub usage_limits: Option<crate::quotas::UsageLimits>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

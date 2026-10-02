@@ -3,9 +3,12 @@ mod attachments;
 mod backend;
 mod directory_picker;
 mod drafts;
+mod fonts;
+mod limits_view;
 mod managed_server;
 mod model_picker;
 mod prefs;
+mod provider_logo;
 mod project_picker;
 mod settings;
 mod sidebar;
@@ -24,6 +27,7 @@ fn main() {
         // The complete Lucide catalog, for icons beyond the component defaults.
         .with_assets(gpui_kit::assets::AllAssets)
         .run(|cx| {
+            fonts::register(cx);
             // Must run before any component-backed view is created.
             gpui_kit::init(cx);
             app::init(cx);

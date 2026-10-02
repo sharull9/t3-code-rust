@@ -1,0 +1,4 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="240" height="48" viewBox="0 0 240 48">
+  <defs><pattern id="lines" width="8" height="8" patternUnits="userSpaceOnUse" patternTransform="rotate(45)"><line x1="0" y1="0" x2="0" y2="8" stroke="white" stroke-width="1"/></pattern></defs>
+  <rect width="240" height="48" fill="url(#lines)"/>
+</svg>
