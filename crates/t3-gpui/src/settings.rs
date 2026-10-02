@@ -1,8 +1,9 @@
 //! Compact settings surface for server configuration and appearance.
+use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::component::{
-    ActiveTheme as _, Disableable as _, Sizable as _, StyledExt as _, h_flex, v_flex,
+    ActiveTheme as _, Disableable as _, Icon, Sizable as _, StyledExt as _, h_flex, v_flex,
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
@@ -26,8 +27,13 @@ pub struct SettingsPanel {
 impl EventEmitter<SettingsEvent> for SettingsPanel {}
 
 impl SettingsPanel {
-    pub fn new(_: &mut Context<Self>) -> Self {
-        Self { providers: Vec::new(), connected: false, open: false, light_theme: false }
+    pub fn new(cx: &mut Context<Self>) -> Self {
+        Self {
+            providers: Vec::new(),
+            connected: false,
+            open: false,
+            light_theme: crate::prefs::Prefs::global(cx).light_theme,
+        }
     }
 
     pub fn set_providers(&mut self, providers: Vec<ServerProvider>, cx: &mut Context<Self>) {
@@ -84,12 +90,16 @@ impl Render for SettingsPanel {
                 .as_deref()
                 .filter(|name| !name.trim().is_empty())
                 .unwrap_or(&provider.instance_id);
-            let status = if !provider.enabled {
-                "Disabled".to_owned()
+            let (status, status_color) = if !provider.enabled {
+                ("Disabled".to_owned(), theme.muted_foreground)
             } else if !provider.installed {
-                "Not installed".to_owned()
+                ("Not installed".to_owned(), theme.warning)
             } else {
-                provider.availability.as_deref().unwrap_or("Available").to_owned()
+                match provider.availability.as_deref() {
+                    Some("unavailable") => ("Unavailable".to_owned(), theme.danger),
+                    Some(other) => (other.to_owned(), theme.success),
+                    None => ("Available".to_owned(), theme.success),
+                }
             };
             v_flex()
                 .id(format!("provider-row-{}", provider.instance_id))
@@ -98,12 +108,22 @@ impl Render for SettingsPanel {
                 .rounded_md()
                 .border_1()
                 .border_color(theme.border)
+                .bg(theme.secondary)
                 .child(
                     h_flex()
                         .gap_2()
                         .items_center()
-                        .child(div().flex_1().text_sm().font_medium().child(name.to_owned()))
-                        .child(div().text_xs().text_color(theme.muted_foreground).child(status)),
+                        .child(
+                            div().flex_1().min_w_0().truncate().text_sm().font_medium().child(name.to_owned()),
+                        )
+                        .child(
+                            h_flex()
+                                .gap_1()
+                                .text_xs()
+                                .text_color(status_color)
+                                .child(div().size_1p5().rounded_full().bg(status_color))
+                                .child(status),
+                        ),
                 )
                 .child(
                     h_flex()
@@ -126,9 +146,10 @@ impl Render for SettingsPanel {
             .gap_1()
             .child(
                 Button::new("settings-managed-server")
-                    .primary()
+                    .outline()
                     .small()
                     .w_full()
+                    .icon(Icon::new(IconName::Server))
                     .label("Choose local server executable…")
                     .on_click(cx.listener(|_, _, _, cx| {
                         cx.emit(SettingsEvent::ChooseManagedServer);
@@ -136,9 +157,10 @@ impl Render for SettingsPanel {
             )
             .child(
                 Button::new("settings-refresh-providers")
-                    .ghost()
+                    .outline()
                     .small()
                     .w_full()
+                    .icon(Icon::new(IconName::RefreshCw))
                     .label(if self.connected {
                         "Refresh providers"
                     } else {
@@ -163,12 +185,14 @@ impl Render for SettingsPanel {
             });
 
         let appearance =
-            v_flex().gap_2().child(div().text_sm().font_medium().child("Appearance")).child(
+            v_flex().gap_2().child(section_label("Appearance", cx)).child(
                 h_flex()
                     .gap_2()
                     .child(
                         Button::new("theme-dark")
                             .small()
+                            .flex_1()
+                            .icon(Icon::new(IconName::Moon))
                             .when(!self.light_theme, |button| button.primary())
                             .label("Dark")
                             .on_click(cx.listener(|this, _, _, cx| this.set_theme(false, cx))),
@@ -176,6 +200,8 @@ impl Render for SettingsPanel {
                     .child(
                         Button::new("theme-light")
                             .small()
+                            .flex_1()
+                            .icon(Icon::new(IconName::Sun))
                             .when(self.light_theme, |button| button.primary())
                             .label("Light")
                             .on_click(cx.listener(|this, _, _, cx| this.set_theme(true, cx))),
@@ -188,7 +214,7 @@ impl Render for SettingsPanel {
                 h_flex()
                     .items_center()
                     .gap_2()
-                    .child(div().flex_1().text_sm().font_medium().child("Server"))
+                    .child(div().flex_1().child(section_label("Server", cx)))
                     .child(
                         Button::new("settings-switch-server")
                             .ghost()
@@ -201,9 +227,9 @@ impl Render for SettingsPanel {
             )
             .child(server_dir)
             .child(server_actions)
-            .child(div().text_xs().text_color(theme.muted_foreground).child(format!(
-                "{} provider instances · {model_count} models",
-                self.providers.len()
+            .child(div().pt_2().child(section_label(
+                format!("Providers · {} instances · {model_count} models", self.providers.len()),
+                cx,
             )))
             .child(div().id("settings-provider-list").child(provider_list));
         let scroll_content = v_flex().gap_3().child(appearance).child(server);
@@ -226,6 +252,7 @@ impl Render for SettingsPanel {
                 h_flex()
                     .items_center()
                     .gap_2()
+                    .child(Icon::new(IconName::Settings).small().text_color(theme.primary))
                     .child(div().flex_1().text_sm().font_semibold().child("Settings"))
                     .child(
                         Button::new("settings-close")
@@ -245,6 +272,10 @@ impl Render for SettingsPanel {
             )
             .into_any_element()
     }
+}
+
+fn section_label(text: impl Into<SharedString>, cx: &App) -> impl IntoElement {
+    div().text_xs().font_medium().text_color(cx.theme().muted_foreground).child(text.into())
 }
 
 #[cfg(test)]

@@ -2,13 +2,16 @@
 
 use std::collections::HashMap;
 
+use gpui_kit::assets::IconName;
 use gpui_kit::component::Disableable as _;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::scroll::ScrollableElement as _;
-use gpui_kit::component::{ActiveTheme as _, Sizable as _, h_flex, v_flex};
+use gpui_kit::component::tab::{Tab, TabBar};
+use gpui_kit::component::{ActiveTheme as _, Sizable as _, StyledExt as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
+use crate::ui::icon;
 use t3_client::{
     WorkspaceDiffPreview, WorkspaceDirectory, WorkspaceGitStatus, WorkspaceRefs, WorkspaceRequest,
     WorkspaceResponse, WorkspaceTerminalEvent,
@@ -89,6 +92,8 @@ pub struct WorkspacePanel {
     terminal_input: Entity<InputState>,
     terminal_open: bool,
     terminal_wanted: bool,
+    /// The branch list shows a few local branches until expanded.
+    show_all_refs: bool,
     connected: bool,
     error: Option<String>,
     _subscriptions: Vec<Subscription>,
@@ -130,6 +135,7 @@ impl WorkspacePanel {
             terminal_input,
             terminal_open: false,
             terminal_wanted: false,
+            show_all_refs: false,
             connected: false,
             error: None,
             _subscriptions: subscriptions,
@@ -515,300 +521,620 @@ impl WorkspacePanel {
 
 impl Render for WorkspacePanel {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let tabs = [WorkspaceTab::Files, WorkspaceTab::Changes, WorkspaceTab::Terminal]
-            .into_iter()
-            .map(|tab| {
-                let label = match tab {
-                    WorkspaceTab::Files => "Files",
-                    WorkspaceTab::Changes => "Changes",
-                    WorkspaceTab::Terminal => "Terminal",
+        let body = match self.tab {
+            WorkspaceTab::Files => self.render_files(cx).into_any_element(),
+            WorkspaceTab::Changes => self.render_changes(cx).into_any_element(),
+            WorkspaceTab::Terminal => self.render_terminal(cx).into_any_element(),
+        };
+        let theme = cx.theme();
+        let tabs = [WorkspaceTab::Files, WorkspaceTab::Changes, WorkspaceTab::Terminal];
+        let selected = tabs.iter().position(|tab| *tab == self.tab).unwrap_or_default();
+        let tab_bar = TabBar::new("workspace-tabs")
+            .segmented()
+            .small()
+            .flex_1()
+            .selected_index(selected)
+            .children(tabs.iter().map(|tab| {
+                let (label, icon_name) = match tab {
+                    WorkspaceTab::Files => ("Files", IconName::FolderOpen),
+                    WorkspaceTab::Changes => ("Changes", IconName::GitBranch),
+                    WorkspaceTab::Terminal => ("Terminal", IconName::SquareTerminal),
                 };
-                Button::new(label)
-                    .small()
-                    .when(self.tab == tab, |button| button.primary())
-                    .disabled(!self.connected)
+                Tab::new()
                     .label(label)
-                    .on_click(cx.listener(move |this, _, _, cx| this.select_tab(tab, cx)))
-            });
-        let mut body = v_flex().gap_2().flex_1();
-        match self.tab {
-            WorkspaceTab::Files => {
-                let mut rows = Vec::new();
-                if !self.directory_path.is_empty() {
-                    rows.push(
-                        Button::new("workspace-parent")
-                            .small()
-                            .ghost()
-                            .label("..  Parent directory")
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.directory_path = parent_path(&this.directory_path);
-                                this.directory = None;
-                                this.refresh_directory(cx);
-                            }))
-                            .into_any_element(),
-                    );
+                    .prefix(icon(icon_name).xsmall())
+                    .disabled(!self.connected)
+            }))
+            .on_click(cx.listener(move |this, index: &usize, _, cx| {
+                if let Some(tab) = tabs.get(*index) {
+                    this.select_tab(*tab, cx);
                 }
-                if let Some(directory) = &self.directory {
-                    for entry in &directory.entries {
-                        let path = entry.path.clone();
-                        let is_dir = entry.kind == "directory";
-                        let title = format!(
-                            "{}{}",
-                            if is_dir { "▸  " } else { "    " },
-                            entry.path.rsplit('/').next().unwrap_or(&entry.path)
-                        );
-                        rows.push(
-                            Button::new(SharedString::from(format!("workspace-entry-{path}")))
-                                .small()
-                                .ghost()
-                                .label(title)
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.open_path(path.clone(), is_dir, cx)
-                                }))
-                                .into_any_element(),
-                        );
-                    }
-                    if directory.truncated {
-                        rows.push(
-                            div()
-                                .text_sm()
-                                .child("Directory listing truncated.")
-                                .into_any_element(),
-                        );
-                    }
-                } else if self.scope.cwd.is_none() {
-                    rows.push(
-                        div()
-                            .text_sm()
-                            .child("Select a project to browse its files.")
-                            .into_any_element(),
-                    );
-                } else if self.is_loading(RequestSlot::Directory) {
-                    rows.push(div().text_sm().child("Loading files…").into_any_element());
+            }));
+        let refresh = Button::new("workspace-refresh")
+            .ghost()
+            .small()
+            .icon(icon(IconName::RefreshCw))
+            .tooltip("Refresh")
+            .disabled(!self.connected || self.scope.cwd.is_none())
+            .on_click(cx.listener(|this, _, _, cx| {
+                match this.tab {
+                    WorkspaceTab::Files => this.refresh_directory(cx),
+                    WorkspaceTab::Changes => this.refresh_changes(cx),
+                    WorkspaceTab::Terminal => this.open_terminal(cx),
                 }
-                if let Some(path) = &self.selected_file {
-                    rows.push(
-                        div()
-                            .mt_3()
-                            .text_xs()
-                            .text_color(cx.theme().muted_foreground)
-                            .child(path.clone())
-                            .into_any_element(),
-                    );
-                    if let Some(contents) = &self.file_contents {
-                        if self.file_truncated {
-                            rows.push(
-                                div()
-                                    .mt_1()
-                                    .text_xs()
-                                    .text_color(cx.theme().muted_foreground)
-                                    .child("File preview truncated by the server.")
-                                    .into_any_element(),
-                            );
-                        }
-                        rows.push(
-                            div()
-                                .mt_1()
-                                .p_2()
-                                .rounded_md()
-                                .bg(cx.theme().secondary)
-                                .text_sm()
-                                .font_family("monospace")
-                                .child(contents.clone())
-                                .into_any_element(),
-                        );
-                    }
-                }
-                body = body.children(rows);
+                cx.notify();
+            }));
+
+        v_flex()
+            .size_full()
+            .min_h_0()
+            .bg(theme.sidebar)
+            .child(
+                h_flex()
+                    .gap_2()
+                    .px_3()
+                    .py_2()
+                    .border_b_1()
+                    .border_color(theme.sidebar_border)
+                    .child(tab_bar)
+                    .child(refresh),
+            )
+            .children(self.error.clone().map(|error| {
+                h_flex()
+                    .mx_3()
+                    .mt_2()
+                    .gap_2()
+                    .p_2()
+                    .rounded_md()
+                    .bg(theme.danger.opacity(0.1))
+                    .text_xs()
+                    .text_color(theme.danger)
+                    .child(icon(IconName::CircleAlert).xsmall().flex_shrink_0())
+                    .child(div().min_w_0().child(error))
+            }))
+            .child(body)
+    }
+}
+
+impl WorkspacePanel {
+    fn render_files(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme();
+        let mono = theme.mono_font_family.clone();
+        let location = if self.directory_path.is_empty() {
+            self.scope
+                .cwd
+                .as_deref()
+                .and_then(|cwd| cwd.trim_end_matches(['/', '\\']).rsplit(['/', '\\']).next())
+                .unwrap_or("Workspace")
+                .to_owned()
+        } else {
+            self.directory_path.clone()
+        };
+
+        let mut rows: Vec<AnyElement> = Vec::new();
+        if let Some(directory) = &self.directory {
+            for entry in &directory.entries {
+                let path = entry.path.clone();
+                let is_dir = entry.kind == "directory";
+                let name = entry.path.rsplit('/').next().unwrap_or(&entry.path).to_owned();
+                let selected = !is_dir && self.selected_file.as_deref() == Some(&entry.path);
+                // Listings can be recursive; indent by depth below the open folder.
+                let depth = entry_depth(&self.directory_path, &entry.path);
+                rows.push(
+                    tree_row(
+                        SharedString::from(format!("workspace-entry-{path}")),
+                        if is_dir { IconName::Folder } else { IconName::File },
+                        name,
+                        selected,
+                        cx,
+                    )
+                    .pl(px(8. + 14. * depth as f32))
+                    .when(entry.ignored, |row| row.opacity(0.5))
+                    .when(is_dir, |row| {
+                        row.child(
+                            icon(IconName::ChevronRight)
+                                .xsmall()
+                                .text_color(theme.muted_foreground),
+                        )
+                    })
+                    .on_click(
+                        cx.listener(move |this, _, _, cx| this.open_path(path.clone(), is_dir, cx)),
+                    )
+                    .into_any_element(),
+                );
             }
-            WorkspaceTab::Changes => {
-                let mut rows = Vec::new();
-                if let Some(refs) = &self.refs {
-                    if refs.is_repo {
-                        rows.push(
-                            div()
-                                .text_xs()
-                                .text_color(cx.theme().muted_foreground)
-                                .child("Local branches")
-                                .into_any_element(),
-                        );
-                        for reference in refs.refs.iter().filter(|reference| !reference.is_remote) {
-                            let name = reference.name.clone();
-                            rows.push(
-                                Button::new(SharedString::from(format!("workspace-ref-{name}")))
-                                    .small()
-                                    .ghost()
-                                    .label(format!(
-                                        "{} {}",
-                                        if reference.current { "●" } else { "○" },
-                                        name
-                                    ))
-                                    .disabled(!self.connected || reference.current)
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        this.switch_ref(name.clone(), cx)
-                                    }))
-                                    .into_any_element(),
-                            );
-                        }
-                    }
-                }
-                if let Some(status) = &self.status {
-                    if !status.is_repo {
-                        rows.push(
-                            div()
-                                .text_sm()
-                                .child("This workspace is not a Git repository.")
-                                .into_any_element(),
-                        );
-                    } else {
-                        rows.push(
-                            div()
-                                .text_sm()
-                                .child(format!(
-                                    "{}  +{}  −{}",
-                                    status.ref_name.as_deref().unwrap_or("(detached)"),
-                                    status.working_tree.insertions,
-                                    status.working_tree.deletions
-                                ))
-                                .into_any_element(),
-                        );
-                        for file in &status.working_tree.files {
-                            let path = file.path.clone();
-                            rows.push(
-                                Button::new(SharedString::from(format!("workspace-change-{path}")))
-                                    .small()
-                                    .ghost()
-                                    .label(format!(
-                                        "{}   +{} −{}",
-                                        file.path, file.insertions, file.deletions
-                                    ))
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        let Some(cwd) = this.scope.cwd.clone() else {
-                                            return;
-                                        };
-                                        this.selected_change = Some(path.clone());
-                                        this.request(
-                                            WorkspaceRequest::DiffFile { cwd, path: path.clone() },
-                                            RequestSlot::Diff,
-                                            cx,
-                                        );
-                                    }))
-                                    .into_any_element(),
-                            );
-                        }
-                    }
-                } else {
-                    rows.push(
-                        div()
-                            .text_sm()
-                            .child(if self.is_loading(RequestSlot::Status) {
-                                "Loading changes…"
-                            } else {
-                                "Changes will appear here."
-                            })
-                            .into_any_element(),
-                    );
-                }
-                if let Some(diff) = &self.diff {
-                    if let Some(path) = &self.selected_change {
-                        rows.push(
-                            div()
-                                .mt_2()
-                                .text_xs()
-                                .text_color(cx.theme().muted_foreground)
-                                .child(path.clone())
-                                .into_any_element(),
-                        );
-                    }
-                    for source in &diff.sources {
-                        rows.push(
-                            div()
-                                .mt_2()
-                                .text_xs()
-                                .text_color(cx.theme().muted_foreground)
-                                .child(source.title.clone())
-                                .into_any_element(),
-                        );
-                        rows.push(
-                            div()
-                                .p_2()
-                                .rounded_md()
-                                .bg(cx.theme().secondary)
-                                .text_xs()
-                                .font_family("monospace")
-                                .child(source.diff.clone())
-                                .into_any_element(),
-                        );
-                    }
-                }
-                body = body.children(rows);
+            if directory.entries.is_empty() {
+                rows.push(hint("This folder is empty.", cx).into_any_element());
             }
-            WorkspaceTab::Terminal => {
-                body = body.child(
+            if directory.truncated {
+                rows.push(hint("Directory listing truncated.", cx).into_any_element());
+            }
+        } else if self.scope.cwd.is_none() {
+            rows.push(hint("Open a thread to browse its files.", cx).into_any_element());
+        } else if self.is_loading(RequestSlot::Directory) {
+            rows.push(loading("Loading files…", cx).into_any_element());
+        }
+
+        let preview = self.selected_file.as_ref().map(|path| {
+            v_flex()
+                .gap_1()
+                .pt_3()
+                .child(
                     h_flex()
-                        .justify_between()
+                        .gap_1p5()
+                        .px_2()
+                        .text_xs()
+                        .text_color(theme.muted_foreground)
+                        .child(icon(IconName::FileText).xsmall())
+                        .child(div().min_w_0().truncate().child(path.clone()))
+                        .when(self.file_truncated, |row| row.child("· truncated")),
+                )
+                .child(match &self.file_contents {
+                    Some(contents) => {
+                        code_block(contents.clone(), mono.clone(), cx).into_any_element()
+                    }
+                    None => loading("Loading preview…", cx).into_any_element(),
+                })
+        });
+
+        v_flex()
+            .flex_1()
+            .min_h_0()
+            .child(
+                h_flex()
+                    .gap_1()
+                    .px_3()
+                    .pt_2()
+                    .pb_1()
+                    .text_xs()
+                    .text_color(theme.muted_foreground)
+                    .when(!self.directory_path.is_empty(), |row| {
+                        row.child(
+                            Button::new("workspace-parent")
+                                .ghost()
+                                .xsmall()
+                                .icon(icon(IconName::ArrowUp))
+                                .tooltip("Parent folder")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.directory_path = parent_path(&this.directory_path);
+                                    this.directory = None;
+                                    this.refresh_directory(cx);
+                                })),
+                        )
+                    })
+                    .child(div().min_w_0().truncate().font_medium().child(location)),
+            )
+            .child(
+                div()
+                    .id("workspace-files")
+                    .flex_1()
+                    .min_h_0()
+                    .px_2()
+                    .pb_3()
+                    .overflow_y_scrollbar()
+                    .child(v_flex().children(rows).children(preview)),
+            )
+    }
+
+    fn render_changes(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme();
+        let mono = theme.mono_font_family.clone();
+        let mut content = v_flex().gap_3();
+
+        match &self.status {
+            Some(status) if !status.is_repo => {
+                content = content.child(hint("This workspace is not a Git repository.", cx));
+            }
+            Some(status) => {
+                let tree = &status.working_tree;
+                let ref_name = status.ref_name.clone().unwrap_or_else(|| "(detached)".into());
+                content = content.child(
+                    v_flex()
+                        .gap_1()
+                        .p_3()
+                        .rounded_lg()
+                        .border_1()
+                        .border_color(theme.border)
+                        .bg(theme.secondary)
+                        .child(
+                            h_flex()
+                                .gap_1p5()
+                                .text_sm()
+                                .font_medium()
+                                .child(
+                                    icon(IconName::GitBranch).xsmall().text_color(theme.primary),
+                                )
+                                .child(div().min_w_0().truncate().child(ref_name)),
+                        )
+                        .child(
+                            h_flex()
+                                .gap_3()
+                                .text_xs()
+                                .text_color(theme.muted_foreground)
+                                .child(format!(
+                                    "{} changed file{}",
+                                    tree.files.len(),
+                                    if tree.files.len() == 1 { "" } else { "s" }
+                                ))
+                                .child(
+                                    div()
+                                        .text_color(theme.success)
+                                        .child(format!("+{}", tree.insertions)),
+                                )
+                                .child(
+                                    div()
+                                        .text_color(theme.danger)
+                                        .child(format!("−{}", tree.deletions)),
+                                ),
+                        ),
+                );
+                if tree.files.is_empty() {
+                    content = content.child(hint("Working tree is clean.", cx));
+                }
+                content = content.child(v_flex().children(tree.files.iter().map(|file| {
+                    let path = file.path.clone();
+                    let selected = self.selected_change.as_deref() == Some(&file.path);
+                    tree_row(
+                        SharedString::from(format!("workspace-change-{path}")),
+                        IconName::FileDiff,
+                        file.path.clone(),
+                        selected,
+                        cx,
+                    )
+                    .child(
+                        h_flex()
+                            .flex_shrink_0()
+                            .gap_1p5()
+                            .text_xs()
+                            .font_family(mono.clone())
+                            .child(
+                                div()
+                                    .text_color(theme.success)
+                                    .child(format!("+{}", file.insertions)),
+                            )
+                            .child(
+                                div().text_color(theme.danger).child(format!("−{}", file.deletions)),
+                            ),
+                    )
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        let Some(cwd) = this.scope.cwd.clone() else {
+                            return;
+                        };
+                        this.selected_change = Some(path.clone());
+                        this.request(
+                            WorkspaceRequest::DiffFile { cwd, path: path.clone() },
+                            RequestSlot::Diff,
+                            cx,
+                        );
+                        cx.notify();
+                    }))
+                })));
+            }
+            None => {
+                content = content.child(if self.is_loading(RequestSlot::Status) {
+                    loading("Loading changes…", cx).into_any_element()
+                } else {
+                    hint("Changes will appear here.", cx).into_any_element()
+                });
+            }
+        }
+
+        if let Some(diff) = &self.diff {
+            for source in &diff.sources {
+                content = content.child(
+                    v_flex()
+                        .gap_1()
                         .child(
                             div()
                                 .text_xs()
-                                .text_color(cx.theme().muted_foreground)
-                                .child(format!("Remote terminal · {}", self.terminal_id)),
+                                .text_color(theme.muted_foreground)
+                                .child(source.title.clone()),
                         )
-                        .child(if matches!(self.terminal_status.as_str(), "exited" | "error") {
-                            Button::new("terminal-restart")
-                                .small()
-                                .ghost()
-                                .disabled(!self.connected)
-                                .label("Restart")
-                                .on_click(cx.listener(|this, _, _, cx| this.restart_terminal(cx)))
-                        } else if self.terminal_open {
-                            Button::new("terminal-close")
-                                .small()
-                                .ghost()
-                                .disabled(!self.connected)
-                                .label("Close")
-                                .on_click(cx.listener(|this, _, _, cx| this.close_terminal(cx)))
-                        } else {
-                            Button::new("terminal-open")
-                                .small()
-                                .ghost()
-                                .disabled(!self.connected)
-                                .label("Open terminal")
-                                .on_click(cx.listener(|this, _, _, cx| this.open_terminal(cx)))
-                        }),
-                );
-                if self.terminal_open && self.terminal_status == "running" {
-                    body = body
-                        .child(Input::new(&self.terminal_input).w_full().disabled(!self.connected));
-                }
-                if self.terminal_open && self.terminal_status != "running" {
-                    body = body.child(
-                        div()
-                            .text_xs()
-                            .text_color(cx.theme().muted_foreground)
-                            .child(format!("Terminal status: {}", self.terminal_status)),
-                    );
-                }
-                body = body.child(
-                    div()
-                        .p_2()
-                        .rounded_md()
-                        .bg(cx.theme().secondary)
-                        .text_sm()
-                        .font_family("monospace")
-                        .child(self.terminal_history.clone()),
+                        .child(diff_block(&source.diff, mono.clone(), cx)),
                 );
             }
         }
-        if let Some(error) = &self.error {
-            body = body.child(div().text_sm().child(error.clone()));
+
+        if let Some(refs) = self.refs.as_ref().filter(|refs| refs.is_repo) {
+            let local: Vec<_> = refs.refs.iter().filter(|reference| !reference.is_remote).collect();
+            let shown = if self.show_all_refs { local.len() } else { local.len().min(6) };
+            content = content.child(
+                v_flex()
+                    .gap_0p5()
+                    .child(
+                        div()
+                            .px_2()
+                            .pb_1()
+                            .text_xs()
+                            .font_medium()
+                            .text_color(theme.muted_foreground)
+                            .child(format!("Local branches · {}", local.len())),
+                    )
+                    .children(local.iter().take(shown).map(|reference| {
+                        let name = reference.name.clone();
+                        let current = reference.current;
+                        tree_row(
+                            SharedString::from(format!("workspace-ref-{name}")),
+                            IconName::GitBranch,
+                            name.clone(),
+                            current,
+                            cx,
+                        )
+                        .when(current, |row| {
+                            row.child(div().text_xs().text_color(theme.primary).child("current"))
+                        })
+                        .when(!current && self.connected, |row| {
+                            row.on_click(cx.listener(move |this, _, _, cx| {
+                                this.switch_ref(name.clone(), cx);
+                                cx.notify();
+                            }))
+                        })
+                    }))
+                    .when(local.len() > 6, |list| {
+                        list.child(
+                            Button::new("workspace-refs-more")
+                                .ghost()
+                                .xsmall()
+                                .label(if self.show_all_refs {
+                                    "Show fewer".to_owned()
+                                } else {
+                                    format!("Show all {}", local.len())
+                                })
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.show_all_refs = !this.show_all_refs;
+                                    cx.notify();
+                                })),
+                        )
+                    }),
+            );
         }
+
+        div()
+            .id("workspace-changes")
+            .flex_1()
+            .min_h_0()
+            .p_3()
+            .overflow_y_scrollbar()
+            .child(content)
+    }
+
+    fn render_terminal(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme();
+        let (status_color, status_label) = match self.terminal_status.as_str() {
+            _ if !self.terminal_open => (theme.muted_foreground, "closed".to_owned()),
+            "running" => (theme.success, "running".to_owned()),
+            "error" => (theme.danger, "error".to_owned()),
+            other => (theme.muted_foreground, other.to_owned()),
+        };
+        let action = if matches!(self.terminal_status.as_str(), "exited" | "error") {
+            Button::new("terminal-restart")
+                .ghost()
+                .xsmall()
+                .icon(icon(IconName::RotateCcw))
+                .label("Restart")
+                .disabled(!self.connected)
+                .on_click(cx.listener(|this, _, _, cx| this.restart_terminal(cx)))
+        } else if self.terminal_open {
+            Button::new("terminal-close")
+                .ghost()
+                .xsmall()
+                .icon(icon(IconName::X))
+                .label("Close")
+                .disabled(!self.connected)
+                .on_click(cx.listener(|this, _, _, cx| this.close_terminal(cx)))
+        } else {
+            Button::new("terminal-open")
+                .ghost()
+                .xsmall()
+                .icon(icon(IconName::Play))
+                .label("Open terminal")
+                .disabled(!self.connected)
+                .on_click(cx.listener(|this, _, _, cx| this.open_terminal(cx)))
+        };
+        let output = strip_ansi(&self.terminal_history);
+
         v_flex()
-            .size_full()
+            .flex_1()
+            .min_h_0()
             .gap_2()
             .p_3()
-            .child(h_flex().gap_1().children(tabs))
-            .child(body.overflow_y_scrollbar())
+            .child(
+                h_flex()
+                    .gap_2()
+                    .text_xs()
+                    .text_color(theme.muted_foreground)
+                    .child(div().size_2().flex_shrink_0().rounded_full().bg(status_color))
+                    .child(div().flex_1().child(format!("{} · {status_label}", self.terminal_id)))
+                    .child(action),
+            )
+            .child(
+                div()
+                    .id("terminal-output")
+                    .flex_1()
+                    .min_h_0()
+                    .p_3()
+                    .rounded_lg()
+                    .border_1()
+                    .border_color(theme.border)
+                    .bg(theme.background)
+                    .overflow_y_scrollbar()
+                    .text_xs()
+                    .font_family(theme.mono_font_family.clone())
+                    .child(if output.trim().is_empty() {
+                        div()
+                            .text_color(theme.muted_foreground)
+                            .child(if self.terminal_open {
+                                "Output will stream here."
+                            } else {
+                                "Open a terminal in this thread's workspace."
+                            })
+                            .into_any_element()
+                    } else {
+                        div().child(output).into_any_element()
+                    }),
+            )
+            .when(self.terminal_open && self.terminal_status == "running", |column| {
+                column.child(
+                    Input::new(&self.terminal_input)
+                        .small()
+                        .w_full()
+                        .prefix(icon(IconName::ChevronRight).xsmall().text_color(theme.primary))
+                        .disabled(!self.connected),
+                )
+            })
     }
+}
+
+/// A full-width, left-aligned list row: icon, truncated label, then whatever
+/// the caller appends (counts, chevrons, tags).
+fn tree_row(
+    id: SharedString,
+    icon_name: IconName,
+    label: String,
+    selected: bool,
+    cx: &App,
+) -> Stateful<Div> {
+    let theme = cx.theme();
+    h_flex()
+        .id(id)
+        .w_full()
+        .gap_2()
+        .px_2()
+        .py_1()
+        .rounded_md()
+        .text_sm()
+        .cursor_pointer()
+        .when(selected, |row| row.bg(theme.list_active))
+        .when(!selected, |row| row.hover(|style| style.bg(theme.list_hover)))
+        .child(
+            icon(icon_name)
+                .xsmall()
+                .flex_shrink_0()
+                .text_color(if selected { theme.primary } else { theme.muted_foreground }),
+        )
+        .child(div().flex_1().min_w_0().truncate().child(label))
+}
+
+/// How many folders `path` sits below `directory` (both `/`-separated and
+/// relative to the workspace root; an empty `directory` is the root).
+fn entry_depth(directory: &str, path: &str) -> usize {
+    let relative = if directory.is_empty() {
+        path
+    } else {
+        path.strip_prefix(directory).map_or(path, |rest| rest.trim_start_matches('/'))
+    };
+    relative.matches('/').count()
+}
+
+fn hint(text: &'static str, cx: &App) -> impl IntoElement {
+    div().px_2().py_2().text_sm().text_color(cx.theme().muted_foreground).child(text)
+}
+
+fn loading(text: &'static str, cx: &App) -> impl IntoElement {
+    h_flex()
+        .gap_2()
+        .px_2()
+        .py_2()
+        .text_sm()
+        .text_color(cx.theme().muted_foreground)
+        .child(crate::ui::loader(text, gpui_kit::component::Size::XSmall))
+        .child(text)
+}
+
+fn code_block(text: String, mono: SharedString, cx: &App) -> impl IntoElement {
+    let theme = cx.theme();
+    div()
+        .p_3()
+        .rounded_lg()
+        .border_1()
+        .border_color(theme.border)
+        .bg(theme.background)
+        .text_xs()
+        .font_family(mono)
+        .child(text)
+}
+
+/// A unified diff with added, removed and hunk lines tinted. Long diffs stop
+/// after `MAX_DIFF_LINES` so a huge change cannot stall layout.
+fn diff_block(diff: &str, mono: SharedString, cx: &App) -> impl IntoElement {
+    const MAX_DIFF_LINES: usize = 1_500;
+    let theme = cx.theme();
+    let total = diff.lines().count();
+    v_flex()
+        .py_2()
+        .rounded_lg()
+        .border_1()
+        .border_color(theme.border)
+        .bg(theme.background)
+        .overflow_hidden()
+        .text_xs()
+        .font_family(mono)
+        .children(diff.lines().take(MAX_DIFF_LINES).map(|line| {
+            let (color, background) = if line.starts_with("+++") || line.starts_with("---") {
+                (theme.muted_foreground, None)
+            } else if line.starts_with('+') {
+                (theme.success, Some(theme.success.opacity(0.08)))
+            } else if line.starts_with('-') {
+                (theme.danger, Some(theme.danger.opacity(0.08)))
+            } else if line.starts_with('@') {
+                (theme.info, None)
+            } else {
+                (theme.foreground.opacity(0.8), None)
+            };
+            div()
+                .px_3()
+                .text_color(color)
+                .when_some(background, |row, background| row.bg(background))
+                .child(if line.is_empty() { " ".to_owned() } else { line.to_owned() })
+        }))
+        .when(total > MAX_DIFF_LINES, |block| {
+            block.child(
+                div()
+                    .px_3()
+                    .pt_1()
+                    .text_color(theme.muted_foreground)
+                    .child(format!("… {} more lines", total - MAX_DIFF_LINES)),
+            )
+        })
+}
+
+/// Terminal output as plain text: drops ANSI escape sequences (colors, cursor
+/// movement, window titles) and carriage returns, which the output panel
+/// cannot interpret and would otherwise show as noise.
+fn strip_ansi(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut chars = input.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\u{1b}' => match chars.next() {
+                // CSI: parameters, then one final byte in @..~.
+                Some('[') => {
+                    for c in chars.by_ref() {
+                        if ('@'..='~').contains(&c) {
+                            break;
+                        }
+                    }
+                }
+                // OSC: ends with BEL or ESC \.
+                Some(']') => {
+                    while let Some(c) = chars.next() {
+                        if c == '\u{7}' {
+                            break;
+                        }
+                        if c == '\u{1b}' && chars.peek() == Some(&'\\') {
+                            chars.next();
+                            break;
+                        }
+                    }
+                }
+                _ => {}
+            },
+            '\r' => {}
+            c if c.is_control() && c != '\n' && c != '\t' => {}
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 fn parent_path(path: &str) -> String {
@@ -963,6 +1289,23 @@ mod tests {
             event,
             WorkspaceEvent::Request { request: WorkspaceRequest::OpenTerminal { .. }, .. }
         )));
+    }
+
+    #[::core::prelude::v1::test]
+    fn recursive_entries_indent_below_the_open_folder() {
+        assert_eq!(entry_depth("", "Cargo.toml"), 0);
+        assert_eq!(entry_depth("", "crates/t3-client/Cargo.toml"), 2);
+        assert_eq!(entry_depth("crates", "crates/t3-client"), 0);
+        assert_eq!(entry_depth("crates", "crates/t3-client/src/lib.rs"), 2);
+    }
+
+    #[::core::prelude::v1::test]
+    fn terminal_output_drops_escape_sequences() {
+        assert_eq!(
+            strip_ansi("\u{1b}]0;title\u{7}\u{1b}[1;32mok\u{1b}[0m done\r\nnext\u{1b}[2K"),
+            "ok done\nnext"
+        );
+        assert_eq!(strip_ansi("plain\ttext"), "plain\ttext");
     }
 
     #[::core::prelude::v1::test]

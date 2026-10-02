@@ -25,9 +25,24 @@ pub struct DraftStore {
 #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct EnvironmentDrafts {
+    /// Composer text by thread ID, including draft threads' IDs.
     pub thread_text: HashMap<String, String>,
     /// thread ID -> request ID -> question ID -> answer draft.
     pub question_answers: HashMap<String, HashMap<String, HashMap<String, AnswerDraft>>>,
+    /// Threads started locally but not yet created on the server. A draft
+    /// becomes a real thread, with the same ID, when its first message is sent.
+    pub new_threads: Vec<DraftThread>,
+}
+
+/// A new thread's settings before it exists on the server.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DraftThread {
+    pub id: String,
+    pub project_id: String,
+    pub model_selection: serde_json::Value,
+    pub runtime_mode: String,
+    pub interaction_mode: String,
 }
 
 pub fn default_path() -> Option<PathBuf> {
@@ -172,6 +187,13 @@ mod tests {
             .environment_mut("https://other.example", "prod")
             .thread_text
             .insert("thread-a".into(), "separate server".into());
+        store.environment_mut("https://example.com", "prod").new_threads.push(DraftThread {
+            id: "draft-1".into(),
+            project_id: "project-1".into(),
+            model_selection: serde_json::json!({ "instanceId": "codex", "model": "gpt" }),
+            runtime_mode: "full-access".into(),
+            interaction_mode: "default".into(),
+        });
         store.save(&path).unwrap();
         store
             .environment_mut("https://example.com", "prod")

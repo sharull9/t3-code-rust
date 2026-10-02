@@ -7,7 +7,7 @@
 //! those redraws re-layout the cards without re-filtering, re-lowercasing or
 //! re-sorting `shell.threads` every frame.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use gpui_kit::assets::IconName;
 use gpui_kit::component::Disableable as _;
@@ -25,6 +25,8 @@ use crate::ui::{self, SIDEBAR_WIDTH, icon};
 
 pub enum SidebarEvent {
     OpenThread(String),
+    OpenDraft(String),
+    DiscardDraft(String),
     OpenSettings,
     LoadArchived(String),
     SwitchServer,
@@ -33,8 +35,22 @@ pub enum SidebarEvent {
     ThreadAction(String, t3_client::ThreadAction),
 }
 
+/// A new thread being composed, not yet on the server.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SidebarDraft {
+    pub id: String,
+    pub project_id: String,
+    pub text: String,
+}
+
 pub struct Sidebar {
     search: Entity<InputState>,
+    /// Draft threads, shown above the thread list.
+    new_drafts: Vec<SidebarDraft>,
+    /// Existing threads whose composer holds unsent text.
+    unsent: HashSet<String>,
+    /// Provider instances by id, for each card's account badge.
+    providers: HashMap<String, t3_client::ServerProvider>,
     shell: ShellState,
     status: Status,
     open_thread_id: Option<String>,
@@ -92,6 +108,9 @@ impl Sidebar {
             archive_error: false,
             restoring: Vec::new(),
             search,
+            new_drafts: Vec::new(),
+            unsent: HashSet::new(),
+            providers: HashMap::new(),
             shell: ShellState::default(),
             status: Status::Connecting(String::new()),
             open_thread_id: None,
@@ -140,6 +159,29 @@ impl Sidebar {
         self.restoring.clear();
         self.open_thread_id = None;
         cx.notify();
+    }
+
+    pub fn set_providers(
+        &mut self,
+        providers: Vec<t3_client::ServerProvider>,
+        cx: &mut Context<Self>,
+    ) {
+        self.providers =
+            providers.into_iter().map(|provider| (provider.instance_id.clone(), provider)).collect();
+        cx.notify();
+    }
+
+    pub fn set_drafts(
+        &mut self,
+        new_drafts: Vec<SidebarDraft>,
+        unsent: HashSet<String>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.new_drafts != new_drafts || self.unsent != unsent {
+            self.new_drafts = new_drafts;
+            self.unsent = unsent;
+            cx.notify();
+        }
     }
 
     pub fn set_open_thread(&mut self, thread_id: Option<String>, cx: &mut Context<Self>) {
@@ -256,10 +298,12 @@ impl Sidebar {
 
         let mut active: Vec<ThreadShell> =
             matching.iter().filter(|t| !t.is_settled()).map(|t| (*t).clone()).collect();
+        // Working threads lead under their own header, like T3's sidebar.
+        let working = |t: &ThreadShell| matches!(thread_badge(t), Some(Badge::Working));
         active.sort_by(|a, b| {
-            b.pinned_at
-                .is_some()
-                .cmp(&a.pinned_at.is_some())
+            working(b)
+                .cmp(&working(a))
+                .then_with(|| b.pinned_at.is_some().cmp(&a.pinned_at.is_some()))
                 .then_with(|| b.updated_at.cmp(&a.updated_at))
         });
 
@@ -274,16 +318,42 @@ impl Sidebar {
 }
 
 impl Render for Sidebar {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let mut active_cards: Vec<_> = self
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let query = self.search.read(cx).value().trim().to_lowercase();
+        let draft_cards: Vec<_> = if self.archive_mode {
+            Vec::new()
+        } else {
+            self.new_drafts
+                .iter()
+                .filter(|draft| {
+                    query.is_empty()
+                        || draft.text.to_lowercase().contains(&query)
+                        || self
+                            .projects
+                            .get(&draft.project_id)
+                            .is_some_and(|p| p.title.to_lowercase().contains(&query))
+                })
+                .enumerate()
+                .map(|(ix, draft)| self.render_draft_card(ix, draft, cx).into_any_element())
+                .collect()
+        };
+        let working_count = self
             .active
             .iter()
-            .enumerate()
-            .map(|(ix, thread)| {
-                let active = self.open_thread_id.as_deref() == Some(thread.id.as_str());
-                self.render_thread_card("active-thread", ix, thread, active, cx).into_any_element()
-            })
-            .collect();
+            .take_while(|thread| matches!(thread_badge(thread), Some(Badge::Working)))
+            .count();
+        let mut active_cards: Vec<_> = Vec::with_capacity(self.active.len() + 2);
+        for (ix, thread) in self.active.iter().enumerate() {
+            if ix == 0 && working_count > 0 {
+                active_cards.push(section_header("Working", cx).into_any_element());
+            }
+            if ix == working_count && working_count > 0 {
+                active_cards.push(section_header("Recent", cx).into_any_element());
+            }
+            let active = self.open_thread_id.as_deref() == Some(thread.id.as_str());
+            active_cards
+                .push(self.render_thread_card("active-thread", ix, thread, active, cx).into_any_element());
+        }
         // Searching surfaces settled matches too, rather than making the
         // user expand the shelf first to find what they typed for.
         let searching = !self.search.read(cx).value().trim().is_empty();
@@ -321,9 +391,14 @@ impl Render for Sidebar {
                 .collect();
             settled_cards.clear();
         }
-        let empty = active_cards.is_empty() && (self.archive_mode || self.settled.is_empty());
+        let empty = active_cards.is_empty()
+            && draft_cards.is_empty()
+            && (self.archive_mode || self.settled.is_empty());
         let divider = (!self.archive_mode && !self.settled.is_empty())
             .then(|| self.render_settled_divider(settled_expanded, cx).into_any_element());
+        // The shelf sits at the bottom of the sidebar; open, it takes at
+        // most 40% of the window's height and scrolls on its own.
+        let settled_max_h = window.viewport_size().height * 0.4;
 
         let theme = cx.theme();
         let (label, color) = match &self.status {
@@ -405,10 +480,13 @@ impl Render for Sidebar {
                         .items_center()
                         .justify_between()
                         .child(
-                            div()
+                            h_flex()
+                                .gap_1p5()
                                 .text_xs()
+                                .font_medium()
                                 .text_color(theme.muted_foreground)
-                                .child("ARCHIVED THREADS"),
+                                .child(icon(IconName::Archive).xsmall())
+                                .child(format!("Archived · {}", self.archived.len())),
                         )
                         .child(
                             Button::new("archive-refresh")
@@ -471,9 +549,8 @@ impl Render for Sidebar {
                     v_flex()
                         .gap_0p5()
                         .pb_2()
+                        .children(draft_cards)
                         .children(active_cards)
-                        .children(divider)
-                        .children(settled_cards)
                         .when(empty, |list| {
                             list.child(
                                 div()
@@ -483,7 +560,7 @@ impl Render for Sidebar {
                                     .text_color(theme.muted_foreground)
                                     .child(if self.archive_mode {
                                         if self.archive_request.is_some() {
-                                            "Loading archived threads?"
+                                            "Loading archived threads…"
                                         } else if self.archive_error {
                                             "Could not load archive. Try Refresh."
                                         } else {
@@ -498,6 +575,28 @@ impl Render for Sidebar {
                         }),
                 ),
             )
+            .when_some(divider, |sidebar, divider| {
+                sidebar.child(
+                    v_flex()
+                        .flex_none()
+                        .px_2()
+                        .pt_1()
+                        .border_t_1()
+                        .border_color(theme.sidebar_border)
+                        .child(divider)
+                        .when(!settled_cards.is_empty(), |shelf| {
+                            shelf.child(
+                                div()
+                                    .id("settled-list")
+                                    .max_h(settled_max_h)
+                                    .overflow_y_scrollbar()
+                                    .child(
+                                        v_flex().gap_0p5().pb_2().children(settled_cards),
+                                    ),
+                            )
+                        }),
+                )
+            })
             .child(
                 h_flex()
                     .gap_2()
@@ -570,6 +669,81 @@ impl Sidebar {
             .child(div().flex_1().h(px(1.)).bg(theme.sidebar_border))
             .child(
                 icon(if expanded { IconName::ChevronUp } else { IconName::ChevronDown }).xsmall(),
+            )
+    }
+
+    /// A draft thread's card: pencil, project, and the first line of its
+    /// unsent text; clicking reopens it and the cross discards it.
+    fn render_draft_card(
+        &self,
+        ix: usize,
+        draft: &SidebarDraft,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let theme = cx.theme();
+        let active = self.open_thread_id.as_deref() == Some(draft.id.as_str());
+        let project = self.projects.get(&draft.project_id);
+        let first_line = draft.text.lines().map(str::trim).find(|line| !line.is_empty());
+        let open_id = draft.id.clone();
+        let discard_id = draft.id.clone();
+
+        v_flex()
+            .id(("draft-thread", ix))
+            .test_support()
+            .gap_1()
+            .px_3()
+            .py_2()
+            .rounded_lg()
+            .border_1()
+            .border_dashed()
+            .border_color(theme.primary.opacity(if active { 0.45 } else { 0.25 }))
+            .cursor_pointer()
+            .when(active, |card| card.bg(theme.sidebar_accent))
+            .when(!active, |card| card.hover(|style| style.bg(theme.list_hover)))
+            .on_click(cx.listener(move |_, _, _, cx| {
+                cx.emit(SidebarEvent::OpenDraft(open_id.clone()));
+            }))
+            .child(
+                h_flex()
+                    .gap_2()
+                    .text_xs()
+                    .child(icon(IconName::SquarePen).xsmall().text_color(theme.primary))
+                    .when_some(project, |row, project| {
+                        row.child(ui::project_tag(&project.id, &project.title)).child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .truncate()
+                                .text_color(theme.muted_foreground)
+                                .child(project.title.clone()),
+                        )
+                    })
+                    .when(project.is_none(), |row| row.child(div().flex_1()))
+                    .child(div().text_color(theme.primary).child("Draft"))
+                    .child(
+                        Button::new(SharedString::from(format!("discard-draft-{}", draft.id)))
+                            .ghost()
+                            .xsmall()
+                            .icon(icon(IconName::X))
+                            .tooltip("Discard draft")
+                            .on_click(cx.listener(move |_, _, _, cx| {
+                                cx.stop_propagation();
+                                cx.emit(SidebarEvent::DiscardDraft(discard_id.clone()));
+                            })),
+                    ),
+            )
+            .child(
+                div()
+                    .truncate()
+                    .text_sm()
+                    .font_medium()
+                    .when(first_line.is_none(), |title| {
+                        title.italic().text_color(theme.muted_foreground)
+                    })
+                    .when(first_line.is_some(), |title| {
+                        title.text_color(theme.foreground.opacity(0.85))
+                    })
+                    .child(first_line.unwrap_or("New thread").to_owned()),
             )
     }
 
@@ -648,13 +822,33 @@ impl Sidebar {
                     }
                     _ => icon(IconName::CircleAlert).xsmall().into_any_element(),
                 })
-                .child(badge.label())
+                .child(match badge {
+                    Badge::Working => working_since(thread)
+                        .and_then(ui::elapsed)
+                        .map_or_else(|| "Working".to_owned(), |time| format!("Working {time}")),
+                    _ => badge.label().to_owned(),
+                })
                 .into_any_element(),
             None => div()
                 .text_color(theme.muted_foreground)
                 .children(ui::relative_time(&thread.updated_at))
                 .into_any_element(),
         };
+        let unsent = self.unsent.contains(&thread.id);
+        // The account the thread runs on: its provider instance's mark.
+        let account = thread
+            .model_selection
+            .as_ref()
+            .and_then(|selection| selection["instanceId"].as_str())
+            .and_then(|instance| self.providers.get(instance))
+            .map(|provider| {
+                crate::model_picker::provider_mark(
+                    &provider.instance_id,
+                    &provider.driver,
+                    &crate::model_picker::provider_name(provider),
+                    px(16.),
+                )
+            });
 
         v_flex()
             .id((list, ix))
@@ -663,8 +857,12 @@ impl Sidebar {
             .px_3()
             .py_2()
             .rounded_lg()
+            .border_1()
+            .border_color(transparent_black())
             .cursor_pointer()
-            .when(active, |card| card.bg(theme.sidebar_accent))
+            .when(active, |card| {
+                card.bg(theme.sidebar_accent).border_color(theme.primary.opacity(0.25))
+            })
             .when(!active, |card| card.hover(|style| style.bg(theme.list_hover)))
             .on_click(cx.listener(move |_, _, _, cx| {
                 if !archived {
@@ -686,6 +884,17 @@ impl Sidebar {
                         )
                     })
                     .when(project.is_none(), |row| row.child(div().flex_1()))
+                    .when(unsent, |row| {
+                        row.child(
+                            div()
+                                .id(SharedString::from(format!("unsent-{}", thread.id)))
+                                .child(icon(IconName::PencilLine).xsmall().text_color(theme.primary))
+                                .tooltip(|window, cx| {
+                                    gpui_kit::component::tooltip::Tooltip::new("Unsent draft")
+                                        .build(window, cx)
+                                }),
+                        )
+                    })
                     .child(trailing)
                     .when(pinned, |row| {
                         row.child(icon(IconName::Pin).xsmall().text_color(theme.muted_foreground))
@@ -721,16 +930,26 @@ impl Sidebar {
                     .font_medium()
                     .when(active, |title| title.font_semibold())
                     .when(!active, |title| title.text_color(theme.foreground.opacity(0.85)))
-                    .child(thread.title.clone()),
+                    .child(ui::display_title(&thread.title)),
             )
-            .children(thread.branch.clone().map(|branch| {
-                h_flex()
-                    .gap_1()
-                    .text_xs()
-                    .text_color(theme.muted_foreground)
-                    .child(icon(IconName::GitBranch).xsmall())
-                    .child(div().min_w_0().truncate().child(branch))
-            }))
+            .when(thread.branch.is_some() || account.is_some(), |card| {
+                card.child(
+                    h_flex()
+                        .gap_1()
+                        .text_xs()
+                        .text_color(theme.muted_foreground)
+                        .children(thread.branch.clone().map(|branch| {
+                            h_flex()
+                                .flex_1()
+                                .min_w_0()
+                                .gap_1()
+                                .child(icon(IconName::GitBranch).xsmall())
+                                .child(div().min_w_0().truncate().child(branch))
+                        }))
+                        .when(thread.branch.is_none(), |row| row.child(div().flex_1()))
+                        .children(account.map(|mark| div().pr_0p5().child(mark))),
+                )
+            })
     }
 }
 
@@ -757,6 +976,27 @@ impl Badge {
             Badge::Failed => cx.theme().danger,
         }
     }
+}
+
+/// A small uppercase-free section label with a rule, like "Settled (N)".
+fn section_header(label: &'static str, cx: &App) -> impl IntoElement {
+    let theme = cx.theme();
+    h_flex()
+        .gap_2()
+        .items_center()
+        .px_3()
+        .pt_2()
+        .pb_1()
+        .text_xs()
+        .text_color(theme.muted_foreground)
+        .child(label)
+        .child(div().flex_1().h(px(1.)).bg(theme.sidebar_border))
+}
+
+/// When the running turn started, for the "Working 7m" label.
+fn working_since(thread: &ThreadShell) -> Option<&str> {
+    let turn = thread.latest_turn.as_ref()?;
+    turn.started_at.as_deref().or(turn.requested_at.as_deref())
 }
 
 fn thread_badge(thread: &ThreadShell) -> Option<Badge> {
