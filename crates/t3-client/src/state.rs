@@ -131,6 +131,9 @@ fn apply_event(thread: &mut ThreadDetail, event: OrchestrationEvent) {
                         }
                         existing.updated_at = payload.updated_at;
                     }
+                    if !payload.attachments.is_empty() {
+                        existing.attachments = payload.attachments;
+                    }
                     existing.streaming = payload.streaming;
                     if payload.turn_id.is_some() {
                         existing.turn_id = payload.turn_id;
@@ -138,6 +141,7 @@ fn apply_event(thread: &mut ThreadDetail, event: OrchestrationEvent) {
                 }
                 None => thread.messages.push(Message {
                     id: payload.message_id,
+                    attachments: payload.attachments,
                     role: payload.role,
                     text: payload.text,
                     turn_id: payload.turn_id,

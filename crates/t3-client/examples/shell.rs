@@ -6,11 +6,10 @@ use t3_client::{Connection, PairingLink, ShellState};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let link = std::env::args()
-        .nth(1)
-        .ok_or("usage: shell <pairing-link>")?;
+    let link = std::env::args().nth(1).ok_or("usage: shell <pairing-link>")?;
     let http = reqwest::Client::new();
-    let credentials = t3_client::auth::pair(&http, &PairingLink::parse(&link)?, "t3-client smoke").await?;
+    let credentials =
+        t3_client::auth::pair(&http, &PairingLink::parse(&link)?, "t3-client smoke").await?;
     println!("paired with {}", credentials.base_url);
     let connection = Connection::connect(&http, &credentials).await?;
     println!("connected");

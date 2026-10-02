@@ -1,4 +1,4 @@
-# T3 Code GPUI
+# Rust code
 
 A native desktop client for [T3 Code](https://github.com/pingdotgg/t3code), built with
 [GPUI](https://gpui.rs) and [GPUI Kit](https://gpui-kit.com). The T3 server (`npx t3`) stays the
@@ -55,25 +55,66 @@ Headless check of the protocol layer, with no UI:
 ```sh
 cargo run -p t3-client --example shell -- "http://localhost:3773/pair#token=..."
 cargo test -p t3-client
+# Check an existing saved session without pairing or changing server state:
+cargo run -p t3-client --example session -- <path-to-credentials.json>
 ```
 
 ## How it talks to the server
 
-| Step | Endpoint |
-| ---- | -------- |
-| Pair (one-time link → bearer token) | `POST /oauth/token` (token exchange, form-encoded) |
-| Socket ticket | `POST /api/auth/websocket-ticket` |
-| RPC | `GET /ws?wsTicket=…`, Effect RPC with JSON messages |
-| Projects/threads | `orchestration.subscribeShell` (stream) |
-| Thread detail | `orchestration.subscribeThread` (stream, last 30 turns) |
-| Send / stop | `orchestration.dispatchCommand` with `thread.turn.start` / `thread.turn.interrupt` |
+| Step                                | Endpoint                                                                           |
+| ----------------------------------- | ---------------------------------------------------------------------------------- |
+| Pair (one-time link → bearer token) | `POST /oauth/token` (token exchange, form-encoded)                                 |
+| Socket ticket                       | `POST /api/auth/websocket-ticket`                                                  |
+| RPC                                 | `GET /ws?wsTicket=…`, Effect RPC with JSON messages                                |
+| Projects/threads                    | `orchestration.subscribeShell` (stream)                                            |
+| Archived threads                    | `orchestration.getArchivedShellSnapshot` (on demand)                               |
+| Thread detail                       | `orchestration.subscribeThread` (stream, full history)                             |
+| Send / stop                         | `orchestration.dispatchCommand` with `thread.turn.start` / `thread.turn.interrupt` |
 
 The types in `t3-client/src/types.rs` are a hand-ported subset of
 `packages/contracts/src/orchestration.ts`. Unknown fields are ignored, and stream items that fail
 to decode are skipped, so newer servers keep working until a change touches a field we use.
 
-## Not yet supported
+## Native features
 
-Approvals and user-input prompts (threads show a "needs you" badge), creating
-threads/projects, diffs, terminals, attachments, model selection, multiple environments,
-DPoP-bound tokens, and relay/T3 Connect.
+The app supports model selection, runtime/Build/Plan modes, project/thread creation,
+approval responses, user-input questions, and pin/settle/archive/restore/rename actions.
+Archived threads have a searchable shelf with refresh and restore controls. New
+threads inherit current modes and use destination-project model defaults first.
+
+Composer text and question answers persist across restarts under the server URL
+and environment ID. File attachments upload through signed server URLs, with
+retry/removal controls and per-message download links. Selected local attachment
+files are held in memory and must be selected again after restarting the app.
+
+Open **Workspace** beside Settings or press Ctrl+J for server-side files, readonly
+previews, Git status/diffs, local branch switching, and a command terminal with
+streamed output. Project creation browses folders on the server. Ctrl+N creates a
+thread, Ctrl+B toggles the sidebar, Ctrl+L focuses the composer, and Ctrl+, opens
+Settings. Question cards support Ctrl+1 through Ctrl+9 for choices.
+
+Settings shows provider availability and model counts, refreshes server config,
+and switches dark/light appearance. **Local server** lets you select a compatible
+T3 server executable: the app starts it with a private stdin bootstrap, a separate
+`t3-gpui/server` data directory, and in-memory credentials. No pasted pairing link
+is needed for that session. Server discovery, bundling and automatic local startup
+on the next app launch are still pending.
+
+The compact desktop UI groups tool calls between messages, with expandable per-call
+details and icon-only copy controls. Settings opens at the bottom of the sidebar,
+capped at 40% of the window height. Thread lists and settings scroll independently.
+See the [compact UI changes](docs/plans/2026-10-01-compact-rust-code-ui.md).
+
+## Remaining parity work
+
+Slash commands, provider-specific model options, message edit/retry and plan actions,
+worktree creation, full terminal emulation, provider authentication/preferences,
+multiple simultaneous environments, DPoP tokens, and relay/T3 Connect remain.
+Pixel equivalence with the original desktop has not been verified.
+
+See the [UI parity and local-backend plan](docs/plans/2026-10-01-ui-parity-and-local-backend.md)
+for implementation details and the remaining local-server work.
+
+The [improvement audit](docs/plans/2026-10-01-improvement-audit.md) records the remaining
+work across UI, workspace, connections, performance and delivery. Failed pairing
+keeps the current thread and drafts; sends wait for fresh thread details.

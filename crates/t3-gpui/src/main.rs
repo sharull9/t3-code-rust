@@ -1,10 +1,17 @@
 mod app;
+mod attachments;
 mod backend;
+mod directory_picker;
+mod drafts;
+mod managed_server;
 mod project_picker;
+mod settings;
 mod sidebar;
 mod thread_view;
 mod transcript;
 mod ui;
+mod user_input;
+mod workspace;
 
 use gpui_kit::component::TitleBar;
 use gpui_kit::*;
@@ -16,7 +23,9 @@ fn main() {
         .run(|cx| {
             // Must run before any component-backed view is created.
             gpui_kit::init(cx);
+            app::init(cx);
             project_picker::init(cx);
+            user_input::init(cx);
             ui::apply_theme(cx);
 
             let bounds = Bounds::centered(None, size(px(1400.), px(900.)), cx);
@@ -27,8 +36,11 @@ fn main() {
                 ..TitleBar::window_options()
             };
             // Wraps the view in `Root`, which hosts dialogs, notifications and menus.
-            gpui_kit::open_window(options, cx, |window, cx| cx.new(|cx| app::T3App::new(window, cx)))
-                .expect("failed to open window");
+            gpui_kit::open_window(options, cx, |window, cx| {
+                window.set_window_title("Rust code");
+                cx.new(|cx| app::T3App::new(window, cx))
+            })
+            .expect("failed to open window");
             cx.activate(true);
         });
 }

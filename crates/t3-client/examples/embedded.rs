@@ -25,7 +25,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // A reusable secret only this process knows; the server trusts it as a
     // desktop handoff and exchanges it for bearer tokens.
-    let bootstrap_token = format!("{}{}", uuid::Uuid::new_v4().simple(), uuid::Uuid::new_v4().simple());
+    let bootstrap_token =
+        format!("{}{}", uuid::Uuid::new_v4().simple(), uuid::Uuid::new_v4().simple());
     let envelope = json!({
         "mode": "desktop",
         "noBrowser": true,
@@ -74,7 +75,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // The bootstrap token goes through the same exchange as a pairing token.
     let link = PairingLink::parse(&format!("{base} {bootstrap_token}"))?;
-    let credentials: Credentials = t3_client::auth::pair(&http, &link, "T3 GPUI (embedded)").await?;
+    let credentials: Credentials =
+        t3_client::auth::pair(&http, &link, "T3 GPUI (embedded)").await?;
     println!("logged in, scopes: {}", credentials.scope);
     let again = t3_client::auth::pair(&http, &link, "T3 GPUI (embedded)").await;
     println!("bootstrap token reusable: {}", again.is_ok());

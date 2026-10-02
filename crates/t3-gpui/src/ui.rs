@@ -8,10 +8,14 @@ pub const SIDEBAR_WIDTH: Pixels = px(300.);
 /// Width of the transcript and composer column.
 pub const CONTENT_WIDTH: Pixels = px(780.);
 
-/// Near-black surfaces with a violet accent, after the T3 Code desktop app.
+/// Near-black surfaces with a copper accent for the Rust code desktop.
 pub fn apply_theme(cx: &mut App) {
     Theme::change(ThemeMode::Dark, None, cx);
     let theme = Theme::global_mut(cx);
+    #[cfg(windows)]
+    {
+        theme.font_family = "Bahnschrift".into();
+    }
     theme.background = hex(0x0a0a0b);
     theme.foreground = hex(0xe8e8ea);
     theme.muted_foreground = hex(0x8b8b93);
@@ -24,9 +28,9 @@ pub fn apply_theme(cx: &mut App) {
     theme.list_hover = hex(0x17171a);
     theme.secondary = hex(0x141417);
     theme.secondary_hover = hex(0x1c1c20);
-    theme.primary = hex(0x5b4bdb);
-    theme.primary_hover = hex(0x6a5be6);
-    theme.primary_foreground = hex(0xffffff);
+    theme.primary = hex(0xd49a6a);
+    theme.primary_hover = hex(0xe3ad80);
+    theme.primary_foreground = hex(0x15100d);
 }
 
 pub fn hex(value: u32) -> Hsla {
@@ -74,10 +78,8 @@ pub fn project_tag(project_id: &str, title: &str) -> impl IntoElement {
 
 /// Up to two letters: the initials of the first two words, or the first two letters.
 pub fn initials(title: &str) -> String {
-    let words: Vec<&str> = title
-        .split(|c: char| !c.is_alphanumeric())
-        .filter(|w| !w.is_empty())
-        .collect();
+    let words: Vec<&str> =
+        title.split(|c: char| !c.is_alphanumeric()).filter(|w| !w.is_empty()).collect();
     let letters: String = match words.as_slice() {
         [] => String::new(),
         [only] => only.chars().take(2).collect(),
@@ -107,9 +109,9 @@ pub fn provider_label(provider: Option<&str>) -> String {
         Some("codex") => "Codex".into(),
         Some(other) => {
             let mut chars = other.chars();
-            chars.next().map_or_else(String::new, |first| {
-                first.to_uppercase().chain(chars).collect()
-            })
+            chars
+                .next()
+                .map_or_else(String::new, |first| first.to_uppercase().chain(chars).collect())
         }
     }
 }
