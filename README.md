@@ -101,11 +101,18 @@ is needed for that session. Server discovery, bundling and automatic local start
 on the next app launch are still pending.
 
 The compact desktop UI groups tool calls between messages, with expandable per-call
-details and icon-only copy controls. Settings opens at the bottom of the sidebar,
-capped at 40% of the window height. Thread lists and settings scroll independently.
+details and icon-only copy controls. Settings opens as a full page in the main area,
+with Appearance, Providers, Connections and Keyboard sections. Back, Escape or
+Ctrl+, returns to the previous view and preserves the current draft. Categories
+use a rail on wide windows and tabs on narrow windows.
 See the [compact UI changes](docs/plans/2026-10-01-compact-rust-code-ui.md).
 
 ## Remaining parity work
+
+The [full migration plan](docs/plans/2026-10-02-full-t3-code-migration.md) compares
+the native app with upstream T3 Code at `54084ae1` and orders the remaining work
+into ten phases. Its [contract inventory](docs/plans/2026-10-02-upstream-parity-inventory.md)
+tracks all 153 public RPC methods and the settings/capability fields at that revision.
 
 Slash commands, provider-specific model options, message edit/retry and plan actions,
 worktree creation, full terminal emulation, provider authentication/preferences,

@@ -22,7 +22,7 @@ use crate::backend::{Backend, Command, Event, Status};
 use crate::directory_picker::{DirectoryPicker, DirectoryPickerEvent};
 use crate::drafts::{DraftStore, DraftThread};
 use crate::project_picker::{ProjectPicker, ProjectPickerEvent};
-use crate::settings::{SettingsEvent, SettingsPanel};
+use crate::settings::{SettingsEvent, SettingsPage};
 use crate::sidebar::{Sidebar, SidebarEvent};
 use crate::thread_view::{ThreadView, ThreadViewEvent};
 use crate::ui::{self, SIDEBAR_WIDTH, icon};
@@ -51,6 +51,7 @@ pub fn init(cx: &mut App) {
     ]);
 }
 pub struct T3App {
+    focus_handle: FocusHandle,
     backend: Backend,
     status: Status,
     error: Option<SharedString>,
@@ -81,7 +82,7 @@ pub struct T3App {
     workspace: Entity<WorkspacePanel>,
     workspace_open: bool,
     directory_picker: Entity<DirectoryPicker>,
-    settings: Entity<SettingsPanel>,
+    settings: Entity<SettingsPage>,
     usage: Entity<UsageView>,
     /// The usage page replaces the open thread in the main column.
     usage_open: bool,
@@ -111,7 +112,7 @@ impl T3App {
         let project_picker = cx.new(|cx| ProjectPicker::new(window, cx));
         let workspace = cx.new(|cx| WorkspacePanel::new(window, cx));
         let directory_picker = cx.new(|cx| DirectoryPicker::new(window, cx));
-        let settings = cx.new(SettingsPanel::new);
+        let settings = cx.new(SettingsPage::new);
         let usage = cx.new(UsageView::new);
         cx.on_release(|this, cx| {
             this.capture_current_drafts(cx);
@@ -151,6 +152,7 @@ impl T3App {
             ),
             cx.subscribe_in(&settings, window, |this, _, event: &SettingsEvent, window, cx| {
                 match event {
+                    SettingsEvent::Close => this.set_settings_open(false, window, cx),
                     SettingsEvent::RefreshProviders => this.backend.send(Command::RefreshConfig),
                     SettingsEvent::SwitchServer => {
                         this.settings.update(cx, |settings, cx| settings.set_open(false, cx));
@@ -218,15 +220,23 @@ impl T3App {
                     }
                     SidebarEvent::DiscardDraft(draft_id) => this.discard_draft(draft_id, cx),
                     SidebarEvent::SwitchServer => {
+                        this.set_settings_open(false, window, cx);
                         this.switching_server = true;
                         this.pairing_link.update(cx, |state, cx| state.focus(window, cx));
                         cx.notify();
                     }
                     SidebarEvent::OpenSettings => {
-                        this.settings.update(cx, |panel, cx| panel.toggle_open(cx));
-                        cx.notify();
+                        this.set_settings_open(true, window, cx);
                     }
-                    SidebarEvent::ToggleUsage => this.set_usage_open(!this.usage_open, cx),
+                    SidebarEvent::ToggleUsage => {
+                        this.set_settings_open(false, window, cx);
+                        this.set_usage_open(!this.usage_open, cx);
+                        if this.usage_open {
+                            this.focus_handle.focus(window, cx);
+                        } else if let Some(thread) = &this.thread {
+                            thread.update(cx, |view, cx| view.focus_composer(window, cx));
+                        }
+                    }
                     SidebarEvent::AddProject => this.add_project(window, cx),
                     SidebarEvent::NewThread => {
                         let projects = this.shell.projects.clone();
@@ -257,6 +267,7 @@ impl T3App {
         ];
 
         Self {
+            focus_handle: cx.focus_handle(),
             backend,
             status: Status::Connecting(String::new()),
             error: None,
@@ -659,6 +670,7 @@ impl T3App {
 
     /// Shows a draft thread in place of the open thread.
     fn open_draft(&mut self, draft_id: String, window: &mut Window, cx: &mut Context<Self>) {
+        self.set_settings_open(false, window, cx);
         self.set_usage_open(false, cx);
         let Some(draft) = self.draft_threads.iter().find(|draft| draft.id == draft_id).cloned()
         else {
@@ -784,6 +796,7 @@ impl T3App {
     }
 
     fn open_thread(&mut self, thread_id: String, window: &mut Window, cx: &mut Context<Self>) {
+        self.set_settings_open(false, window, cx);
         self.set_usage_open(false, cx);
         if let Some(thread) = &self.thread {
             if thread.read(cx).thread_id() == thread_id && !thread.read(cx).is_draft() {
@@ -1042,7 +1055,38 @@ impl T3App {
         cx.notify();
     }
 
+    fn set_settings_open(&mut self, open: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if self.settings.read(cx).is_open() == open {
+            return;
+        }
+        self.settings.update(cx, |page, cx| {
+            page.set_open(open, cx);
+            if open {
+                page.focus(window, cx);
+            }
+        });
+        if !open {
+            if self.status == Status::NeedsPairing || self.switching_server {
+                self.pairing_link.update(cx, |input, cx| input.focus(window, cx));
+            } else if !self.usage_open {
+                if let Some(thread) = &self.thread {
+                    thread.update(cx, |view, cx| view.focus_composer(window, cx));
+                } else {
+                    self.focus_handle.focus(window, cx);
+                }
+            } else {
+                self.focus_handle.focus(window, cx);
+            }
+        }
+        cx.notify();
+    }
+
+    fn toggle_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.set_settings_open(!self.settings.read(cx).is_open(), window, cx);
+    }
+
     fn toggle_workspace(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.set_settings_open(false, window, cx);
         self.workspace_open = !self.workspace_open;
         if self.workspace_open {
             if window.bounds().size.width < px(1100.) {
@@ -1073,7 +1117,10 @@ impl T3App {
 
 impl Render for T3App {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let main = if self.status == Status::NeedsPairing || self.switching_server {
+        let settings_open = self.settings.read(cx).is_open();
+        let main = if settings_open {
+            self.settings.clone().into_any_element()
+        } else if self.status == Status::NeedsPairing || self.switching_server {
             self.render_pairing(window, cx).into_any_element()
         } else if self.usage_open {
             self.usage.clone().into_any_element()
@@ -1088,6 +1135,7 @@ impl Render for T3App {
         };
 
         v_flex()
+            .track_focus(&self.focus_handle)
             .key_context("T3App")
             .on_action(cx.listener(|this, _: &NewThread, window, cx| {
                 if matches!(this.status, Status::Connected(_)) {
@@ -1100,6 +1148,8 @@ impl Render for T3App {
                 cx.notify();
             }))
             .on_action(cx.listener(|this, _: &FocusComposer, window, cx| {
+                this.set_settings_open(false, window, cx);
+                this.set_usage_open(false, cx);
                 if let Some(thread) = &this.thread {
                     thread.update(cx, |view, cx| view.focus_composer(window, cx));
                 }
@@ -1107,12 +1157,13 @@ impl Render for T3App {
             .on_action(cx.listener(|this, _: &ToggleWorkspace, window, cx| {
                 this.toggle_workspace(window, cx)
             }))
-            .on_action(cx.listener(|this, _: &ShowSettings, _, cx| {
-                this.settings.update(cx, |settings, cx| settings.toggle_open(cx))
+            .on_action(cx.listener(|this, _: &ShowSettings, window, cx| {
+                this.toggle_settings(window, cx)
             }))
             .on_action(cx.listener(|this, _: &DismissModal, window, cx| {
                 if this.settings.read(cx).is_open() {
-                    this.settings.update(cx, |panel, cx| panel.set_open(false, cx));
+                    this.set_settings_open(false, window, cx);
+                    return;
                 } else if this.directory_picker.read(cx).is_open() {
                     this.directory_picker.update(cx, |picker, cx| picker.cancel(cx));
                 } else {
@@ -1149,9 +1200,19 @@ impl Render for T3App {
                                     }),
                                 ))
                             }))
-                            .child(main),
+                            .child(
+                                div()
+                                    .id("main-content")
+                                    .test_support()
+                                    .flex()
+                                    .flex_col()
+                                    .flex_1()
+                                    .min_h_0()
+                                    .min_w_0()
+                                    .child(main),
+                            ),
                     )
-                    .when(self.workspace_open && !self.switching_server, |row| {
+                    .when(self.workspace_open && !self.switching_server && !settings_open, |row| {
                         row.child(
                             div()
                                 .w(px(
@@ -1168,18 +1229,6 @@ impl Render for T3App {
             // Painted last so it stacks above the sidebar and main column.
             .child(self.project_picker.clone())
             .child(self.directory_picker.clone())
-            .when(self.settings.read(cx).is_open(), |root| {
-                root.child(
-                    div()
-                        .id("settings-anchor")
-                        .absolute()
-                        .left_0()
-                        .bottom_0()
-                        .w(if self.sidebar_open { SIDEBAR_WIDTH } else { px(320.) })
-                        .occlude()
-                        .child(self.settings.clone()),
-                )
-            })
     }
 }
 
@@ -1216,7 +1265,8 @@ impl T3App {
                     .border_r_1()
                     .border_color(theme.sidebar_border)
             });
-        let shell = self.open_thread_shell(cx).filter(|_| !self.usage_open);
+        let settings_open = self.settings.read(cx).is_open();
+        let shell = self.open_thread_shell(cx).filter(|_| !self.usage_open && !settings_open);
         let project =
             shell.and_then(|thread| self.shell.projects.iter().find(|p| p.id == thread.project_id));
         let breadcrumb = h_flex()
@@ -1247,7 +1297,10 @@ impl T3App {
                         .child(ui::display_title(&thread.title)),
                 )
             })
-            .when(self.usage_open, |row| row.child(div().font_semibold().child("Usage")));
+            .when(self.usage_open && !settings_open, |row| {
+                row.child(div().font_semibold().child("Usage"))
+            })
+            .when(settings_open, |row| row.child(div().font_semibold().child("Settings")));
         let controls = h_flex()
             .gap_1()
             .px_2()
@@ -1273,8 +1326,8 @@ impl T3App {
                     .tooltip("Settings (Ctrl+,)")
                     .occlude()
                     .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.settings.update(cx, |panel, cx| panel.toggle_open(cx))
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.toggle_settings(window, cx)
                     })),
             );
         TitleBar::new().pl_0().child(
@@ -1510,6 +1563,69 @@ mod recovery_tests {
     use gpui_kit::test::TestWindowExt as _;
 
     #[gpui_kit::test]
+    fn settings_returns_to_empty_usage_and_pairing_views_with_working_shortcuts(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            init(cx);
+        });
+        let (backend, _commands) = Backend::for_test();
+        let (_events, receiver) = futures::channel::mpsc::unbounded();
+        let (handle, app) = cx.update(|cx| {
+            gpui_kit::open_window(
+                WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(Bounds {
+                        origin: Point::default(),
+                        size: size(px(1400.), px(900.)),
+                    })),
+                    ..Default::default()
+                },
+                cx,
+                |window, cx| cx.new(|cx| T3App::new_with_backend(backend, receiver, window, cx)),
+            ).unwrap()
+        });
+        cx.update_window(handle, |_, window, cx| {
+            app.update(cx, |app, cx| {
+                app.handle_event(Event::Status(Status::Connected("Test server".into())), window, cx);
+            });
+            window.render_frame(cx);
+            window.click("settings", cx);
+            assert!(app.read(cx).settings.read(cx).is_open());
+            window.render_frame(cx);
+            assert_eq!(window.find("settings-page").bounds(), window.find("main-content").bounds());
+            assert!(window.find("settings-nav-connections").bounds().origin.y
+                > window.find("settings-nav-appearance").bounds().origin.y);
+            window.press("escape", cx);
+            assert!(!app.read(cx).settings.read(cx).is_open());
+            window.press("ctrl-,", cx);
+            assert!(app.read(cx).settings.read(cx).is_open());
+            window.press("escape", cx);
+            window.click("sidebar-usage", cx);
+        }).unwrap();
+        cx.update_window(handle, |_, window, cx| {
+            assert!(app.read(cx).usage_open);
+            window.press("ctrl-,", cx);
+            assert!(app.read(cx).settings.read(cx).is_open());
+            window.press("escape", cx);
+            assert!(app.read(cx).usage_open);
+            window.press("ctrl-,", cx);
+            assert!(app.read(cx).settings.read(cx).is_open());
+            window.press("escape", cx);
+            app.update(cx, |app, cx| {
+                app.handle_event(Event::Status(Status::NeedsPairing), window, cx);
+            });
+            window.press("ctrl-,", cx);
+            assert!(app.read(cx).settings.read(cx).is_open());
+            window.click("settings-nav-connections", cx);
+            window.render_frame(cx);
+            assert!(window.find("settings-managed-server").visible());
+            window.press("escape", cx);
+            assert!(!app.read(cx).settings.read(cx).is_open());
+            window.input("Pairing draft", cx);
+            assert_eq!(app.read(cx).pairing_link.read(cx).value(), "Pairing draft");
+        }).unwrap();
+    }
+
+    #[gpui_kit::test]
     fn workspace_and_settings_shortcuts_fit_minimum_window(cx: &mut TestAppContext) {
         cx.update(|cx| {
             gpui_kit::init(cx);
@@ -1555,10 +1671,16 @@ mod recovery_tests {
             window.press("ctrl-,", cx);
             window.render_frame(cx);
             assert!(app.read(cx).settings.read(cx).is_open());
-            let panel = window.find("settings-panel").bounds();
-            assert!(panel.size.height <= px(480.) * 0.4);
-            assert!(panel.size.width <= px(320.));
-            assert!(panel.origin.y >= px(480.) * 0.6);
+            let page = window.find("settings-page");
+            assert_eq!(page.bounds(), window.find("main-content").bounds());
+            assert!(page.bounds().size.height > px(480.) * 0.8);
+            assert_eq!(page.bounds().size.width, px(720.));
+            assert_eq!(page.focused(), Some(true));
+            window.input("Do not edit the hidden composer", cx);
+            assert!(app.read(cx).thread.as_ref().unwrap().read(cx).draft(cx).is_empty());
+            window.click("settings-nav-keyboard", cx);
+            window.render_frame(cx);
+            assert!(window.find("settings-close").visible());
             window.press("escape", cx);
             assert!(!app.read(cx).settings.read(cx).is_open());
             window.input("Typing after settings", cx);
@@ -1566,6 +1688,30 @@ mod recovery_tests {
                 app.read(cx).thread.as_ref().unwrap().read(cx).draft(cx),
                 "Typing after settings"
             );
+        })
+        .unwrap();
+        cx.update_window(handle, |_, window, cx| {
+            // Opening from the sidebar uses the same page and preserves the draft.
+            window.press("ctrl-j", cx);
+            window.click("toggle-sidebar", cx);
+            window.render_frame(cx);
+            window.click("sidebar-settings", cx);
+        })
+        .unwrap();
+        cx.update_window(handle, |_, window, cx| {
+            assert!(app.read(cx).settings.read(cx).is_open());
+            window.render_frame(cx);
+            assert_eq!(window.find("settings-page").bounds(), window.find("main-content").bounds());
+            assert!(window.find("settings-page").bounds().origin.x >= SIDEBAR_WIDTH);
+            window.click("settings-close", cx);
+        })
+        .unwrap();
+        cx.update_window(handle, |_, window, cx| {
+            window.input(" again", cx);
+            assert_eq!(app.read(cx).thread.as_ref().unwrap().read(cx).draft(cx), "Typing after settings again");
+            window.press("ctrl-,", cx);
+            window.press("ctrl-,", cx);
+            assert!(!app.read(cx).settings.read(cx).is_open());
         })
         .unwrap();
     }
