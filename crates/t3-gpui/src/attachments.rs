@@ -224,7 +224,9 @@ impl AttachmentPanel {
     }
 }
 
-/// Unsent pastes older than this are removed the next time an image is pasted.
+/// Pastes older than this are removed at startup. Attachment trays live only
+/// in memory, so after a restart no row can still need them; the age keeps a
+/// second running copy of the app from deleting the first one's pastes.
 const PASTED_MAX_AGE: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
 fn pasted_dir() -> PathBuf {
@@ -250,7 +252,6 @@ fn save_pasted_image_in(directory: &Path, image: &Image) -> Result<PathBuf, Stri
         _ => ("png", to_png(&image.bytes)?),
     };
     std::fs::create_dir_all(directory).map_err(|error| error.to_string())?;
-    prune_pasted(directory);
     let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S");
     let mut path = directory.join(format!("pasted-image-{stamp}.{extension}"));
     let mut n = 1;
@@ -272,7 +273,13 @@ fn to_png(bytes: &[u8]) -> Result<Vec<u8>, String> {
     Ok(png.into_inner())
 }
 
-/// Removes old pastes left behind by drafts that were never sent.
+/// Removes old pastes left behind by drafts that were never sent. Call once
+/// at startup, before any tray exists; never while rows may reference them.
+pub fn prune_pasted_images() {
+    let directory = pasted_dir();
+    std::thread::spawn(move || prune_pasted(&directory));
+}
+
 fn prune_pasted(directory: &Path) {
     let Ok(entries) = std::fs::read_dir(directory) else { return };
     let now = SystemTime::now();
@@ -531,6 +538,27 @@ mod pasted_tests {
         assert_eq!(attachment.kind, t3_client::attachments::AttachmentKind::Image);
         let svg = Image { format: ImageFormat::Svg, bytes: b"<svg/>".to_vec(), id: 2 };
         assert!(save_pasted_image_in(&directory, &svg).is_err());
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn pasting_keeps_old_files_and_startup_pruning_removes_them() {
+        let directory = std::env::temp_dir().join(format!("t3-gpui-prune-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let old = directory.join("pasted-image-old.png");
+        let recent = directory.join("pasted-image-recent.png");
+        std::fs::write(&old, b"x").unwrap();
+        std::fs::write(&recent, b"x").unwrap();
+        let week_ago = SystemTime::now() - PASTED_MAX_AGE - Duration::from_secs(60);
+        std::fs::File::options().write(true).open(&old).unwrap().set_modified(week_ago).unwrap();
+
+        let image = Image { format: ImageFormat::Png, bytes: b"png".to_vec(), id: 3 };
+        save_pasted_image_in(&directory, &image).unwrap();
+        assert!(old.exists(), "a failed paste still in a tray keeps its file");
+
+        prune_pasted(&directory);
+        assert!(!old.exists());
+        assert!(recent.exists());
         let _ = std::fs::remove_dir_all(directory);
     }
 }
