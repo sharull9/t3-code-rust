@@ -12,6 +12,7 @@ mod sidebar;
 mod thread_view;
 mod transcript;
 mod ui;
+mod usage;
 mod user_input;
 mod workspace;
 

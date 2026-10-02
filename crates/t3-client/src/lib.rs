@@ -20,6 +20,7 @@ pub mod pending;
 pub mod rpc;
 pub mod state;
 pub mod types;
+pub mod usage;
 pub mod workspace;
 
 use std::sync::Arc;
@@ -33,6 +34,7 @@ pub use error::{Error, RpcError};
 pub use rpc::{RpcSession, Subscription};
 pub use state::{ShellState, ThreadState, sort_settled_threads};
 pub use types::*;
+pub use usage::{UsageReport, UsageSummary, UsageWindow};
 pub use workspace::*;
 
 #[derive(Debug, Clone, PartialEq)]

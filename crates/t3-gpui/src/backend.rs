@@ -38,6 +38,10 @@ pub enum Command {
     OpenThread(String),
     CloseThread,
     LoadArchived(String),
+    LoadUsage {
+        request_id: u64,
+        window: t3_client::UsageWindow,
+    },
     ThreadAction {
         thread_id: String,
         action: t3_client::ThreadAction,
@@ -122,6 +126,10 @@ pub enum Event {
     Archived {
         request_id: String,
         snapshot: Option<t3_client::ShellSnapshot>,
+    },
+    Usage {
+        request_id: u64,
+        result: Result<t3_client::UsageSummary, String>,
     },
     ThreadActionFinished {
         thread_id: String,
@@ -442,6 +450,9 @@ async fn wait_offline(
                     events.emit(Event::Archived { request_id, snapshot: None });
                     events.error("Reconnect before browsing archived threads.");
                 }
+                Some(Command::LoadUsage { request_id, .. }) => {
+                    events.emit(Event::Usage { request_id, result: Err("Reconnect to see usage.".into()) });
+                }
                 Some(Command::SendMessage { thread, text, attachments }) => {
                     events.error("Cannot send while disconnected. Your draft has been kept.");
                     events.emit(Event::SendFinished { thread_id: thread.id, text, success: false, attachment_ids: attachments.iter().map(|a| a.id.clone()).collect() });
@@ -602,6 +613,14 @@ async fn run_session(
                             }
                         };
                         events.emit(Event::Archived { request_id, snapshot });
+                    });
+                }
+                Some(Command::LoadUsage { request_id, window }) => {
+                    let connection = connection.clone();
+                    let events = events.clone();
+                    operations.spawn(async move {
+                        let result = connection.usage_summary(&window).await.map_err(|error| describe(&error));
+                        events.emit(Event::Usage { request_id, result });
                     });
                 }
                 Some(Command::ThreadAction { thread_id, action }) => {
