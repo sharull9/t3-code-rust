@@ -10,12 +10,17 @@ use gpui_kit::component::Disableable as _;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{InputEvent, Textarea, TextareaState};
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
-use gpui_kit::component::{ActiveTheme as _, Icon, Sizable as _, Size, h_flex, v_flex};
+use gpui_kit::component::popover::Popover;
+use gpui_kit::component::{
+    ActiveTheme as _, Icon, Sizable as _, Size, StyledExt as _, h_flex, v_flex,
+};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use t3_client::{Session, ThreadShell, ThreadStreamItem};
 
 use crate::attachments::{AttachmentPanel, AttachmentPanelEvent};
+use crate::drafts::DraftThread;
+use crate::model_picker::{ModelPicker, ModelPickerEvent};
 use crate::transcript::{Transcript, TranscriptEvent};
 use crate::ui::{self, CONTENT_WIDTH};
 use crate::user_input::{UserInputEvent, UserInputPanel};
@@ -28,6 +33,10 @@ pub enum ThreadViewEvent {
     Stop,
     OpenAttachment(t3_client::attachments::UploadedAttachment),
     Update(t3_client::ThreadAction),
+    /// A draft thread's model or modes changed; nothing is sent to the server.
+    DraftSettingsChanged(DraftThread),
+    /// Continue this thread in a new one on another provider's model.
+    ContinueInNewThread(serde_json::Value),
 }
 
 pub struct ThreadView {
@@ -45,6 +54,10 @@ pub struct ThreadView {
     user_input: Entity<UserInputPanel>,
     attachments: Entity<AttachmentPanel>,
     thread_loaded: bool,
+    model_picker: Entity<ModelPicker>,
+    /// Set while this view composes a thread that does not exist on the
+    /// server yet, with the project title for its heading.
+    draft: Option<(DraftThread, SharedString)>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -115,6 +128,24 @@ impl ThreadView {
             cx.emit(ThreadViewEvent::Attachment(event.clone()))
         }));
         subscriptions.push(cx.observe(&attachments, |_, _, cx| cx.notify()));
+        let model_picker = cx.new(|cx| ModelPicker::new(window, cx));
+        subscriptions.push(cx.subscribe_in(
+            &model_picker,
+            window,
+            |this, _, event: &ModelPickerEvent, window, cx| {
+                match event {
+                    ModelPickerEvent::Select(model) => {
+                        this.update_setting(t3_client::ThreadAction::Model(model.clone()), cx)
+                    }
+                    ModelPickerEvent::ContinueInNewThread(model) => {
+                        cx.emit(ThreadViewEvent::ContinueInNewThread(model.clone()))
+                    }
+                    ModelPickerEvent::Dismiss => {}
+                }
+                this.focus_composer(window, cx);
+                cx.notify();
+            },
+        ));
         composer.update(cx, |state, cx| state.focus(window, cx));
 
         Self {
@@ -130,8 +161,59 @@ impl ThreadView {
             user_input,
             attachments,
             thread_loaded: false,
+            model_picker,
+            draft: None,
             _subscriptions: subscriptions,
         }
+    }
+
+    /// A view for a draft thread: the composer under a heading, sendable as
+    /// soon as the server is connected. The first send creates the thread.
+    pub fn new_draft(
+        draft: DraftThread,
+        project_title: SharedString,
+        user_input: Entity<UserInputPanel>,
+        attachments: Entity<AttachmentPanel>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let mut view =
+            Self::new_with_attachments(draft.id.clone(), user_input, attachments, window, cx);
+        view.draft = Some((draft, project_title));
+        view.thread_loaded = true;
+        view.attachments.update(cx, |panel, cx| panel.set_connected(view.connected, cx));
+        view.sync_model_picker(cx);
+        view
+    }
+
+    pub fn is_draft(&self) -> bool {
+        self.draft.is_some()
+    }
+
+    pub fn draft_thread(&self) -> Option<&DraftThread> {
+        self.draft.as_ref().map(|(draft, _)| draft)
+    }
+
+    /// The model the composer shows: the draft's, else the thread's.
+    fn selection(&self) -> Option<serde_json::Value> {
+        match &self.draft {
+            Some((draft, _)) => Some(draft.model_selection.clone()),
+            None => self.shell.as_ref().and_then(|t| t.model_selection.clone()),
+        }
+    }
+
+    /// A thread that has run a turn is bound to its provider instance.
+    fn is_started(&self, cx: &App) -> bool {
+        self.draft.is_none()
+            && (self.shell.as_ref().is_some_and(ThreadShell::is_started)
+                || self.transcript.read(cx).has_messages())
+    }
+
+    fn sync_model_picker(&mut self, cx: &mut Context<Self>) {
+        let (providers, selection, started) =
+            (self.providers.clone(), self.selection(), self.is_started(cx));
+        self.model_picker
+            .update(cx, |picker, cx| picker.set_context(providers, selection, started, cx));
     }
 
     pub fn thread_id(&self) -> &str {
@@ -182,6 +264,7 @@ impl ThreadView {
         cx: &mut Context<Self>,
     ) {
         self.providers = providers;
+        self.sync_model_picker(cx);
         cx.notify();
     }
 
@@ -195,6 +278,7 @@ impl ThreadView {
             cx.notify();
         }
         self.shell = shell;
+        self.sync_model_picker(cx);
         if self.pending_update.as_ref().is_some_and(|action| self.shell_has_action(action)) {
             self.pending_update = None;
             cx.notify();
@@ -219,6 +303,18 @@ impl ThreadView {
     }
 
     fn update_setting(&mut self, action: t3_client::ThreadAction, cx: &mut Context<Self>) {
+        if let Some((draft, _)) = &mut self.draft {
+            match action {
+                t3_client::ThreadAction::Model(model) => draft.model_selection = model,
+                t3_client::ThreadAction::RuntimeMode(mode) => draft.runtime_mode = mode,
+                t3_client::ThreadAction::InteractionMode(mode) => draft.interaction_mode = mode,
+                _ => return,
+            }
+            cx.emit(ThreadViewEvent::DraftSettingsChanged(draft.clone()));
+            self.sync_model_picker(cx);
+            cx.notify();
+            return;
+        }
         self.pending_update = Some(action.clone());
         cx.emit(ThreadViewEvent::Update(action));
         cx.notify();
@@ -253,6 +349,10 @@ impl ThreadView {
 
     /// A reconnect resubscribes and resends the snapshot; drop the stale copy.
     pub fn reset(&mut self, cx: &mut Context<Self>) {
+        // A draft has no server state to resubscribe to.
+        if self.draft.is_some() {
+            return;
+        }
         self.thread_loaded = false;
         self.user_input.update(cx, |panel, cx| panel.suspend(cx));
         self.pending_update = None;
@@ -279,6 +379,9 @@ impl ThreadView {
         if self.approvals != approvals || working != self.is_working(cx) {
             self.approvals = approvals;
             cx.notify();
+        }
+        if !self.model_picker.read(cx).is_open() {
+            self.sync_model_picker(cx);
         }
     }
 
@@ -310,7 +413,7 @@ impl ThreadView {
 }
 
 impl Render for ThreadView {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
         let working = self.is_working(cx);
         let has_user_input = self.thread_loaded && self.user_input.read(cx).has_requests();
@@ -324,52 +427,87 @@ impl Render for ThreadView {
         let session_error = session.and_then(|s| s.last_error.clone());
         let approvals = &self.approvals;
         let provider = ui::provider_label(session.and_then(|s| s.provider_name.as_deref()));
-        let model_label = shell
-            .and_then(|t| t.model_selection.as_ref())
-            .and_then(|m| m.get("model"))
-            .and_then(|m| m.as_str())
-            .unwrap_or(&provider)
-            .to_owned();
-        let selection = shell.and_then(|t| t.model_selection.clone());
-        let providers = self.providers.clone();
-        let view = cx.entity().downgrade();
+        let selection = self.selection();
+        let model_id = selection.as_ref().and_then(|m| m["model"].as_str()).unwrap_or(&provider);
+        // The server's display name ("Claude Opus 5.5"), not its id ("claude-opus-5-5").
+        let selected_provider = selection.as_ref().and_then(|selection| {
+            self.providers.iter().find(|p| selection["instanceId"] == p.instance_id)
+        });
+        let model_label = selected_provider
+            .and_then(|provider| provider.models.iter().find(|model| model.id == model_id))
+            .map_or_else(|| model_id.to_owned(), |model| model.label.clone());
         let settings_disabled = !self.connected
             || !self.thread_loaded
             || working
             || self.sending
             || self.pending_update.is_some()
-            || shell.is_none();
-        let model_picker = Button::new("model-picker").ghost().small()
-            .label(model_label.clone()).tooltip(model_label).max_w(px(220.))
-            .icon(Icon::new(IconName::Bot).xsmall())
-            .disabled(settings_disabled).dropdown_menu(move |mut menu, _, _| {
-                for provider in &providers {
-                    if !provider.enabled || !provider.installed || provider.availability.as_deref() == Some("unavailable") { continue; }
-                    menu = menu.label(provider.display_name.clone().unwrap_or_else(|| ui::provider_label(Some(&provider.driver))));
-                    for model in &provider.models {
-                        let selected = selection.as_ref().is_some_and(|s| s["instanceId"] == provider.instance_id && s["model"] == model.id);
-                        let action = t3_client::ThreadAction::Model(serde_json::json!({ "instanceId": provider.instance_id, "model": model.id }));
-                        let view = view.clone();
-                        menu = menu.item(PopupMenuItem::new(model.label.clone()).checked(selected)
-                            .disabled(provider.requires_new_thread_for_model_change && !selected)
-                            .on_click(move |_, _, cx| { let _ = view.update(cx, |view, cx| view.update_setting(action.clone(), cx)); }));
+            || (shell.is_none() && self.draft.is_none());
+        // Provider mark first, then the model, like T3's composer chip.
+        let model_mark = match selected_provider {
+            Some(provider) => crate::model_picker::provider_mark(
+                &provider.instance_id,
+                &provider.driver,
+                &crate::model_picker::provider_name(provider),
+                px(14.),
+            )
+            .into_any_element(),
+            None => Icon::new(IconName::Bot).xsmall().into_any_element(),
+        };
+        let model_button = Button::new("model-picker")
+            .ghost()
+            .small()
+            .tooltip(model_label.clone())
+            .max_w(px(240.))
+            .disabled(settings_disabled)
+            .child(
+                h_flex()
+                    .min_w_0()
+                    .gap_1p5()
+                    .items_center()
+                    .child(model_mark)
+                    .child(div().min_w_0().truncate().child(model_label))
+                    .child(Icon::new(IconName::ChevronDown).xsmall()),
+            );
+        let picker = self.model_picker.clone();
+        let model_picker = Popover::new("model-picker-popover")
+            .anchor(Anchor::BottomLeft)
+            .p_0()
+            .overflow_hidden()
+            .open(self.model_picker.read(cx).is_open())
+            .on_open_change(move |open, window, cx| {
+                picker.update(cx, |picker, cx| {
+                    if *open && !settings_disabled {
+                        picker.open(window, cx);
+                    } else {
+                        picker.close(cx);
                     }
-                }
-                if providers.is_empty() { menu = menu.label("Models unavailable. Reconnect to retry."); }
-                menu
-            });
-        let (runtime_label, runtime_icon) =
-            ui::runtime_mode(shell.map_or("", |t| t.runtime_mode.as_str()));
-        let (mode_label, mode_icon) =
-            ui::interaction_mode(shell.map_or("", |t| t.interaction_mode.as_str()));
+                });
+            })
+            .trigger(model_button)
+            .child(self.model_picker.clone());
+        let (runtime_mode, interaction_mode) = match &self.draft {
+            Some((draft, _)) => (draft.runtime_mode.clone(), draft.interaction_mode.clone()),
+            None => (
+                shell.map_or_else(String::new, |t| t.runtime_mode.clone()),
+                shell.map_or_else(String::new, |t| t.interaction_mode.clone()),
+            ),
+        };
+        let (runtime_label, runtime_icon) = ui::runtime_mode(&runtime_mode);
+        let (mode_label, mode_icon) = ui::interaction_mode(&interaction_mode);
 
         // `Transcript` is embedded cached and styled to fill the remaining
         // column; it repaints only when it notifies itself (new stream
         // items, scrolling), never because this view redraws for an
         // unrelated reason such as the composer's loader animation below
         // (see `transcript.rs`).
-        let transcript =
-            self.transcript.clone().cached(StyleRefinement::default().flex_1().min_h_0());
+        let transcript = match &self.draft {
+            Some((_, project)) => draft_hero(project, cx).into_any_element(),
+            None => self
+                .transcript
+                .clone()
+                .cached(StyleRefinement::default().flex_1().min_h_0())
+                .into_any_element(),
+        };
 
         let action = Button::new(if working { "stop" } else { "send" })
             .ghost()
@@ -426,7 +564,7 @@ impl Render for ThreadView {
                 "runtime-picker",
                 runtime_icon,
                 runtime_label,
-                shell.map_or("", |t| t.runtime_mode.as_str()),
+                &runtime_mode,
                 true,
                 settings_disabled,
                 cx,
@@ -436,7 +574,7 @@ impl Render for ThreadView {
                 "interaction-picker",
                 mode_icon,
                 mode_label,
-                shell.map_or("", |t| t.interaction_mode.as_str()),
+                &interaction_mode,
                 false,
                 settings_disabled,
                 cx,
@@ -450,12 +588,13 @@ impl Render for ThreadView {
             })
             .child(action);
 
+        let composer_focused = self.composer.read(cx).focus_handle(cx).is_focused(window);
         let composer = v_flex()
             .w_full()
             .max_w(CONTENT_WIDTH)
             .rounded_xl()
             .border_1()
-            .border_color(theme.border)
+            .border_color(if composer_focused { theme.primary.opacity(0.45) } else { theme.border })
             .bg(theme.secondary)
             .when(has_attachments, |composer| {
                 composer.child(div().px_3().pt_2().child(self.attachments.clone()))
@@ -488,11 +627,19 @@ impl Render for ThreadView {
             .px_3()
             .text_xs()
             .text_color(theme.muted_foreground)
-            .child(Icon::new(IconName::FolderClosed).xsmall())
-            .child(if shell.and_then(|t| t.worktree_path.as_ref()).is_some() {
-                "Worktree"
-            } else {
-                "Local checkout"
+            .when(self.draft.is_some(), |footer| {
+                footer
+                    .child(Icon::new(IconName::Pencil).xsmall())
+                    .child("Draft · the thread is created when you send")
+            })
+            .when(self.draft.is_none(), |footer| {
+                footer.child(Icon::new(IconName::FolderClosed).xsmall()).child(
+                    if shell.and_then(|t| t.worktree_path.as_ref()).is_some() {
+                        "Worktree"
+                    } else {
+                        "Local checkout"
+                    },
+                )
             })
             .child(div().flex_1())
             .children(branch.map(|branch| {
@@ -571,6 +718,31 @@ impl Render for ThreadView {
                 .child(footer),
         )
     }
+}
+
+/// The empty state of a draft thread, in place of the transcript.
+fn draft_hero(project: &SharedString, cx: &App) -> Div {
+    let theme = cx.theme();
+    v_flex()
+        .flex_1()
+        .min_h_0()
+        .items_center()
+        .justify_center()
+        .gap_3()
+        .px_6()
+        .child(
+            div()
+                .text_2xl()
+                .font_semibold()
+                .text_color(theme.foreground)
+                .child(format!("What should we build in {project}?")),
+        )
+        .child(
+            div()
+                .text_sm()
+                .text_color(theme.muted_foreground)
+                .child("Pick a model below and describe the task. Nothing is created until you send."),
+        )
 }
 
 impl ThreadView {

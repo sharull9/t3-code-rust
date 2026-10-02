@@ -20,11 +20,12 @@ use std::time::{Duration, Instant};
 
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::clipboard::Clipboard;
 use gpui_kit::component::message_scroller::{MessageScroller, MessageScrollerState};
 use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::component::text::TextView;
 use gpui_kit::component::{
-    ActiveTheme as _, Icon, Sizable as _, Size, StyledExt as _, h_flex, v_flex,
+    ActiveTheme as _, Sizable as _, Size, StyledExt as _, h_flex, v_flex,
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
@@ -135,6 +136,11 @@ impl Transcript {
     }
 
     /// A reconnect resubscribes and resends the snapshot; drop the stale copy.
+    /// Whether the loaded thread has any messages yet.
+    pub fn has_messages(&self) -> bool {
+        self.state.thread.as_ref().is_some_and(|thread| !thread.messages.is_empty())
+    }
+
     pub fn reset(&mut self, cx: &mut Context<Self>) {
         self.state = ThreadState::default();
         self.rows = Rc::default();
@@ -326,6 +332,7 @@ fn render_message(message: &MessageRow, entity: &Entity<Transcript>, cx: &App) -
 
     match message.role {
         MessageRole::User => h_flex()
+            .group(MESSAGE_GROUP)
             .justify_end()
             .child(
                 v_flex()
@@ -346,6 +353,7 @@ fn render_message(message: &MessageRow, entity: &Entity<Transcript>, cx: &App) -
             )
             .into_any_element(),
         MessageRole::Assistant => v_flex()
+            .group(MESSAGE_GROUP)
             .gap_1()
             .text_sm()
             .child(TextView::markdown(id, message.text.clone()))
@@ -353,6 +361,7 @@ fn render_message(message: &MessageRow, entity: &Entity<Transcript>, cx: &App) -
             .child(h_flex().justify_end().child(copy))
             .into_any_element(),
         MessageRole::System | MessageRole::Unknown | MessageRole::Reasoning => v_flex()
+            .group(MESSAGE_GROUP)
             .gap_1()
             .child(
                 div().text_xs().text_color(cx.theme().muted_foreground).child(message.text.clone()),
@@ -367,15 +376,20 @@ fn copy_button(message: &MessageRow) -> impl IntoElement {
     copy_text_button(&message.id, message.text.to_string())
 }
 
+/// Copies on click and briefly shows a check. Hidden until the pointer is
+/// over its row (the `MESSAGE_GROUP` hover group), so a long transcript
+/// isn't striped with copy icons.
 fn copy_text_button(message_id: &str, text: String) -> impl IntoElement {
-    Button::new(format!("copy-message-{message_id}"))
-        .ghost()
-        .small()
-        .icon(Icon::new(IconName::Copy).xsmall())
-        .accessibility_label("Copy message")
-        .tooltip("Copy message")
-        .on_click(move |_, _, cx| cx.write_to_clipboard(ClipboardItem::new_string(text.clone())))
+    div().opacity(0.).group_hover(MESSAGE_GROUP, |style| style.opacity(1.)).child(
+        Clipboard::new(SharedString::from(format!("copy-message-{message_id}")))
+            .value(text)
+            .tooltip("Copy message")
+            .small(),
+    )
 }
+
+/// Hover group for a transcript row, revealing its copy control.
+const MESSAGE_GROUP: &str = "transcript-message";
 
 fn attachment_chips(
     attachments: &[UploadedAttachment],
@@ -459,12 +473,15 @@ fn render_thought(
         .when(expanded, |column| {
             column.child(
                 v_flex()
+                    .group(MESSAGE_GROUP)
                     .gap_1()
                     .child(
-                        div()
-                            .text_sm()
-                            .text_color(theme.muted_foreground)
-                            .child(thought.text.clone()),
+                        div().text_sm().text_color(theme.muted_foreground).child(
+                            TextView::markdown(
+                                SharedString::from(format!("thought-{}", thought.id)),
+                                tidy_reasoning(&thought.text),
+                            ),
+                        ),
                     )
                     .child(
                         h_flex()
@@ -473,6 +490,29 @@ fn render_thought(
                     ),
             )
         })
+}
+
+/// Reasoning streams arrive with padding: leading/trailing whitespace and
+/// runs of blank lines between summary sections. Collapse them so an
+/// expanded thought reads as tight paragraphs instead of large gaps.
+fn tidy_reasoning(text: &str) -> SharedString {
+    let mut tidy = String::with_capacity(text.len());
+    let mut blank_run = 0;
+    for line in text.trim().lines() {
+        let line = line.trim_end();
+        if line.is_empty() {
+            blank_run += 1;
+            if blank_run > 1 {
+                continue;
+            }
+        } else {
+            blank_run = 0;
+        }
+        tidy.push_str(line);
+        tidy.push('\n');
+    }
+    tidy.truncate(tidy.trim_end().len());
+    tidy.into()
 }
 
 /// A collapsed activity run between messages. Tool calls and context updates
@@ -560,7 +600,7 @@ fn render_activity_group(
                                 .rounded_md()
                                 .bg(theme.secondary)
                                 .text_xs()
-                                .font_family("monospace")
+                                .font_family(theme.mono_font_family.clone())
                                 .child(payload),
                         ),
                     )
@@ -575,12 +615,14 @@ fn render_working(working_since: Option<Instant>, cx: &App) -> impl IntoElement 
         Some(started) => format!("Working for {}", format_elapsed(started.elapsed())),
         None => "Working".to_owned(),
     };
+    let theme = cx.theme();
     h_flex()
         .gap_2()
         .items_center()
         .text_sm()
         .font_medium()
-        .text_color(cx.theme().muted_foreground)
+        .text_color(theme.muted_foreground)
+        .child(div().size_1p5().rounded_full().bg(theme.primary))
         .child(label)
 }
 
@@ -884,6 +926,12 @@ mod tests {
             turn_id: None,
             created_at: created_at.to_owned(),
         }
+    }
+
+    #[test]
+    fn reasoning_text_drops_padding_and_repeated_blank_lines() {
+        let text = "\n\n**Planning**  \n\n\n\nRead the file.\n\n\n";
+        assert_eq!(tidy_reasoning(text).as_ref(), "**Planning**\n\nRead the file.");
     }
 
     #[test]

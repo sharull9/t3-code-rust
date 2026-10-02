@@ -177,6 +177,12 @@ impl ThreadShell {
         self.settled_override.as_deref() == Some("settled")
     }
 
+    /// Whether a turn has ever been requested. A started thread is bound to
+    /// its provider instance; changing provider means a new thread.
+    pub fn is_started(&self) -> bool {
+        self.latest_turn.is_some() || self.latest_user_message_at.is_some()
+    }
+
     /// Port of `resolveSettledThreadTimestamp` in
     /// `packages/client-runtime/src/state/threadSort.ts`: `settledAt` when
     /// stamped, otherwise the latest of the user message / turn timestamps,

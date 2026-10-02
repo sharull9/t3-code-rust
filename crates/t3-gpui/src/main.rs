@@ -4,6 +4,8 @@ mod backend;
 mod directory_picker;
 mod drafts;
 mod managed_server;
+mod model_picker;
+mod prefs;
 mod project_picker;
 mod settings;
 mod sidebar;
@@ -26,7 +28,10 @@ fn main() {
             app::init(cx);
             project_picker::init(cx);
             user_input::init(cx);
-            ui::apply_theme(cx);
+            model_picker::init(cx);
+            let prefs = prefs::Prefs::load();
+            ui::apply_theme(prefs.light_theme, cx);
+            cx.set_global(prefs);
 
             let bounds = Bounds::centered(None, size(px(1400.), px(900.)), cx);
             let options = WindowOptions {

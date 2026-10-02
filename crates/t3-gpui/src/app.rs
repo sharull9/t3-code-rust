@@ -7,8 +7,9 @@ use gpui_kit::component::Disableable as _;
 use gpui_kit::component::alert::Alert;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
+use gpui_kit::component::kbd::Kbd;
 use gpui_kit::component::{
-    ActiveTheme as _, Sizable as _, StyledExt as _, TitleBar, h_flex, v_flex,
+    ActiveTheme as _, Sizable as _, Size, StyledExt as _, TitleBar, h_flex, v_flex,
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
@@ -19,7 +20,7 @@ use t3_client::{ProjectShell, ShellState, ThreadShell};
 use crate::attachments::{AttachmentPanel, AttachmentPanelEvent};
 use crate::backend::{Backend, Command, Event, Status};
 use crate::directory_picker::{DirectoryPicker, DirectoryPickerEvent};
-use crate::drafts::DraftStore;
+use crate::drafts::{DraftStore, DraftThread};
 use crate::project_picker::{ProjectPicker, ProjectPickerEvent};
 use crate::settings::{SettingsEvent, SettingsPanel};
 use crate::sidebar::{Sidebar, SidebarEvent};
@@ -66,6 +67,9 @@ pub struct T3App {
     pairing_pending: bool,
     providers: Vec<t3_client::ServerProvider>,
     drafts: HashMap<String, String>,
+    /// New threads being composed. None exists on the server until its first
+    /// message is sent; the composer text lives in `drafts` by the same ID.
+    draft_threads: Vec<DraftThread>,
     draft_store: DraftStore,
     active_server: Option<String>,
     active_environment: String,
@@ -124,13 +128,7 @@ impl T3App {
                             request: t3_client::WorkspaceRequest::BrowseDirectories {
                                 partial_path: partial_path.clone(),
                                 cwd: this
-                                    .open_thread_shell(cx)
-                                    .and_then(|thread| {
-                                        this.shell
-                                            .projects
-                                            .iter()
-                                            .find(|project| project.id == thread.project_id)
-                                    })
+                                    .current_project(cx)
                                     .map(|project| project.workspace_root.clone())
                                     .filter(|path| !path.trim().is_empty()),
                             },
@@ -155,15 +153,9 @@ impl T3App {
                         this.pairing_link.update(cx, |input, cx| input.focus(window, cx));
                     }
                     SettingsEvent::Theme(light) => {
-                        if *light {
-                            gpui_kit::component::Theme::change(
-                                gpui_kit::component::ThemeMode::Light,
-                                Some(window),
-                                cx,
-                            );
-                        } else {
-                            ui::apply_theme(cx);
-                        }
+                        let light = *light;
+                        ui::apply_theme(light, cx);
+                        crate::prefs::Prefs::update(cx, |prefs| prefs.light_theme = light);
                     }
                     SettingsEvent::ChooseManagedServer => {
                         let paths = cx.prompt_for_paths(PathPromptOptions {
@@ -211,6 +203,10 @@ impl T3App {
                     SidebarEvent::OpenThread(thread_id) => {
                         this.open_thread(thread_id.clone(), window, cx)
                     }
+                    SidebarEvent::OpenDraft(draft_id) => {
+                        this.open_draft(draft_id.clone(), window, cx)
+                    }
+                    SidebarEvent::DiscardDraft(draft_id) => this.discard_draft(draft_id, cx),
                     SidebarEvent::SwitchServer => {
                         this.switching_server = true;
                         this.pairing_link.update(cx, |state, cx| state.focus(window, cx));
@@ -242,7 +238,7 @@ impl T3App {
                 window,
                 |this, _, event: &ProjectPickerEvent, window, cx| match event {
                     ProjectPickerEvent::Select(project) => {
-                        this.create_thread_in(project.clone(), window, cx)
+                        this.new_draft_in(project.id.clone(), None, None, window, cx)
                     }
                     ProjectPickerEvent::Cancel => {}
                 },
@@ -264,6 +260,7 @@ impl T3App {
             pairing_pending: false,
             providers: Vec::new(),
             drafts: HashMap::new(),
+            draft_threads: Vec::new(),
             draft_store: DraftStore::default(),
             active_server: None,
             active_environment: "default".into(),
@@ -355,6 +352,7 @@ impl T3App {
                     self.thread = None;
                     self._thread_subscription = None;
                     self.drafts.clear();
+                    self.draft_threads.clear();
                     self.question_panels.clear();
                     self.sending.clear();
                     self.providers.clear();
@@ -403,11 +401,12 @@ impl T3App {
                         }
                         self.active_server = Some(server.clone());
                         self.active_environment = environment;
-                        self.drafts = self
-                            .draft_store
-                            .environment(&server, &self.active_environment)
-                            .map(|env| env.thread_text.clone())
-                            .unwrap_or_default();
+                        let saved = self.draft_store.environment(&server, &self.active_environment);
+                        self.drafts =
+                            saved.map(|env| env.thread_text.clone()).unwrap_or_default();
+                        self.draft_threads =
+                            saved.map(|env| env.new_threads.clone()).unwrap_or_default();
+                        self.sync_sidebar_drafts(cx);
                     }
                 }
                 for panel in self.attachment_panels.values() {
@@ -436,9 +435,11 @@ impl T3App {
             Event::Shell(item) => {
                 self.shell.apply(item);
                 if self.thread.as_ref().is_some_and(|thread| {
-                    self.shell
-                        .thread(thread.read(cx).thread_id())
-                        .is_none_or(|thread| thread.archived_at.is_some())
+                    !thread.read(cx).is_draft()
+                        && self
+                            .shell
+                            .thread(thread.read(cx).thread_id())
+                            .is_none_or(|thread| thread.archived_at.is_some())
                 }) && self.shell.synchronized
                 {
                     if let Some(thread) = &self.thread {
@@ -463,6 +464,14 @@ impl T3App {
                     let thread_id = self.pending_new_thread_id.take().unwrap();
                     self.open_thread(thread_id, window, cx);
                 }
+                let before = self.draft_threads.len();
+                let shell = &self.shell;
+                self.draft_threads.retain(|draft| shell.thread(&draft.id).is_none());
+                if before != self.draft_threads.len() {
+                    self.capture_current_drafts(cx);
+                    self.schedule_draft_save(cx);
+                }
+                self.sync_sidebar_drafts(cx);
             }
             Event::Thread { thread_id, item } => {
                 if let Some(thread) = &self.thread {
@@ -486,6 +495,8 @@ impl T3App {
                 self.providers = config.providers;
                 self.settings
                     .update(cx, |panel, cx| panel.set_providers(self.providers.clone(), cx));
+                self.sidebar
+                    .update(cx, |sidebar, cx| sidebar.set_providers(self.providers.clone(), cx));
                 if let Some(thread) = &self.thread {
                     thread.update(cx, |view, cx| view.set_providers(self.providers.clone(), cx));
                 }
@@ -525,23 +536,24 @@ impl T3App {
                 }
                 self.capture_current_drafts(cx);
                 self.schedule_draft_save(cx);
+                self.sync_sidebar_drafts(cx);
             }
         }
         cx.notify();
     }
 
-    /// Prompts for a folder with the native picker and dispatches
-    /// `project.create` for it. The folder's name is the project title, same
+    /// Opens the server-side folder picker and dispatches `project.create`
+    /// for the chosen folder. The folder's name is the project title, same
     /// default as the web app's "Add project" flow.
+    ///
+    /// Starts in the folder that holds the open thread's project, so its
+    /// siblings are listed: a browse path without a trailing separator is a
+    /// name filter and would show only the project already added.
     fn add_project(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if matches!(self.status, Status::Connected(_)) {
             let initial = self
-                .open_thread_shell(cx)
-                .and_then(|thread| {
-                    self.shell.projects.iter().find(|project| project.id == thread.project_id)
-                })
-                .map(|project| project.workspace_root.clone())
-                .filter(|path| !path.trim().is_empty())
+                .current_project(cx)
+                .and_then(|project| containing_folder(&project.workspace_root))
                 .unwrap_or_else(|| "~".into());
             self.directory_picker.update(cx, |picker, cx| {
                 picker.open(&initial, window, cx);
@@ -549,16 +561,33 @@ impl T3App {
         }
     }
 
-    /// Dispatches `thread.create` for `project`, defaults matching
-    /// `ChatView.tsx`'s new-thread flow (see `t3_client::Connection::create_thread`).
-    /// The thread opens once its shell entry streams back in.
-    fn create_thread_in(
+    /// Starts composing a new thread in `project_id`. Nothing reaches the
+    /// server until the first message is sent (see `Command::StartThread`);
+    /// until then the draft lives in `draft_threads` and the sidebar.
+    ///
+    /// Model and modes default like `ChatView.tsx`'s new-thread flow: the
+    /// project's default model, else the open thread's, else the first usable
+    /// provider's default model.
+    fn new_draft_in(
         &mut self,
-        project: ProjectShell,
-        _window: &mut Window,
+        project_id: String,
+        model: Option<serde_json::Value>,
+        text: Option<String>,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let thread_id = t3_client::new_id();
+        // Reuse an untouched draft rather than piling up empty ones.
+        if model.is_none() && text.is_none() {
+            let untouched = self.draft_threads.iter().find(|draft| {
+                draft.project_id == project_id
+                    && !self.sending.contains(&draft.id)
+                    && self.drafts.get(&draft.id).is_none_or(|text| text.trim().is_empty())
+            });
+            if let Some(draft) = untouched {
+                let draft_id = draft.id.clone();
+                return self.open_draft(draft_id, window, cx);
+            }
+        }
         let current = self.open_thread_shell(cx);
         let runtime_mode = current
             .map(|thread| thread.runtime_mode.clone())
@@ -566,17 +595,18 @@ impl T3App {
         let interaction_mode = current
             .map(|thread| thread.interaction_mode.clone())
             .unwrap_or_else(|| "default".into());
-        let model_selection = project
-            .default_model_selection
-            .or_else(|| {
-                self.open_thread_shell(cx).and_then(|thread| thread.model_selection.clone())
-            })
+        let project_default = self
+            .shell
+            .projects
+            .iter()
+            .find(|project| project.id == project_id)
+            .and_then(|project| project.default_model_selection.clone());
+        let model_selection = model
+            .or(project_default)
+            .or_else(|| current.and_then(|thread| thread.model_selection.clone()))
             .or_else(|| {
                 self.providers.iter().find_map(|provider| {
-                    if !provider.enabled
-                        || !provider.installed
-                        || provider.availability.as_deref() == Some("unavailable")
-                    {
+                    if !crate::model_picker::usable(provider) {
                         return None;
                     }
                     let model = provider
@@ -588,16 +618,137 @@ impl T3App {
                 })
             })
             .unwrap_or_else(fallback_model_selection);
-        self.pending_new_thread_id = Some(thread_id.clone());
-        self.backend.send(Command::CreateThread {
-            id: thread_id,
-            project_id: project.id,
-            title: "New thread".into(),
+        let draft = DraftThread {
+            id: t3_client::new_id(),
+            project_id,
             model_selection,
             runtime_mode,
             interaction_mode,
+        };
+        if let Some(text) = text {
+            self.drafts.insert(draft.id.clone(), text);
+        }
+        let draft_id = draft.id.clone();
+        self.draft_threads.push(draft);
+        self.open_draft(draft_id, window, cx);
+    }
+
+    /// Shows a draft thread in place of the open thread.
+    fn open_draft(&mut self, draft_id: String, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(draft) = self.draft_threads.iter().find(|draft| draft.id == draft_id).cloned()
+        else {
+            return;
+        };
+        if let Some(thread) = &self.thread
+            && thread.read(cx).thread_id() == draft_id
+        {
+            thread.update(cx, |view, cx| view.focus_composer(window, cx));
+            return;
+        }
+        self.capture_current_drafts(cx);
+        if self.thread.as_ref().is_some_and(|thread| !thread.read(cx).is_draft()) {
+            self.backend.send(Command::CloseThread);
+        }
+        let connected = matches!(self.status, Status::Connected(_));
+        let project_title = self
+            .shell
+            .projects
+            .iter()
+            .find(|project| project.id == draft.project_id)
+            .map_or_else(|| SharedString::from("this project"), |project| project.title.clone().into());
+        let questions = cx.new(UserInputPanel::new);
+        let attachments = self
+            .attachment_panels
+            .entry(draft_id.clone())
+            .or_insert_with(|| cx.new(AttachmentPanel::new))
+            .clone();
+        let view = cx.new(|cx| {
+            let mut view =
+                ThreadView::new_draft(draft, project_title, questions, attachments, window, cx);
+            view.set_connected(connected, cx);
+            view.set_providers(self.providers.clone(), cx);
+            view.restore_draft(
+                self.drafts.get(&draft_id).map_or("", String::as_str),
+                self.sending.contains(&draft_id),
+                window,
+                cx,
+            );
+            view
         });
+        self._thread_subscription = Some(cx.subscribe_in(&view, window, Self::on_thread_event));
+        self.thread = Some(view);
+        self.sidebar.update(cx, |sidebar, cx| sidebar.set_open_thread(Some(draft_id), cx));
+        self.after_switch(cx);
+    }
+
+    /// Drops a draft thread and its text; closes it if it is open.
+    fn discard_draft(&mut self, draft_id: &str, cx: &mut Context<Self>) {
+        if self.sending.contains(draft_id) {
+            return;
+        }
+        if self.thread.as_ref().is_some_and(|thread| thread.read(cx).thread_id() == draft_id) {
+            self.thread = None;
+            self._thread_subscription = None;
+            self.sidebar.update(cx, |sidebar, cx| sidebar.set_open_thread(None, cx));
+        }
+        self.draft_threads.retain(|draft| draft.id != draft_id);
+        self.drafts.remove(draft_id);
+        self.attachment_panels.remove(draft_id);
+        self.capture_current_drafts(cx);
+        self.schedule_draft_save(cx);
+        self.sync_sidebar_drafts(cx);
         cx.notify();
+    }
+
+    /// Housekeeping after the open thread or draft changed: forget drafts
+    /// left without text, persist, and refresh the sidebar and workspace.
+    fn after_switch(&mut self, cx: &mut Context<Self>) {
+        let open = self.thread.as_ref().map(|thread| thread.read(cx).thread_id().to_owned());
+        let (drafts, sending) = (&self.drafts, &self.sending);
+        self.draft_threads.retain(|draft| {
+            open.as_deref() == Some(draft.id.as_str())
+                || sending.contains(&draft.id)
+                || drafts.get(&draft.id).is_some_and(|text| !text.trim().is_empty())
+        });
+        self.capture_current_drafts(cx);
+        self.schedule_draft_save(cx);
+        self.sync_sidebar_drafts(cx);
+        if self.workspace_open {
+            self.sync_workspace(cx);
+        }
+        cx.notify();
+    }
+
+    /// Gives the sidebar the draft threads and which threads have unsent text.
+    fn sync_sidebar_drafts(&self, cx: &mut Context<Self>) {
+        let new_threads = self
+            .draft_threads
+            .iter()
+            .map(|draft| crate::sidebar::SidebarDraft {
+                id: draft.id.clone(),
+                project_id: draft.project_id.clone(),
+                text: self.drafts.get(&draft.id).cloned().unwrap_or_default(),
+            })
+            .collect();
+        let unsent = self
+            .drafts
+            .iter()
+            .filter(|(id, text)| {
+                !text.trim().is_empty() && !self.draft_threads.iter().any(|d| d.id == **id)
+            })
+            .map(|(id, _)| id.clone())
+            .collect();
+        self.sidebar.update(cx, |sidebar, cx| sidebar.set_drafts(new_threads, unsent, cx));
+    }
+
+    /// The project of the open thread or draft.
+    fn current_project(&self, cx: &App) -> Option<&ProjectShell> {
+        let view = self.thread.as_ref()?.read(cx);
+        let project_id = match view.draft_thread() {
+            Some(draft) => draft.project_id.clone(),
+            None => self.shell.thread(view.thread_id())?.project_id.clone(),
+        };
+        self.shell.projects.iter().find(|project| project.id == project_id)
     }
 
     /// Hands the open thread its shell entry: working state and modes.
@@ -609,7 +760,7 @@ impl T3App {
 
     fn open_thread(&mut self, thread_id: String, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(thread) = &self.thread {
-            if thread.read(cx).thread_id() == thread_id {
+            if thread.read(cx).thread_id() == thread_id && !thread.read(cx).is_draft() {
                 if !thread.read(cx).is_ready() && matches!(self.status, Status::Connected(_)) {
                     thread.update(cx, |view, cx| {
                         view.reset(cx);
@@ -623,7 +774,6 @@ impl T3App {
             }
         }
         self.capture_current_drafts(cx);
-        self.schedule_draft_save(cx);
         let connected = matches!(self.status, Status::Connected(_));
         let panel = self
             .question_panels
@@ -656,21 +806,19 @@ impl T3App {
             );
             view
         });
-        self._thread_subscription = Some(cx.subscribe(&view, Self::on_thread_event));
+        self._thread_subscription = Some(cx.subscribe_in(&view, window, Self::on_thread_event));
         self.thread = Some(view);
         self.sync_thread_shell(cx);
         self.sidebar.update(cx, |sidebar, cx| sidebar.set_open_thread(Some(thread_id.clone()), cx));
         self.backend.send(Command::OpenThread(thread_id));
-        if self.workspace_open {
-            self.sync_workspace(cx);
-        }
-        cx.notify();
+        self.after_switch(cx);
     }
 
     fn on_thread_event(
         &mut self,
-        view: Entity<ThreadView>,
+        view: &Entity<ThreadView>,
         event: &ThreadViewEvent,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let id = view.read(cx).thread_id().to_owned();
@@ -685,6 +833,15 @@ impl T3App {
                         drafts.thread_text.insert(id, text.clone());
                     }
                 }
+                self.schedule_draft_save(cx);
+                self.sync_sidebar_drafts(cx);
+                return;
+            }
+            ThreadViewEvent::DraftSettingsChanged(draft) => {
+                if let Some(entry) = self.draft_threads.iter_mut().find(|d| d.id == draft.id) {
+                    *entry = draft.clone();
+                }
+                self.capture_current_drafts(cx);
                 self.schedule_draft_save(cx);
                 return;
             }
@@ -733,6 +890,25 @@ impl T3App {
             }
             _ => {}
         }
+        if let Some(draft) = view.read(cx).draft_thread().cloned() {
+            match event {
+                ThreadViewEvent::Send(text, attachments) => {
+                    self.sending.insert(draft.id.clone());
+                    self.pending_new_thread_id = Some(draft.id.clone());
+                    self.backend.send(Command::StartThread {
+                        title: thread_title(text),
+                        draft,
+                        text: text.clone(),
+                        attachments: attachments.clone(),
+                    });
+                }
+                ThreadViewEvent::OpenAttachment(attachment) => {
+                    self.backend.send(Command::OpenAsset(attachment.clone()))
+                }
+                _ => {}
+            }
+            return;
+        }
         let Some(thread) = self.shell.thread(view.read(cx).thread_id()).cloned() else {
             self.error = Some("This thread is no longer available.".into());
             return cx.notify();
@@ -752,7 +928,18 @@ impl T3App {
             ThreadViewEvent::Update(action) => self
                 .backend
                 .send(Command::ThreadAction { thread_id: thread.id, action: action.clone() }),
+            ThreadViewEvent::ContinueInNewThread(model) => {
+                let text = continuation_prompt(&thread.id, &thread.title);
+                self.new_draft_in(
+                    thread.project_id.clone(),
+                    Some(model.clone()),
+                    Some(text),
+                    window,
+                    cx,
+                );
+            }
             ThreadViewEvent::DraftChanged(_)
+            | ThreadViewEvent::DraftSettingsChanged(_)
             | ThreadViewEvent::QuestionDraftsChanged(_)
             | ThreadViewEvent::Attachment(_) => {}
             ThreadViewEvent::Stop => {
@@ -791,6 +978,12 @@ impl T3App {
                 .filter(|(_, text)| !text.is_empty())
                 .map(|(id, text)| (id.clone(), text.clone()))
                 .collect();
+            drafts.new_threads = self
+                .draft_threads
+                .iter()
+                .filter(|draft| self.drafts.get(&draft.id).is_some_and(|t| !t.trim().is_empty()))
+                .cloned()
+                .collect();
             for (id, panel) in &self.question_panels {
                 let answers = panel.read(cx).snapshot_answer_drafts(cx);
                 if answers.is_empty() {
@@ -824,8 +1017,7 @@ impl T3App {
 
     fn sync_workspace(&self, cx: &mut Context<Self>) {
         let thread = self.open_thread_shell(cx);
-        let project =
-            thread.and_then(|t| self.shell.projects.iter().find(|p| p.id == t.project_id));
+        let project = self.current_project(cx);
         let scope = WorkspaceScope {
             project_id: project.map(|p| p.id.clone()),
             thread_id: thread.map(|t| t.id.clone()),
@@ -852,15 +1044,7 @@ impl Render for T3App {
             // itself (see `ThreadView::apply`/`set_shell`/`set_connected`).
             thread.clone().cached(StyleRefinement::default().size_full()).into_any_element()
         } else {
-            div()
-                .flex()
-                .flex_1()
-                .items_center()
-                .justify_center()
-                .text_sm()
-                .text_color(cx.theme().muted_foreground)
-                .child("Select a thread")
-                .into_any_element()
+            self.render_empty(window, cx).into_any_element()
         };
 
         v_flex()
@@ -918,7 +1102,12 @@ impl Render for T3App {
                             .min_w_0()
                             .h_full()
                             .children(self.error.clone().map(|error| {
-                                div().p_2().child(Alert::error("backend-error", error))
+                                div().p_2().child(Alert::error("backend-error", error).on_close(
+                                    cx.listener(|this, _, _, cx| {
+                                        this.error = None;
+                                        cx.notify();
+                                    }),
+                                ))
                             }))
                             .child(main),
                     )
@@ -1010,7 +1199,12 @@ impl T3App {
             })
             .when_some(shell, |row, thread| {
                 row.child(
-                    div().flex_1().min_w_0().truncate().font_semibold().child(thread.title.clone()),
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .truncate()
+                        .font_semibold()
+                        .child(ui::display_title(&thread.title)),
                 )
             });
         let controls = h_flex()
@@ -1044,6 +1238,117 @@ impl T3App {
             );
         TitleBar::new().pl_0().child(
             h_flex().w_full().h_full().min_w_0().child(brand).child(breadcrumb).child(controls),
+        )
+    }
+
+    /// The main column with no thread open: what is on the server, the two
+    /// ways to start, and the shortcuts that get there faster.
+    fn render_empty(&self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme();
+        let connected = matches!(self.status, Status::Connected(_));
+        let active = self
+            .shell
+            .threads
+            .iter()
+            .filter(|thread| thread.archived_at.is_none() && !thread.is_settled())
+            .count();
+        let summary: SharedString = match &self.status {
+            Status::Connected(_) => format!(
+                "{} project{} · {active} active thread{}",
+                self.shell.projects.len(),
+                if self.shell.projects.len() == 1 { "" } else { "s" },
+                if active == 1 { "" } else { "s" },
+            )
+            .into(),
+            Status::Reconnecting { reason, .. } => format!("Reconnecting: {reason}").into(),
+            _ => "Connecting to the server…".into(),
+        };
+        let shortcut = |keys: &str, label: &'static str| {
+            h_flex()
+                .justify_between()
+                .gap_4()
+                .py_1()
+                .text_xs()
+                .text_color(theme.muted_foreground)
+                .child(label)
+                .children(Keystroke::parse(keys).ok().map(Kbd::new))
+        };
+
+        div().flex().flex_1().items_center().justify_center().p_6().child(
+            v_flex()
+                .id("empty-state")
+                .w(px(360.))
+                .gap_6()
+                .child(
+                    v_flex()
+                        .gap_3()
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .size(px(40.))
+                                .rounded_lg()
+                                .border_1()
+                                .border_color(theme.primary.opacity(0.35))
+                                .bg(theme.primary.opacity(0.08))
+                                .child(
+                                    icon(IconName::SquareTerminal)
+                                        .size(px(20.))
+                                        .text_color(theme.primary),
+                                ),
+                        )
+                        .child(div().text_xl().font_semibold().child("Pick up a thread"))
+                        .child(
+                            h_flex()
+                                .gap_2()
+                                .text_sm()
+                                .text_color(theme.muted_foreground)
+                                .when(!connected, |row| {
+                                    row.child(ui::loader("empty-connecting", Size::XSmall))
+                                })
+                                .child(summary),
+                        ),
+                )
+                .child(
+                    h_flex()
+                        .gap_2()
+                        .child(
+                            Button::new("empty-new-thread")
+                                .primary()
+                                .small()
+                                .icon(icon(IconName::SquarePen))
+                                .label("New thread")
+                                .disabled(!connected || self.shell.projects.is_empty())
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    let projects = this.shell.projects.clone();
+                                    this.project_picker
+                                        .update(cx, |picker, cx| picker.open(projects, window, cx));
+                                })),
+                        )
+                        .child(
+                            Button::new("empty-add-project")
+                                .outline()
+                                .small()
+                                .icon(icon(IconName::FolderPlus))
+                                .label("Add project")
+                                .disabled(!connected)
+                                .on_click(
+                                    cx.listener(|this, _, window, cx| this.add_project(window, cx)),
+                                ),
+                        ),
+                )
+                .child(
+                    v_flex()
+                        .pt_4()
+                        .border_t_1()
+                        .border_color(theme.border)
+                        .child(shortcut("ctrl-n", "New thread"))
+                        .child(shortcut("ctrl-l", "Focus the composer"))
+                        .child(shortcut("ctrl-j", "Files, changes and terminal"))
+                        .child(shortcut("ctrl-b", "Toggle the sidebar"))
+                        .child(shortcut("ctrl-,", "Settings")),
+                ),
         )
     }
 
@@ -1089,7 +1394,7 @@ impl T3App {
                         .child(
                             Button::new("pair")
                                 .primary()
-                                .label(if self.pairing_pending { "Connecting?" } else { "Connect" })
+                                .label(if self.pairing_pending { "Connecting…" } else { "Connect" })
                                 .disabled(
                                     self.pairing_pending
                                         || self.pairing_link.read(cx).value().trim().is_empty(),
@@ -1098,6 +1403,62 @@ impl T3App {
                         ),
                 ),
         )
+    }
+}
+
+/// The folder holding `path`, with a trailing separator in the path's own
+/// style: `C:\repos\app` gives `C:\repos\`, `/home/me/app/` gives `/home/me/`.
+/// A new thread's title: the first line of its first message, shortened.
+fn thread_title(text: &str) -> String {
+    const MAX: usize = 60;
+    let line = text.lines().map(str::trim).find(|line| !line.is_empty()).unwrap_or_default();
+    if line.is_empty() {
+        return "New thread".into();
+    }
+    if line.chars().count() <= MAX {
+        return line.to_owned();
+    }
+    let short: String = line.chars().take(MAX - 1).collect();
+    format!("{}…", short.trim_end())
+}
+
+/// The opening message of a thread that continues `thread_id` on another
+/// provider: the new agent has none of the old conversation, so it is told
+/// to read that thread first.
+fn continuation_prompt(thread_id: &str, title: &str) -> String {
+    format!(
+        "Continue the work from thread `{thread_id}` (\"{}\"). First read that thread's \
+         full history to understand what was done and what is left, then continue from \
+         where it stopped.",
+        ui::display_title(title)
+    )
+}
+
+fn containing_folder(path: &str) -> Option<String> {
+    let path = path.trim().trim_end_matches(['/', '\\']);
+    let split = path.rfind(['/', '\\'])?;
+    Some(path[..=split].to_owned())
+}
+
+#[cfg(test)]
+mod folder_tests {
+    use super::*;
+
+    #[::core::prelude::v1::test]
+    fn new_thread_titles_use_the_first_line_and_stay_short() {
+        assert_eq!(super::thread_title("\n  Fix the build  \nand more"), "Fix the build");
+        assert_eq!(super::thread_title("   "), "New thread");
+        let long = super::thread_title(&"word ".repeat(30));
+        assert_eq!(long.chars().count(), 60);
+        assert!(long.ends_with('\u{2026}'));
+    }
+
+    #[::core::prelude::v1::test]
+    fn containing_folder_keeps_the_path_style() {
+        assert_eq!(containing_folder(r"C:\repos\app").as_deref(), Some(r"C:\repos\"));
+        assert_eq!(containing_folder("/home/me/app/").as_deref(), Some("/home/me/"));
+        assert_eq!(containing_folder("C:/repos/existing").as_deref(), Some("C:/repos/"));
+        assert_eq!(containing_folder("app"), None);
     }
 }
 
@@ -1210,14 +1571,27 @@ mod recovery_tests {
             window.click(("project-picker-row", 0usize), cx);
         })
         .unwrap();
-        let mut created = false;
+        // Picking a project opens a draft; nothing is created on the server
+        // until its first message is sent.
         while let Ok(command) = commands.try_recv() {
-            if let Command::CreateThread { project_id, .. } = command {
-                assert_eq!(project_id, "project-1");
-                created = true;
-            }
+            assert!(!matches!(command, Command::StartThread { .. }));
         }
-        assert!(created, "Selecting a visible project must create a thread");
+        app.read_with(cx, |app, cx| {
+            let draft = app.thread.as_ref().unwrap().read(cx).draft_thread().cloned().unwrap();
+            assert_eq!(draft.project_id, "project-1");
+            assert_eq!(app.draft_threads, vec![draft]);
+        });
+        cx.update(|cx| {
+            let view = app.read(cx).thread.clone().unwrap();
+            view.update(cx, |_, cx| {
+                cx.emit(ThreadViewEvent::Send("Fix the build\nthen run tests".into(), Vec::new()))
+            });
+        });
+        let command = commands.try_recv().unwrap();
+        assert!(
+            matches!(&command, Command::StartThread { draft, title, .. } if draft.project_id == "project-1" && title == "Fix the build"),
+            "the first send creates the thread"
+        );
         cx.update_window(handle, |_, window, cx| {
             window.render_frame(cx);
             window.click("add-project", cx);
@@ -1225,7 +1599,7 @@ mod recovery_tests {
         .unwrap();
         let command = commands.try_recv().unwrap();
         assert!(
-            matches!(command,Command::Workspace { request: t3_client::WorkspaceRequest::BrowseDirectories { partial_path, .. }, .. } if partial_path == "C:/repos/existing")
+            matches!(command,Command::Workspace { request: t3_client::WorkspaceRequest::BrowseDirectories { partial_path, .. }, .. } if partial_path == "C:/repos/")
         );
         cx.update_window(handle, |_, window, cx| {
             window.render_frame(cx);
