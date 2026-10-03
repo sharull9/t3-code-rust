@@ -474,7 +474,14 @@ async fn settings_requests(
                 Err(error) => events.error(format!("Settings unavailable: {}", describe(&error))),
             },
             SettingsRequest::Save { request_id, patch, base } => {
-                let result = connection.update_settings_from(&base, patch).await.map_err(|error| describe(&error));
+                let result = connection.update_settings_from(&base, patch).await;
+                if let Err(t3_client::settings::SettingsUpdateError::ProviderRemoved { settings, .. }) = &result {
+                    events.emit(Event::Settings(settings.clone()));
+                }
+                let result = result.map_err(|error| match error {
+                    t3_client::settings::SettingsUpdateError::Rpc(error) => describe(&error),
+                    other => other.to_string(),
+                });
                 events.emit(Event::SettingsSaved { request_id, result });
             }
         }

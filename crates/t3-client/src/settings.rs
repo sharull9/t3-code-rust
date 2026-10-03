@@ -95,6 +95,14 @@ pub struct ScopedValue {
 #[derive(Debug, Clone, PartialEq)]
 pub struct ServerSettings(Value);
 
+#[derive(Debug, thiserror::Error)]
+pub enum SettingsUpdateError {
+    #[error(transparent)]
+    Rpc(#[from] crate::RpcError),
+    #[error("Provider instance \"{instance_id}\" was removed on the server. Your changes were not saved.")]
+    ProviderRemoved { instance_id: String, settings: ServerSettings },
+}
+
 impl Default for ServerSettings {
     fn default() -> Self {
         Self(Value::Object(Map::new()))
@@ -273,6 +281,29 @@ impl ServerSettings {
         patch
     }
 
+    /// Reject a save if rebasing would discard an edit to a removed provider.
+    /// Cached, unedited entries and already-completed removals are harmless.
+    /// The latest snapshot lets the UI report the conflict and show current data.
+    pub fn rebase_patch_for_save(
+        &self,
+        patch: &Value,
+        latest: &Self,
+    ) -> Result<Value, SettingsUpdateError> {
+        if let Some(instances) = patch.get("providerInstances").and_then(Value::as_object) {
+            for (id, edited) in instances {
+                let original = self.0.get("providerInstances").and_then(|map| map.get(id));
+                let current = latest.0.get("providerInstances").and_then(|map| map.get(id));
+                if original.is_some() && original != Some(edited) && current.is_none() {
+                    return Err(SettingsUpdateError::ProviderRemoved {
+                        instance_id: id.clone(),
+                        settings: latest.clone(),
+                    });
+                }
+            }
+        }
+        Ok(self.rebase_patch(patch, latest))
+    }
+
     /// Applies a patch the way the server does, for showing a pending save
     /// before the server answers. Objects merge key by key except the model
     /// selections, which replace; a project's entry replaces whole and `null`
@@ -363,9 +394,10 @@ impl crate::Connection {
 
     /// Refresh before replacing project entries or the provider map. Callers
     /// must serialize edits so each refresh includes the previous save.
-    pub async fn update_settings_from(&self, base: &ServerSettings, patch: Value) -> Result<ServerSettings, crate::RpcError> {
+    pub async fn update_settings_from(&self, base: &ServerSettings, patch: Value) -> Result<ServerSettings, SettingsUpdateError> {
         let latest = self.get_settings().await?;
-        self.update_settings(base.rebase_patch(&patch, &latest)).await
+        let patch = base.rebase_patch_for_save(&patch, &latest)?;
+        Ok(self.update_settings(patch).await?)
     }
 }
 
@@ -566,5 +598,69 @@ mod tests {
                 assert!(instances.get("kept").is_none());
             }
         }
+    }
+
+    #[test]
+    fn provider_save_conflicts_only_when_an_edit_would_be_discarded() {
+        let base = ServerSettings::from_value(json!({ "providerInstances": {
+            "removed": { "driver": "codex", "enabled": true },
+            "kept": { "driver": "claude", "enabled": true }
+        } }));
+        let latest = ServerSettings::from_value(json!({ "providerInstances": {
+            "kept": { "driver": "claude", "enabled": true }
+        } }));
+        let mut patch = base.raw().clone();
+        // An unchanged cached entry does not conflict with its remote removal.
+        patch["providerInstances"]["kept"]["enabled"] = json!(false);
+        assert!(base.rebase_patch_for_save(&patch, &latest).is_ok());
+        patch["providerInstances"]["removed"]["enabled"] = json!(false);
+        let error = base.rebase_patch_for_save(&patch, &latest).unwrap_err();
+        assert!(error.to_string().contains("Your changes were not saved"));
+        assert!(matches!(error, SettingsUpdateError::ProviderRemoved { instance_id, settings }
+            if instance_id == "removed" && settings == latest));
+        // Removing an already-removed entry is idempotent; new IDs are additions.
+        patch["providerInstances"].as_object_mut().unwrap().remove("removed");
+        patch["providerInstances"]["new"] = json!({ "driver": "cursor", "enabled": true });
+        assert_eq!(base.rebase_patch_for_save(&patch, &latest).unwrap(), patch);
+    }
+
+    #[tokio::test]
+    async fn provider_conflict_returns_latest_settings_without_sending_a_write() {
+        use futures::{SinkExt as _, StreamExt as _};
+        use std::time::Duration;
+        use tokio::net::TcpListener;
+        use tokio_tungstenite::{accept_async, tungstenite::Message};
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let accept = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            accept_async(socket).await.unwrap()
+        });
+        let connection = crate::Connection {
+            rpc: crate::rpc::RpcSession::connect(&format!("ws://{address}")).await.unwrap(),
+        };
+        let mut server = accept.await.unwrap();
+        let base = ServerSettings::from_value(json!({ "providerInstances": {
+            "work": { "driver": "codex", "enabled": true }
+        } }));
+        let mut patch = base.raw().clone();
+        patch["providerInstances"]["work"]["enabled"] = json!(false);
+        let caller = connection.clone();
+        let save = tokio::spawn(async move { caller.update_settings_from(&base, patch).await });
+        let frame = tokio::time::timeout(Duration::from_secs(2), server.next()).await.unwrap().unwrap().unwrap();
+        let Message::Text(text) = frame else { panic!("expected settings request") };
+        let request: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(request["tag"], "server.getSettings");
+        let latest = json!({ "providerInstances": {}, "defaultAutoPull": true });
+        server.send(Message::Text(json!({
+            "_tag": "Exit", "requestId": request["id"],
+            "exit": { "_tag": "Success", "value": latest }
+        }).to_string().into())).await.unwrap();
+        let error = tokio::time::timeout(Duration::from_secs(2), save).await.unwrap().unwrap().unwrap_err();
+        assert!(matches!(error, SettingsUpdateError::ProviderRemoved { instance_id, settings }
+            if instance_id == "work" && settings.raw() == &latest));
+        assert!(tokio::time::timeout(Duration::from_millis(100), server.next()).await.is_err(),
+            "a conflicted save must not send server.updateSettings");
     }
 }

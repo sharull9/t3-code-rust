@@ -727,11 +727,13 @@ impl Render for SettingsPage {
                                     )
                                     .children(scope_bar)
                                     .children(self.save_error.clone().map(|error| {
-                                        Alert::error("settings-save-error", error).on_close(
-                                            cx.listener(|this, _, _, cx| {
-                                                this.save_error = None;
-                                                cx.notify();
-                                            }),
+                                        div().id("settings-save-error-container").test_support().child(
+                                            Alert::error("settings-save-error", error).on_close(
+                                                cx.listener(|this, _, _, cx| {
+                                                    this.save_error = None;
+                                                    cx.notify();
+                                                }),
+                                            ),
                                         )
                                     }))
                                     .child(content),
@@ -827,6 +829,33 @@ mod tests {
             assert_eq!(page.server_value("enableAgentDeviceAccess").value, json!(false));
             assert_eq!(page.server_value("defaultAutoPull").value, json!(true));
         });
+    }
+
+    #[gpui_kit::test]
+    fn removed_provider_save_shows_an_error_and_current_server_settings(cx: &mut TestAppContext) {
+        let (handle, page) = open_page(cx, size(px(900.), px(700.)));
+        let base = json!({ "providerInstances": { "work": { "driver": "codex", "enabled": true } } });
+        load(&page, cx, base, true);
+        page.update(cx, |page, cx| {
+            page.section = Section::Providers;
+            let base = page.effective_settings().into_owned();
+            let mut patch = base.raw().clone();
+            patch["providerInstances"]["work"]["enabled"] = json!(false);
+            page.save(patch.clone(), cx);
+            let latest = ServerSettings::from_value(json!({ "providerInstances": {} }));
+            let error = base.rebase_patch_for_save(&patch, &latest).unwrap_err();
+            // The backend publishes the conflict's fresh snapshot, then the failure.
+            page.set_server_settings(latest, cx);
+            page.settings_saved(1, Err(error.to_string()), cx);
+            assert!(page.pending.is_empty());
+            assert!(page.server_settings.as_ref().unwrap().raw()["providerInstances"].get("work").is_none());
+            assert!(page.save_error.as_ref().unwrap().contains("Your changes were not saved"));
+        });
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            assert!(window.find("settings-save-error-container").visible());
+            assert!(window.try_find("provider-enabled-work").is_none());
+        }).unwrap();
     }
 
     #[gpui_kit::test]
