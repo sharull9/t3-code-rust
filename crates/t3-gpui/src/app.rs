@@ -56,6 +56,8 @@ pub fn init(cx: &mut App) {
 }
 pub struct T3App {
     focus_handle: FocusHandle,
+    /// Whether the light palette is currently applied.
+    light_applied: bool,
     backend: Backend,
     status: Status,
     error: Option<SharedString>,
@@ -100,6 +102,34 @@ impl T3App {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let (backend, events) = Backend::spawn();
         Self::new_with_backend(backend, events, window, cx)
+    }
+
+    /// Re-applies the theme when preferences or (in System mode) the OS
+    /// appearance change, and redraws views that cache their last frame.
+    fn appearance_subscriptions(
+        mut subscriptions: Vec<Subscription>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Vec<Subscription> {
+        subscriptions.push(cx.observe_global::<crate::prefs::Prefs>(|this, cx| {
+            let light = ui::is_light(crate::prefs::Prefs::global(cx).theme, cx.window_appearance());
+            if light != this.light_applied {
+                this.light_applied = light;
+                ui::apply_theme(light, cx);
+            }
+            if let Some(thread) = &this.thread {
+                thread.update(cx, |thread, cx| thread.refresh_appearance(cx));
+            }
+            cx.notify();
+        }));
+        subscriptions.push(window.observe_window_appearance(|window, cx| {
+            let mode = crate::prefs::Prefs::global(cx).theme;
+            if mode == crate::prefs::ThemeMode::System {
+                ui::apply_theme(ui::is_light(mode, window.appearance()), cx);
+                cx.refresh_windows();
+            }
+        }));
+        subscriptions
     }
 
     fn new_with_backend(
@@ -168,11 +198,6 @@ impl T3App {
                             request_id: *request_id,
                             patch: patch.clone(),
                         })
-                    }
-                    SettingsEvent::Theme(light) => {
-                        let light = *light;
-                        ui::apply_theme(light, cx);
-                        crate::prefs::Prefs::update(cx, |prefs| prefs.light_theme = light);
                     }
                     SettingsEvent::ChooseManagedServer => {
                         let paths = cx.prompt_for_paths(PathPromptOptions {
@@ -279,6 +304,7 @@ impl T3App {
 
         Self {
             focus_handle: cx.focus_handle(),
+            light_applied: ui::is_light(crate::prefs::Prefs::global(cx).theme, window.appearance()),
             backend,
             status: Status::Connecting(String::new()),
             error: None,
@@ -310,7 +336,7 @@ impl T3App {
             question_panels: HashMap::new(),
             sending: HashSet::new(),
             _thread_subscription: None,
-            _subscriptions: subscriptions,
+            _subscriptions: Self::appearance_subscriptions(subscriptions, window, cx),
         }
     }
 
@@ -1198,6 +1224,7 @@ impl T3App {
 
 impl Render for T3App {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        window.set_rem_size(px(crate::prefs::Prefs::global(cx).font_size_interface as f32));
         let settings_open = self.settings.read(cx).is_open();
         let usage_active = self.usage_open && !settings_open && !self.switching_server;
         self.usage.update(cx, |usage, _| usage.set_active(usage_active));

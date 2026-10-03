@@ -6,8 +6,34 @@ use gpui_kit::component::{Icon, Sizable as _, Size, StyledExt as _, Theme, Theme
 use gpui_kit::*;
 
 pub const SIDEBAR_WIDTH: Pixels = px(300.);
-/// Width of the transcript and composer column.
+/// Conversation column width for the default ("comfortable") chat width.
 pub const CONTENT_WIDTH: Pixels = px(780.);
+
+/// The conversation column's max width for the chat-width preference.
+pub fn content_width(cx: &App) -> Pixels {
+    use crate::prefs::ChatWidth;
+    match crate::prefs::Prefs::global(cx).chat_width {
+        ChatWidth::Comfortable => CONTENT_WIDTH,
+        ChatWidth::Wide => px(1080.),
+        ChatWidth::Full => px(100_000.),
+    }
+}
+
+/// Font size for code and other monospace output.
+pub fn code_size(cx: &App) -> Pixels {
+    px(crate::prefs::Prefs::global(cx).font_size_code as f32)
+}
+
+/// Whether `mode` shows the light palette given the OS appearance.
+pub fn is_light(mode: crate::prefs::ThemeMode, appearance: WindowAppearance) -> bool {
+    match mode {
+        crate::prefs::ThemeMode::Light => true,
+        crate::prefs::ThemeMode::Dark => false,
+        crate::prefs::ThemeMode::System => {
+            matches!(appearance, WindowAppearance::Light | WindowAppearance::VibrantLight)
+        }
+    }
+}
 
 /// Surface and accent colors for one appearance. Every token the app or its
 /// gpui-kit components read is derived from these, so buttons, tabs, menus,
