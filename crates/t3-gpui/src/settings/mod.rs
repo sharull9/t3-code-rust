@@ -45,6 +45,9 @@ pub enum SettingsEvent {
     /// Send `patch` with `server.updateSettings`, then answer through
     /// [`SettingsPage::settings_saved`] with the same `request_id`.
     UpdateServerSettings { request_id: u64, patch: Value },
+    /// Send `ops` with `server.upsertKeybinding` / `server.removeKeybinding`,
+    /// then answer through [`SettingsPage::keybindings_saved`].
+    UpdateKeybindings { request_id: u64, ops: Vec<t3_client::KeybindingOp> },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -204,6 +207,8 @@ pub struct SettingsPage {
     pending: Vec<PendingSave>,
     save_error: Option<String>,
     next_request_id: u64,
+    /// Shortcut recording state of the Keybindings page.
+    keys: pages::keybindings::KeysState,
     _subscriptions: Vec<Subscription>,
 }
 impl EventEmitter<SettingsEvent> for SettingsPage {}
@@ -230,6 +235,7 @@ impl SettingsPage {
             pending: Vec::new(),
             save_error: None,
             next_request_id: 1,
+            keys: Default::default(),
             _subscriptions: vec![subscription],
         }
     }
@@ -746,6 +752,7 @@ mod tests {
                     SettingsEvent::ChooseManagedServer => "managed",
                     SettingsEvent::SwitchServer => "switch",
                     SettingsEvent::UpdateServerSettings { .. } => "update",
+                    SettingsEvent::UpdateKeybindings { .. } => "keybindings",
                 });
             })
         });
@@ -972,8 +979,9 @@ mod tests {
             assert!(window.try_find("settings-nav-general").is_some());
         })
         .unwrap();
-        let titles: Vec<_> = search::search("shortcut").iter().map(|entry| entry.title).collect();
-        assert_eq!(titles, ["Keyboard shortcuts"]);
+        let results = search::search("shortcut");
+        assert!(results.iter().all(|entry| entry.section == Section::Keybindings));
+        assert!(results.iter().any(|entry| entry.title == "New thread"));
         // Every word must match; matches in a title lead.
         assert_eq!(search::search("auto settle inactive")[0].title, "Auto-settle inactive threads");
         assert!(search::search("zzzz").is_empty());

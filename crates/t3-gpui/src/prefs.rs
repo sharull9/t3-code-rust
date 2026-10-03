@@ -1,6 +1,7 @@
 //! Small app-wide preferences that are not tied to a server: favorite and
 //! hidden models, and the appearance. Stored beside the drafts as `prefs.json`.
 
+use std::collections::BTreeMap;
 use std::ops::RangeInclusive;
 use std::path::PathBuf;
 
@@ -50,6 +51,9 @@ pub struct Prefs {
     pub font_size_code: u32,
     pub chat_width: ChatWidth,
     pub confirm_thread_archive: bool,
+    /// Shortcut overrides for commands the server has no keybinding id for,
+    /// by `keymap::Command::id`, in upstream syntax (`mod+shift+l`).
+    pub keybindings: BTreeMap<String, Vec<String>>,
 }
 
 const DEFAULT: Prefs = Prefs {
@@ -62,6 +66,7 @@ const DEFAULT: Prefs = Prefs {
     font_size_code: DEFAULT_CODE_FONT_SIZE,
     chat_width: ChatWidth::Comfortable,
     confirm_thread_archive: false,
+    keybindings: BTreeMap::new(),
 };
 
 impl Default for Prefs {
