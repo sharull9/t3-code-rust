@@ -40,7 +40,8 @@ const NULLABLE_PROJECT_KEYS: &[&str] = &[
 ];
 
 /// Patch keys whose value replaces the stored one instead of merging into it.
-const REPLACED_KEYS: &[&str] = &["defaultModelSelection", "sourceControlWriterModelSelection"];
+const REPLACED_KEYS: &[&str] =
+    &["defaultModelSelection", "sourceControlWriterModelSelection", "providerInstances"];
 
 pub fn is_project_scoped(key: &str) -> bool {
     PROJECT_SCOPED_KEYS.contains(&key)
