@@ -240,6 +240,28 @@ impl ServerSettings {
         })
     }
 
+    /// Rebuild whole-object replacements using only the changes made against
+    /// this snapshot. Unedited fields come from `latest`, including removals
+    /// made by another client while this snapshot was cached.
+    pub fn rebase_patch(&self, patch: &Value, latest: &Self) -> Value {
+        let mut patch = patch.clone();
+        if let Some(entries) = patch.get_mut("projectSettingsOverrides").and_then(Value::as_object_mut) {
+            for (project, entry) in entries {
+                let before = self.0["projectSettingsOverrides"].get(project);
+                let current = latest.0["projectSettingsOverrides"].get(project);
+                let mut rebased = rebase_object(before, entry, current);
+                if rebased.as_object().is_some_and(Map::is_empty) {
+                    rebased = Value::Null;
+                }
+                *entry = rebased;
+            }
+        }
+        if let Some(instances) = patch.get_mut("providerInstances") {
+            *instances = rebase_object(self.0.get("providerInstances"), instances, latest.0.get("providerInstances"));
+        }
+        patch
+    }
+
     /// Applies a patch the way the server does, for showing a pending save
     /// before the server answers. Objects merge key by key except the model
     /// selections, which replace; a project's entry replaces whole and `null`
@@ -272,6 +294,38 @@ impl ServerSettings {
     }
 }
 
+/// Apply the difference between two objects to the current object. Missing
+/// fields mean deletion; explicit null remains a stored value. Nested objects
+/// use the same rule so a provider edit does not resend cached configuration.
+fn rebase_object(before: Option<&Value>, after: &Value, current: Option<&Value>) -> Value {
+    let mut result = current.and_then(Value::as_object).cloned().unwrap_or_default();
+    let before = before.and_then(Value::as_object);
+    let after = after.as_object();
+    if let Some(before) = before {
+        for key in before.keys() {
+            if !after.is_some_and(|after| after.contains_key(key)) {
+                result.remove(key);
+            }
+        }
+    }
+    if let Some(after) = after {
+        for (key, value) in after {
+            let original = before.and_then(|before| before.get(key));
+            if original == Some(value) {
+                continue;
+            }
+            let updated = if value.is_object() && original.is_some_and(Value::is_object)
+                && !REPLACED_KEYS.contains(&key.as_str()) {
+                rebase_object(original, value, result.get(key))
+            } else {
+                value.clone()
+            };
+            result.insert(key.clone(), updated);
+        }
+    }
+    Value::Object(result)
+}
+
 fn merge(target: &mut Value, patch: &Value) {
     match (target.as_object_mut(), patch.as_object()) {
         (Some(target), Some(patch)) => {
@@ -294,6 +348,13 @@ impl crate::Connection {
     pub async fn update_settings(&self, patch: Value) -> Result<ServerSettings, crate::RpcError> {
         let value = self.rpc().call::<Value>("server.updateSettings", json!({ "patch": patch })).await?;
         Ok(ServerSettings::from_value(value))
+    }
+
+    /// Refresh before replacing project entries or the provider map. Callers
+    /// must serialize edits so each refresh includes the previous save.
+    pub async fn update_settings_from(&self, base: &ServerSettings, patch: Value) -> Result<ServerSettings, crate::RpcError> {
+        let latest = self.get_settings().await?;
+        self.update_settings(base.rebase_patch(&patch, &latest)).await
     }
 }
 
@@ -414,5 +475,57 @@ mod tests {
         settings.apply_patch(&json!({ "storageCleanup": { "logsAfterDays": 7 } }));
         settings.apply_patch(&json!({ "storageCleanup": { "worktreeOnMerge": true } }));
         assert_eq!(settings.raw()["storageCleanup"], json!({ "logsAfterDays": 7, "worktreeOnMerge": true }));
+    }
+
+    #[test]
+    fn rebasing_project_edits_preserves_remote_revocations_and_new_overrides() {
+        let base = ServerSettings::from_value(json!({ "projectSettingsOverrides": {
+            "p1": { "enableAgentDeviceAccess": true, "defaultRuntimeMode": "auto" }
+        } }));
+        let latest = ServerSettings::from_value(json!({ "projectSettingsOverrides": {
+            "p1": { "defaultRuntimeMode": "approval-required", "defaultAutoPull": true }
+        } }));
+        let patch = base.set_patch("responseStreamingMode", Some(json!("turn")), Some("p1"));
+        assert_eq!(base.rebase_patch(&patch, &latest), json!({ "projectSettingsOverrides": {
+            "p1": { "defaultRuntimeMode": "approval-required", "defaultAutoPull": true,
+                    "responseStreamingMode": "turn" }
+        } }));
+        // Clearing all cached overrides still preserves an override added remotely.
+        let reset = base.project_patch("p1", &[("enableAgentDeviceAccess", None), ("defaultRuntimeMode", None)]);
+        assert_eq!(base.rebase_patch(&reset, &latest), json!({ "projectSettingsOverrides": {
+            "p1": { "defaultAutoPull": true }
+        } }));
+    }
+
+    #[test]
+    fn queued_edits_do_not_resend_a_failed_previous_edit() {
+        let original = ServerSettings::default();
+        let first = original.set_patch("defaultAutoPull", Some(json!(true)), Some("p1"));
+        let mut optimistic = original.clone();
+        optimistic.apply_patch(&first);
+        let second = optimistic.set_patch("sidebarAutoSettleAfterDays", Some(Value::Null), Some("p1"));
+        assert_eq!(optimistic.rebase_patch(&second, &original), json!({ "projectSettingsOverrides": {
+            "p1": { "sidebarAutoSettleAfterDays": null }
+        } }));
+        assert_eq!(optimistic.rebase_patch(&second, &optimistic), second);
+    }
+
+    #[test]
+    fn provider_edits_rebase_only_changed_configuration_and_instance_removals() {
+        let base = ServerSettings::from_value(json!({ "providerInstances": {
+            "work": { "driver": "codex", "enabled": true, "config": { "binaryPath": "old", "customModels": ["a"] } },
+            "remove": { "driver": "claude" }
+        } }));
+        let latest = ServerSettings::from_value(json!({ "providerInstances": {
+            "work": { "driver": "codex", "enabled": false, "config": { "binaryPath": "new", "customModels": ["a"] }, "future": 1 },
+            "remove": { "driver": "claude" }, "remote": { "driver": "cursor" }
+        } }));
+        let mut patch = base.raw().clone();
+        patch["providerInstances"]["work"]["config"]["customModels"] = json!(["b"]);
+        patch["providerInstances"].as_object_mut().unwrap().remove("remove");
+        assert_eq!(base.rebase_patch(&patch, &latest), json!({ "providerInstances": {
+            "work": { "driver": "codex", "enabled": false, "config": { "binaryPath": "new", "customModels": ["b"] }, "future": 1 },
+            "remote": { "driver": "cursor" }
+        } }));
     }
 }

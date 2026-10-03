@@ -55,6 +55,7 @@ pub enum Command {
     UpdateSettings {
         request_id: u64,
         patch: Value,
+        base: t3_client::ServerSettings,
     },
     /// `server.upsertKeybinding` / `server.removeKeybinding` in order; answered
     /// with `Event::KeybindingsSaved`.
@@ -454,6 +455,32 @@ enum Offline {
     Elapsed,
 }
 
+enum SettingsRequest {
+    Load,
+    Save { request_id: u64, patch: Value, base: t3_client::ServerSettings },
+}
+
+/// One worker per connection orders reads and writes, and is aborted along
+/// with the session. A refresh before each save rebases whole-entry patches.
+async fn settings_requests(
+    connection: Connection,
+    events: Emitter,
+    mut requests: mpsc::UnboundedReceiver<SettingsRequest>,
+) {
+    while let Some(request) = requests.recv().await {
+        match request {
+            SettingsRequest::Load => match connection.get_settings().await {
+                Ok(settings) => events.emit(Event::Settings(settings)),
+                Err(error) => events.error(format!("Settings unavailable: {}", describe(&error))),
+            },
+            SettingsRequest::Save { request_id, patch, base } => {
+                let result = connection.update_settings_from(&base, patch).await.map_err(|error| describe(&error));
+                events.emit(Event::SettingsSaved { request_id, result });
+            }
+        }
+    }
+}
+
 /// Handles commands while there is no connection, until `timeout` (if any).
 async fn wait_offline(
     commands: &mut mpsc::UnboundedReceiver<Command>,
@@ -524,6 +551,8 @@ async fn run_session(
     events: &Emitter,
     open_thread: &mut Option<String>,
 ) -> SessionEnd {
+    let (settings_tx, settings_rx) = mpsc::unbounded_channel();
+    let _settings = TaskGuard(tokio::spawn(settings_requests(connection.clone(), events.clone(), settings_rx)));
     let config_connection = connection.clone();
     let config_events = events.clone();
     let _config = TaskGuard(tokio::spawn(async move {
@@ -580,20 +609,10 @@ async fn run_session(
                     });
                 }
                 Some(Command::LoadSettings) => {
-                    let connection = connection.clone(); let events = events.clone();
-                    operations.spawn(async move {
-                        match connection.get_settings().await {
-                            Ok(settings) => events.emit(Event::Settings(settings)),
-                            Err(error) => events.error(format!("Settings unavailable: {}", describe(&error))),
-                        }
-                    });
+                    let _ = settings_tx.send(SettingsRequest::Load);
                 }
-                Some(Command::UpdateSettings { request_id, patch }) => {
-                    let connection = connection.clone(); let events = events.clone();
-                    operations.spawn(async move {
-                        let result = connection.update_settings(patch).await.map_err(|error| describe(&error));
-                        events.emit(Event::SettingsSaved { request_id, result });
-                    });
+                Some(Command::UpdateSettings { request_id, patch, base }) => {
+                    let _ = settings_tx.send(SettingsRequest::Save { request_id, patch, base });
                 }
                 Some(Command::UpdateKeybindings { request_id, ops }) => {
                     let connection = connection.clone(); let events = events.clone();

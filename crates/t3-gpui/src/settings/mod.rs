@@ -44,7 +44,7 @@ pub enum SettingsEvent {
     SwitchServer,
     /// Send `patch` with `server.updateSettings`, then answer through
     /// [`SettingsPage::settings_saved`] with the same `request_id`.
-    UpdateServerSettings { request_id: u64, patch: Value },
+    UpdateServerSettings { request_id: u64, patch: Value, base: ServerSettings },
     /// Send `ops` with `server.upsertKeybinding` / `server.removeKeybinding`,
     /// then answer through [`SettingsPage::keybindings_saved`].
     UpdateKeybindings { request_id: u64, ops: Vec<t3_client::KeybindingOp> },
@@ -189,6 +189,7 @@ impl Section {
 struct PendingSave {
     request_id: u64,
     patch: Value,
+    base: ServerSettings,
 }
 
 pub struct SettingsPage {
@@ -264,14 +265,34 @@ impl SettingsPage {
         cx.notify();
     }
     pub fn set_connected(&mut self, connected: bool, cx: &mut Context<Self>) {
+        if !connected {
+            self.server_settings = None;
+            self.pending.clear();
+            self.save_error = None;
+            self.capabilities = Value::Null;
+            self.projects.clear();
+            self.scope = None;
+            self.providers.clear();
+            self.expanded_provider = None;
+            self.providers_ui = Default::default();
+            self.keys = Default::default();
+            self.archive.reset();
+            cx.notify();
+        }
         if self.connected != connected {
             self.connected = connected;
+            if connected && self.open && self.section == Section::Archive {
+                pages::archive::load(self, cx);
+            }
             cx.notify();
         }
     }
     pub fn set_open(&mut self, open: bool, cx: &mut Context<Self>) {
         if self.open != open {
             self.open = open;
+            if open && self.section == Section::Archive {
+                pages::archive::load(self, cx);
+            }
             cx.notify();
         }
     }
@@ -312,6 +333,9 @@ impl SettingsPage {
         result: Result<ServerSettings, String>,
         cx: &mut Context<Self>,
     ) {
+        if !self.pending.iter().any(|save| save.request_id == request_id) {
+            return;
+        }
         self.pending.retain(|save| save.request_id != request_id);
         match result {
             Ok(settings) => self.server_settings = Some(settings),
@@ -343,7 +367,8 @@ impl SettingsPage {
         }
         let mut settings = base;
         for save in &self.pending {
-            settings.apply_patch(&save.patch);
+            let patch = save.base.rebase_patch(&save.patch, &settings);
+            settings.apply_patch(&patch);
         }
         Cow::Owned(settings)
     }
@@ -380,8 +405,9 @@ impl SettingsPage {
         let request_id = self.next_request_id;
         self.next_request_id += 1;
         self.save_error = None;
-        self.pending.push(PendingSave { request_id, patch: patch.clone() });
-        cx.emit(SettingsEvent::UpdateServerSettings { request_id, patch });
+        let base = self.effective_settings().into_owned();
+        self.pending.push(PendingSave { request_id, patch: patch.clone(), base: base.clone() });
+        cx.emit(SettingsEvent::UpdateServerSettings { request_id, patch, base });
         cx.notify();
     }
 
@@ -769,6 +795,41 @@ mod tests {
     }
 
     #[gpui_kit::test]
+    fn disconnect_invalidates_settings_and_ignores_old_save_replies(cx: &mut TestAppContext) {
+        let (_, page) = open_page(cx, size(px(900.), px(700.)));
+        load(&page, cx, json!({ "defaultRuntimeMode": "auto" }), true);
+        page.update(cx, |page, cx| {
+            page.set_server_value("defaultAutoPull", json!(true), cx);
+            page.scope = Some("old-project".into());
+            page.capabilities = json!({ "storageCleanup": true });
+            page.set_connected(false, cx);
+            assert!(page.pending.is_empty());
+            assert!(page.scope.is_none());
+            assert_eq!(page.capabilities, Value::Null);
+            page.set_connected(true, cx);
+            page.settings_saved(1, Ok(ServerSettings::from_value(json!({ "defaultRuntimeMode": "auto" }))), cx);
+            assert!(!page.server_ready());
+            page.set_server_value("defaultAutoPull", json!(true), cx);
+            assert!(page.pending.is_empty());
+            page.set_server_settings(ServerSettings::default(), cx);
+            assert!(page.server_ready());
+        });
+    }
+
+    #[gpui_kit::test]
+    fn pending_edits_preserve_fresh_remote_settings(cx: &mut TestAppContext) {
+        let (_, page) = open_page(cx, size(px(900.), px(700.)));
+        load(&page, cx, json!({ "projectSettingsOverrides": { "p1": { "enableAgentDeviceAccess": true } } }), true);
+        page.update(cx, |page, cx| {
+            page.scope = Some("p1".into());
+            page.set_server_value("defaultAutoPull", json!(true), cx);
+            page.set_server_settings(ServerSettings::default(), cx);
+            assert_eq!(page.server_value("enableAgentDeviceAccess").value, json!(false));
+            assert_eq!(page.server_value("defaultAutoPull").value, json!(true));
+        });
+    }
+
+    #[gpui_kit::test]
     fn offline_refresh_is_disabled_and_category_navigation_keeps_theme(cx: &mut TestAppContext) {
         let (handle, page) = open_page(cx, size(px(900.), px(700.)));
         let providers = serde_json::from_value::<Vec<ServerProvider>>(json!([
@@ -944,7 +1005,7 @@ mod tests {
         let captured = sent.clone();
         let _subscription = cx.update(|cx| {
             cx.subscribe(&page, move |_, event: &SettingsEvent, _| {
-                if let SettingsEvent::UpdateServerSettings { request_id, patch } = event {
+                if let SettingsEvent::UpdateServerSettings { request_id, patch, .. } = event {
                     captured.borrow_mut().push((*request_id, patch.clone()));
                 }
             })

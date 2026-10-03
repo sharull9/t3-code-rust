@@ -39,6 +39,15 @@ pub struct State {
 }
 
 impl State {
+    pub fn reset(&mut self) {
+        self.threads.clear();
+        self.projects.clear();
+        self.request = None;
+        self.loaded = false;
+        self.failed = false;
+        self.restoring.clear();
+    }
+
     pub fn new(
         window: &mut Window,
         subscriptions: &mut Vec<Subscription>,
@@ -95,7 +104,8 @@ pub fn load(page: &mut SettingsPage, cx: &mut Context<SettingsPage>) {
 
 /// Asks the server to unarchive `thread_id`.
 pub fn unarchive(page: &mut SettingsPage, thread_id: &str, cx: &mut Context<SettingsPage>) {
-    if !page.connected || page.archive.restoring.iter().any(|id| id == thread_id) {
+    if !page.connected || !page.archive.threads.iter().any(|thread| thread.id == thread_id)
+        || page.archive.restoring.iter().any(|id| id == thread_id) {
         return;
     }
     page.archive.restoring.push(thread_id.to_owned());
@@ -141,6 +151,9 @@ impl SettingsPage {
         cx: &mut Context<Self>,
     ) {
         if !matches!(action, ThreadAction::Unarchive) {
+            return;
+        }
+        if !self.archive.restoring.iter().any(|id| id == thread_id) {
             return;
         }
         let before = self.archive.restoring.len();
@@ -337,6 +350,44 @@ mod tests {
             assert_eq!(page.archive.visible("").len(), 1);
             assert!(page.archive.restoring.is_empty());
         });
+    }
+
+    #[gpui_kit::test]
+    fn server_switch_clears_archive_and_rejects_old_results(cx: &mut TestAppContext) {
+        let (_, page, events, _subscription) = loaded_page(cx);
+        page.update(cx, |page, cx| {
+            load(page, cx);
+            let old_request = page.archive.request.clone().unwrap();
+            unarchive(page, "t1", cx);
+            page.set_connected(false, cx);
+            assert!(page.archive.threads.is_empty());
+            assert!(page.archive.projects.is_empty());
+            assert!(page.archive.restoring.is_empty());
+            page.set_connected(true, cx);
+            let new_request = page.archive.request.clone().unwrap();
+            assert_ne!(new_request, old_request);
+            page.set_archived(&old_request, Some(snapshot()), cx);
+            assert!(page.archive.threads.is_empty());
+            page.set_archived(&new_request, None, cx);
+            assert!(page.archive.failed);
+            assert!(page.archive.threads.is_empty());
+            let before = events.borrow().len();
+            unarchive(page, "t1", cx);
+            assert_eq!(events.borrow().len(), before);
+        });
+    }
+
+    #[gpui_kit::test]
+    fn reopening_archive_requests_a_fresh_snapshot(cx: &mut TestAppContext) {
+        let (_, page, events, _subscription) = loaded_page(cx);
+        let before = events.borrow().len();
+        page.update(cx, |page, cx| {
+            page.set_open(false, cx);
+            page.set_open(true, cx);
+            page.set_open(true, cx);
+            assert!(page.archive.request.is_some());
+        });
+        assert_eq!(events.borrow().len(), before + 1);
     }
 
     #[test]

@@ -187,10 +187,11 @@ impl T3App {
                         this.switching_server = true;
                         this.pairing_link.update(cx, |input, cx| input.focus(window, cx));
                     }
-                    SettingsEvent::UpdateServerSettings { request_id, patch } => {
+                    SettingsEvent::UpdateServerSettings { request_id, patch, base } => {
                         this.backend.send(Command::UpdateSettings {
                             request_id: *request_id,
                             patch: patch.clone(),
+                            base: base.clone(),
                         })
                     }
                     SettingsEvent::UpdateKeybindings { request_id, ops } => {
@@ -462,6 +463,7 @@ impl T3App {
                     }
                 });
                 if !connected {
+                    crate::keymap::set_server_keybindings(cx, Vec::new());
                     self.directory_picker.update(cx, |picker, cx| picker.close(cx));
                 }
                 if !connected {
@@ -595,9 +597,7 @@ impl T3App {
                     .update(cx, |panel, cx| panel.keybindings_saved(request_id, result.map(|_| ()), cx));
             }
             Event::Config(config) => {
-                if !config.keybindings.is_empty() {
-                    crate::keymap::set_server_keybindings(cx, config.keybindings.clone());
-                }
+                crate::keymap::set_server_keybindings(cx, config.keybindings.clone());
                 if let Some(environment) = &config.environment {
                     let capabilities = environment.capabilities.clone();
                     self.settings.update(cx, |panel, cx| panel.set_capabilities(capabilities, cx));
@@ -1696,6 +1696,37 @@ mod recovery_tests {
     use super::*;
     use core::prelude::v1::test;
     use gpui_kit::test::TestWindowExt as _;
+
+    #[gpui_kit::test]
+    fn empty_server_keybindings_restore_defaults_after_a_switch(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            init(cx);
+        });
+        let (backend, _commands) = Backend::for_test();
+        let (_events, receiver) = futures::channel::mpsc::unbounded();
+        let (handle, app) = cx.update(|cx| {
+            gpui_kit::open_window(WindowOptions::default(), cx,
+                |window, cx| cx.new(|cx| T3App::new_with_backend(backend, receiver, window, cx))).unwrap()
+        });
+        cx.update_window(handle, |_, window, cx| {
+            let old_config: t3_client::ServerConfig = serde_json::from_value(serde_json::json!({
+                "keybindings": [{ "command": "chat.new", "shortcut": { "key": "k", "modKey": true } }]
+            })).unwrap();
+            app.update(cx, |app, cx| {
+                app.handle_event(Event::Config(old_config.clone()), window, cx);
+                assert!(!crate::keymap::server_keybindings(cx).is_empty());
+                app.handle_event(Event::Config(t3_client::ServerConfig::default()), window, cx);
+                assert!(crate::keymap::server_keybindings(cx).is_empty());
+                let keys = crate::keymap::shortcuts(crate::keymap::Command::NewThread,
+                    &crate::keymap::server_keybindings(cx), crate::prefs::Prefs::global(cx));
+                assert_eq!(keys, ["mod+n", "mod+shift+o"]);
+                app.handle_event(Event::Config(old_config), window, cx);
+                app.handle_event(Event::Status(Status::Connecting("New server".into())), window, cx);
+                assert!(crate::keymap::server_keybindings(cx).is_empty());
+            });
+        }).unwrap();
+    }
 
     #[gpui_kit::test]
     fn settings_returns_to_empty_usage_and_pairing_views_with_working_shortcuts(cx: &mut TestAppContext) {
