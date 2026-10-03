@@ -15,12 +15,15 @@ use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
 use gpui_kit::component::scroll::ScrollableElement as _;
-use gpui_kit::component::{ActiveTheme as _, Sizable as _, Size, StyledExt as _, h_flex, v_flex};
+use gpui_kit::component::{
+    ActiveTheme as _, Sizable as _, Size, StyledExt as _, WindowExt as _, h_flex, v_flex,
+};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use t3_client::{ProjectShell, SessionStatus, ShellState, ThreadShell, sort_settled_threads};
 
 use crate::backend::Status;
+use crate::prefs::Prefs;
 use crate::ui::{self, SIDEBAR_WIDTH, icon};
 
 pub enum SidebarEvent {
@@ -847,7 +850,7 @@ impl Sidebar {
             .dropdown_menu(move |mut menu, _, _| {
                 let view = menu_view.clone();
                 let id = menu_thread_id.clone();
-                let title = title.clone();
+                let rename_title = title.clone();
                 menu = menu.item(PopupMenuItem::new("Rename").on_click(move |_, window, cx| {
                     let _ = view.update(cx, |this, cx| {
                         if this.rename_pending {
@@ -855,7 +858,7 @@ impl Sidebar {
                         }
                         this.renaming = Some(id.clone());
                         this.rename.update(cx, |input, cx| {
-                            input.set_value(title.clone(), window, cx);
+                            input.set_value(rename_title.clone(), window, cx);
                             input.focus(window, cx);
                         });
                         cx.notify();
@@ -871,10 +874,36 @@ impl Sidebar {
                 ] {
                     let view = menu_view.clone();
                     let id = menu_thread_id.clone();
-                    menu = menu.item(PopupMenuItem::new(label).on_click(move |_, _, cx| {
-                        let _ = view.update(cx, |_, cx| {
-                            cx.emit(SidebarEvent::ThreadAction(id.clone(), action.clone()))
-                        });
+                    let archive = matches!(action, t3_client::ThreadAction::Archive);
+                    let title = title.clone();
+                    menu = menu.item(PopupMenuItem::new(label).on_click(move |_, window, cx| {
+                        let send = {
+                            let (view, id, action) = (view.clone(), id.clone(), action.clone());
+                            move |cx: &mut App| {
+                                let _ = view.update(cx, |_, cx| {
+                                    cx.emit(SidebarEvent::ThreadAction(id.clone(), action.clone()))
+                                });
+                            }
+                        };
+                        if archive && Prefs::global(cx).confirm_thread_archive {
+                            let title = title.clone();
+                            window.open_alert_dialog(cx, move |alert, _, _| {
+                                let send = send.clone();
+                                alert
+                                    .title("Archive thread?")
+                                    .description(format!(
+                                        "\"{title}\" moves to the archive. You can restore it later."
+                                    ))
+                                    .ok_text("Archive")
+                                    .show_cancel(true)
+                                    .on_ok(move |_, _, cx| {
+                                        send(cx);
+                                        true
+                                    })
+                            });
+                        } else {
+                            send(cx);
+                        }
                     }));
                 }
                 menu

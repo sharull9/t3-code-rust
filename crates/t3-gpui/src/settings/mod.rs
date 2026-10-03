@@ -42,8 +42,6 @@ pub enum SettingsEvent {
     RefreshProviders,
     ChooseManagedServer,
     SwitchServer,
-    /// `true` means light theme; `false` means dark theme.
-    Theme(bool),
     /// Send `patch` with `server.updateSettings`, then answer through
     /// [`SettingsPage::settings_saved`] with the same `request_id`.
     UpdateServerSettings { request_id: u64, patch: Value },
@@ -188,7 +186,6 @@ pub struct SettingsPage {
     providers: Vec<ServerProvider>,
     connected: bool,
     open: bool,
-    light_theme: bool,
     section: Section,
     /// The provider whose model list is expanded.
     expanded_provider: Option<String>,
@@ -222,7 +219,6 @@ impl SettingsPage {
             providers: Vec::new(),
             connected: false,
             open: false,
-            light_theme: crate::prefs::Prefs::global(cx).light_theme,
             section: Section::General,
             expanded_provider: None,
             focus_handle: cx.focus_handle(),
@@ -363,13 +359,6 @@ impl SettingsPage {
         cx.notify();
     }
 
-    fn set_theme(&mut self, light: bool, cx: &mut Context<Self>) {
-        if self.light_theme != light {
-            self.light_theme = light;
-            cx.emit(SettingsEvent::Theme(light));
-            cx.notify();
-        }
-    }
     fn set_scope(&mut self, scope: Option<String>, cx: &mut Context<Self>) {
         if self.scope != scope {
             self.scope = scope;
@@ -756,8 +745,6 @@ mod tests {
                     SettingsEvent::RefreshProviders => "refresh",
                     SettingsEvent::ChooseManagedServer => "managed",
                     SettingsEvent::SwitchServer => "switch",
-                    SettingsEvent::Theme(true) => "light",
-                    SettingsEvent::Theme(false) => "dark",
                     SettingsEvent::UpdateServerSettings { .. } => "update",
                 });
             })
@@ -767,6 +754,7 @@ mod tests {
             window.click("settings-nav-appearance", cx);
             window.render_frame(cx);
             window.click("theme-light", cx);
+            assert_eq!(crate::prefs::Prefs::global(cx).theme, crate::prefs::ThemeMode::Light);
             window.click("settings-nav-providers", cx);
             window.render_frame(cx);
             window.click("settings-refresh-providers", cx);
@@ -779,15 +767,44 @@ mod tests {
             window.click("settings-switch-server", cx);
             window.click("settings-nav-appearance", cx);
             window.render_frame(cx);
-            assert!(page.read(cx).light_theme);
             window.click("theme-dark", cx);
             window.click("settings-close", cx);
         })
         .unwrap();
         assert_eq!(
             *events.borrow(),
-            ["light", "refresh", "managed", "switch", "dark", "close"]
+            ["refresh", "managed", "switch", "close"]
         );
+    }
+
+    #[gpui_kit::test]
+    fn appearance_controls_change_prefs_and_restore_defaults(cx: &mut TestAppContext) {
+        use crate::prefs::{ChatWidth, Prefs, ThemeMode};
+        let (handle, page) = open_page(cx, size(px(1000.), px(900.)));
+        cx.update_window(handle, |_, window, cx| {
+            page.update(cx, |page, cx| page.set_open(true, cx));
+            window.render_frame(cx);
+            window.click("settings-nav-appearance", cx);
+            window.render_frame(cx);
+            assert!(!pages::appearance::modified(page.read(cx), cx));
+            window.click("chat-width-wide", cx);
+            window.click("font-code-up", cx);
+            window.click("font-prompt-down", cx);
+            window.click("font-interface-up", cx);
+            window.click("setting-confirm-archive-switch", cx);
+            let prefs = Prefs::global(cx).clone();
+            assert_eq!(prefs.chat_width, ChatWidth::Wide);
+            assert_eq!(prefs.font_size_code, 14);
+            assert_eq!(prefs.font_size_prompt, 13);
+            assert_eq!(prefs.font_size_interface, 17);
+            assert!(prefs.confirm_thread_archive);
+            window.render_frame(cx);
+            assert!(pages::appearance::modified(page.read(cx), cx));
+            window.click("settings-restore-defaults", cx);
+            assert!(!Prefs::global(cx).appearance_modified());
+            assert_eq!(Prefs::global(cx).theme, ThemeMode::System);
+        })
+        .unwrap();
     }
 
     #[gpui_kit::test]

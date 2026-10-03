@@ -25,7 +25,7 @@ use crate::drafts::DraftThread;
 use crate::mentions::{self, MentionKind, MentionMenu};
 use crate::model_picker::{ModelPicker, ModelPickerEvent};
 use crate::transcript::{Transcript, TranscriptEvent};
-use crate::ui::{self, CONTENT_WIDTH};
+use crate::ui;
 use crate::user_input::{UserInputEvent, UserInputPanel};
 
 pub enum ThreadViewEvent {
@@ -81,6 +81,13 @@ pub struct ThreadView {
 impl EventEmitter<ThreadViewEvent> for ThreadView {}
 
 impl ThreadView {
+    /// Redraws after an appearance preference changed: this view and its
+    /// transcript are cached, so they would otherwise keep their last frame.
+    pub fn refresh_appearance(&mut self, cx: &mut Context<Self>) {
+        self.transcript.update(cx, |_, cx| cx.notify());
+        cx.notify();
+    }
+
     #[cfg(test)]
     pub fn new(
         thread_id: String,
@@ -700,6 +707,8 @@ impl Render for ThreadView {
             cx.defer_in(window, |this, window, cx| this.retokenize(window, cx));
         }
         let theme = cx.theme();
+        let content_width = ui::content_width(cx);
+        let prompt_size = px(crate::prefs::Prefs::global(cx).font_size_prompt as f32);
         let working = self.is_working(cx);
         let has_user_input = self.thread_loaded && self.user_input.read(cx).has_requests();
         let transcript_state = self.transcript.read(cx);
@@ -893,7 +902,7 @@ impl Render for ThreadView {
         let composer = v_flex()
             .relative()
             .w_full()
-            .max_w(CONTENT_WIDTH)
+            .max_w(content_width)
             .children(mention_menu)
             .rounded_xl()
             .border_1()
@@ -911,6 +920,7 @@ impl Render for ThreadView {
                     .capture_action(cx.listener(Self::on_mention_escape))
                     .capture_action(cx.listener(Self::on_mention_up))
                     .capture_action(cx.listener(Self::on_mention_down))
+                    .text_size(prompt_size)
                     .child(
                         Textarea::new(&self.composer)
                             .accessibility_id("composer")
@@ -941,7 +951,7 @@ impl Render for ThreadView {
 
         let footer = h_flex()
             .w_full()
-            .max_w(CONTENT_WIDTH)
+            .max_w(content_width)
             .gap_1()
             .px_3()
             .text_xs()
@@ -975,7 +985,7 @@ impl Render for ThreadView {
                 .children(session_error.map(|error| {
                     div()
                         .w_full()
-                        .max_w(CONTENT_WIDTH)
+                        .max_w(content_width)
                         .px_1()
                         .text_sm()
                         .text_color(theme.danger)
@@ -984,7 +994,7 @@ impl Render for ThreadView {
                 .children(approvals.iter().take(1).enumerate().map(|(ix, approval)| {
                     v_flex()
                         .w_full()
-                        .max_w(CONTENT_WIDTH)
+                        .max_w(content_width)
                         .gap_2()
                         .p_3()
                         .rounded_lg()
@@ -1030,7 +1040,7 @@ impl Render for ThreadView {
                     column.child(
                         self.user_input
                             .clone()
-                            .cached(StyleRefinement::default().w_full().max_w(CONTENT_WIDTH)),
+                            .cached(StyleRefinement::default().w_full().max_w(content_width)),
                     )
                 })
                 .child(composer)

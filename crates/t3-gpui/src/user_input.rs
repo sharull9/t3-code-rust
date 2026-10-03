@@ -10,7 +10,6 @@ use gpui_kit::*;
 use t3_client::ThreadAction;
 use t3_client::pending::{AnswerDraft, PendingUserInput, build_answers};
 
-use crate::ui::CONTENT_WIDTH;
 
 const QUESTION_CONTEXT: &str = "UserInputPanel";
 
@@ -435,7 +434,7 @@ impl Render for UserInputPanel {
             .on_action(cx.listener(Self::on_option_8))
             .on_action(cx.listener(Self::on_option_9))
             .w_full()
-            .max_w(CONTENT_WIDTH)
+            .max_w(crate::ui::content_width(cx))
             .gap_2()
             .p_3()
             .rounded_lg()
