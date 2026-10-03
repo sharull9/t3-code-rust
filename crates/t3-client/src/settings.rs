@@ -64,6 +64,19 @@ pub fn default_value(key: &str) -> Option<Value> {
         "sidebarAutoSettleAfterDays" => json!(3),
         "sidebarAutoSettleOnMerge" | "newWorktreesStartFromOrigin" | "enableProviderUpdateChecks"
         | "enableAgentBrowserAccess" => json!(true),
+        "sourceControlWritingStyle" => json!({
+            "mode": "repo_conventions",
+            "customInstructions": "",
+            "followChangeRequestTemplates": true,
+        }),
+        "storageCleanup" => json!({
+            "worktreeAfterDays": null,
+            "worktreeOnMerge": false,
+            "worktreeOnDelete": false,
+            "worktreeUnchanged": false,
+            "browserArtifactsAfterDays": null,
+            "logsAfterDays": null,
+        }),
         "continueThreadsAfterServerUpdate" | "defaultAutoPull" | "enableAgentDeviceAccess" => {
             json!(false)
         }
@@ -126,7 +139,12 @@ impl ServerSettings {
                 self.project_overrides(project).is_some_and(|entry| entry.contains_key(key))
             }
             Some(_) => false,
-            None => default_value(key).is_some_and(|default| self.value(key) != default),
+            None => default_value(key).is_some_and(|default| {
+                // A stored object may omit fields; those read as the default.
+                let mut current = default.clone();
+                merge(&mut current, &self.value(key));
+                current != default
+            }),
         }
     }
 

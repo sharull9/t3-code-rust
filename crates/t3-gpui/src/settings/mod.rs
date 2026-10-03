@@ -48,6 +48,12 @@ pub enum SettingsEvent {
     /// Send `ops` with `server.upsertKeybinding` / `server.removeKeybinding`,
     /// then answer through [`SettingsPage::keybindings_saved`].
     UpdateKeybindings { request_id: u64, ops: Vec<t3_client::KeybindingOp> },
+    /// Load the archived threads; answer through [`SettingsPage::set_archived`]
+    /// with the same `request_id`.
+    LoadArchived(String),
+    /// Run a thread action; answer through
+    /// [`SettingsPage::archive_action_finished`].
+    ThreadAction { thread_id: String, action: t3_client::ThreadAction },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -209,6 +215,10 @@ pub struct SettingsPage {
     next_request_id: u64,
     /// Shortcut recording state of the Keybindings page.
     keys: pages::keybindings::KeysState,
+    /// Text inputs of the Source Control, Storage and Archive pages.
+    source_control: pages::source_control::State,
+    storage: pages::storage::State,
+    archive: pages::archive::State,
     _subscriptions: Vec<Subscription>,
 }
 impl EventEmitter<SettingsEvent> for SettingsPage {}
@@ -220,6 +230,10 @@ impl SettingsPage {
                 cx.notify();
             }
         });
+        let mut subscriptions = vec![subscription];
+        let source_control = pages::source_control::State::new(window, &mut subscriptions, cx);
+        let storage = pages::storage::State::new(window, &mut subscriptions, cx);
+        let archive = pages::archive::State::new(window, &mut subscriptions, cx);
         Self {
             providers: Vec::new(),
             connected: false,
@@ -236,7 +250,10 @@ impl SettingsPage {
             save_error: None,
             next_request_id: 1,
             keys: Default::default(),
-            _subscriptions: vec![subscription],
+            source_control,
+            storage,
+            archive,
+            _subscriptions: subscriptions,
         }
     }
     pub fn set_providers(&mut self, providers: Vec<ServerProvider>, cx: &mut Context<Self>) {
@@ -373,6 +390,9 @@ impl SettingsPage {
     }
     fn select_section(&mut self, section: Section, window: &mut Window, cx: &mut Context<Self>) {
         self.section = section;
+        if section == Section::Archive {
+            pages::archive::load(self, cx);
+        }
         if !self.search.read(cx).value().is_empty() {
             self.search.update(cx, |search, cx| search.set_value("", window, cx));
         }
@@ -542,6 +562,11 @@ impl Render for SettingsPage {
         }
         let wide = window.viewport_size().width >= px(1000.);
         let section = self.section;
+        match section {
+            Section::SourceControl => pages::source_control::sync_inputs(self, window, cx),
+            Section::Storage => pages::storage::sync_inputs(self, window, cx),
+            _ => {}
+        }
         let scoped = section.scoped();
         let can_restore = section.modified(self, cx) && (!scoped || self.server_ready());
         let navigation = self.render_navigation(wide, cx);
@@ -696,7 +721,7 @@ mod tests {
     use std::cell::RefCell;
     use std::rc::Rc;
 
-    fn open_page(
+    pub(crate) fn open_page(
         cx: &mut TestAppContext,
         size: Size<Pixels>,
     ) -> (AnyWindowHandle, Entity<SettingsPage>) {
@@ -719,12 +744,17 @@ mod tests {
         })
     }
 
+    /// `pending`, for tests that only hold a `TestAppContext`.
+    pub(crate) fn sent(page: &Entity<SettingsPage>, cx: &TestAppContext) -> Vec<Value> {
+        page.read_with(cx, |page, _| page.pending.iter().map(|save| save.patch.clone()).collect())
+    }
+
     /// Patches sent and not yet answered, in order.
-    fn pending(page: &Entity<SettingsPage>, cx: &App) -> Vec<Value> {
+    pub(crate) fn pending(page: &Entity<SettingsPage>, cx: &App) -> Vec<Value> {
         page.read(cx).pending.iter().map(|save| save.patch.clone()).collect()
     }
 
-    fn load(page: &Entity<SettingsPage>, cx: &mut TestAppContext, settings: Value, connected: bool) {
+    pub(crate) fn load(page: &Entity<SettingsPage>, cx: &mut TestAppContext, settings: Value, connected: bool) {
         page.update(cx, |page, cx| {
             page.set_open(true, cx);
             page.set_connected(connected, cx);
@@ -753,6 +783,8 @@ mod tests {
                     SettingsEvent::SwitchServer => "switch",
                     SettingsEvent::UpdateServerSettings { .. } => "update",
                     SettingsEvent::UpdateKeybindings { .. } => "keybindings",
+                    SettingsEvent::LoadArchived(_) => "load-archived",
+                    SettingsEvent::ThreadAction { .. } => "thread-action",
                 });
             })
         });
