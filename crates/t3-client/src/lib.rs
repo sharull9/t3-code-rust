@@ -16,6 +16,7 @@
 pub mod attachments;
 pub mod auth;
 mod error;
+pub mod keybindings;
 pub mod pending;
 pub mod quotas;
 pub mod rpc;
@@ -33,6 +34,7 @@ pub use reqwest;
 
 pub use auth::{Credentials, PairingLink};
 pub use error::{Error, RpcError};
+pub use keybindings::{KeybindingOp, ResolvedKeybinding};
 pub use rpc::{RpcSession, Subscription};
 pub use settings::ServerSettings;
 pub use state::{ShellState, ThreadState, sort_settled_threads};

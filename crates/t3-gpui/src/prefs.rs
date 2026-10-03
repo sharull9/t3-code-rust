@@ -1,6 +1,7 @@
 //! Small app-wide preferences that are not tied to a server: favorite and
 //! hidden models, and the appearance. Stored beside the drafts as `prefs.json`.
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use gpui_kit::{App, Global};
@@ -14,6 +15,9 @@ pub struct Prefs {
     /// `"<instanceId>/<model>"` keys left out of the model picker.
     pub hidden_models: Vec<String>,
     pub light_theme: bool,
+    /// Shortcut overrides for commands the server has no keybinding id for,
+    /// by `keymap::Command::id`, in upstream syntax (`mod+shift+l`).
+    pub keybindings: BTreeMap<String, Vec<String>>,
 }
 
 impl Global for Prefs {}
@@ -93,4 +97,4 @@ impl Prefs {
 }
 
 static EMPTY: Prefs =
-    Prefs { favorite_models: Vec::new(), hidden_models: Vec::new(), light_theme: false };
+    Prefs { favorite_models: Vec::new(), hidden_models: Vec::new(), light_theme: false, keybindings: BTreeMap::new() };

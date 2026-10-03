@@ -45,14 +45,8 @@ gpui_kit::actions!(
 );
 pub fn init(cx: &mut App) {
     crate::settings::init(cx);
-    cx.bind_keys([
-        KeyBinding::new("ctrl-n", NewThread, Some("T3App")),
-        KeyBinding::new("ctrl-b", ToggleSidebar, Some("T3App")),
-        KeyBinding::new("ctrl-l", FocusComposer, Some("T3App")),
-        KeyBinding::new("ctrl-j", ToggleWorkspace, Some("T3App")),
-        KeyBinding::new("ctrl-,", ShowSettings, Some("T3App")),
-        KeyBinding::new("escape", DismissModal, Some("T3App")),
-    ]);
+    // The user can rebind these; see `keymap`.
+    crate::keymap::apply(cx);
 }
 pub struct T3App {
     focus_handle: FocusHandle,
@@ -167,6 +161,12 @@ impl T3App {
                         this.backend.send(Command::UpdateSettings {
                             request_id: *request_id,
                             patch: patch.clone(),
+                        })
+                    }
+                    SettingsEvent::UpdateKeybindings { request_id, ops } => {
+                        this.backend.send(Command::UpdateKeybindings {
+                            request_id: *request_id,
+                            ops: ops.clone(),
                         })
                     }
                     SettingsEvent::Theme(light) => {
@@ -552,7 +552,17 @@ impl T3App {
             Event::SettingsSaved { request_id, result } => {
                 self.settings.update(cx, |panel, cx| panel.settings_saved(request_id, result, cx));
             }
+            Event::KeybindingsSaved { request_id, result } => {
+                if let Ok(rules) = &result {
+                    crate::keymap::set_server_keybindings(cx, rules.clone());
+                }
+                self.settings
+                    .update(cx, |panel, cx| panel.keybindings_saved(request_id, result.map(|_| ()), cx));
+            }
             Event::Config(config) => {
+                if !config.keybindings.is_empty() {
+                    crate::keymap::set_server_keybindings(cx, config.keybindings.clone());
+                }
                 if let Some(environment) = &config.environment {
                     let capabilities = environment.capabilities.clone();
                     self.settings.update(cx, |panel, cx| panel.set_capabilities(capabilities, cx));

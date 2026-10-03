@@ -56,6 +56,12 @@ pub enum Command {
         request_id: u64,
         patch: Value,
     },
+    /// `server.upsertKeybinding` / `server.removeKeybinding` in order; answered
+    /// with `Event::KeybindingsSaved`.
+    UpdateKeybindings {
+        request_id: u64,
+        ops: Vec<t3_client::KeybindingOp>,
+    },
     ThreadAction {
         thread_id: String,
         action: t3_client::ThreadAction,
@@ -143,6 +149,10 @@ pub enum Event {
     SettingsSaved {
         request_id: u64,
         result: Result<t3_client::ServerSettings, String>,
+    },
+    KeybindingsSaved {
+        request_id: u64,
+        result: Result<Vec<t3_client::ResolvedKeybinding>, String>,
     },
     LimitsFinished { request_id: u64, result: Result<(), String> },
     Archived {
@@ -481,6 +491,7 @@ async fn wait_offline(
                 Some(Command::LoadLimits { request_id }) => events.emit(Event::LimitsFinished { request_id, result: Err("Reconnect to see limits.".into()) }),
                 Some(Command::LoadSettings) => {}
                 Some(Command::UpdateSettings { request_id, .. }) => events.emit(Event::SettingsSaved { request_id, result: Err("Reconnect to change server settings.".into()) }),
+                Some(Command::UpdateKeybindings { request_id, .. }) => events.emit(Event::KeybindingsSaved { request_id, result: Err("Reconnect to change shared shortcuts.".into()) }),
                 Some(Command::SendMessage { thread, text, attachments }) => {
                     events.error("Cannot send while disconnected. Your draft has been kept.");
                     events.emit(Event::SendFinished { thread_id: thread.id, text, success: false, attachment_ids: attachments.iter().map(|a| a.id.clone()).collect() });
@@ -582,6 +593,13 @@ async fn run_session(
                     operations.spawn(async move {
                         let result = connection.update_settings(patch).await.map_err(|error| describe(&error));
                         events.emit(Event::SettingsSaved { request_id, result });
+                    });
+                }
+                Some(Command::UpdateKeybindings { request_id, ops }) => {
+                    let connection = connection.clone(); let events = events.clone();
+                    operations.spawn(async move {
+                        let result = connection.apply_keybinding_ops(&ops).await.map_err(|error| describe(&error));
+                        events.emit(Event::KeybindingsSaved { request_id, result });
                     });
                 }
                 Some(Command::OpenAsset(attachment)) => {
