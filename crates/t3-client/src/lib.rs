@@ -17,6 +17,7 @@ pub mod attachments;
 pub mod auth;
 mod error;
 pub mod pending;
+pub mod provider_config;
 pub mod quotas;
 pub mod rpc;
 pub mod settings;

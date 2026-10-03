@@ -192,6 +192,8 @@ pub struct SettingsPage {
     section: Section,
     /// The provider whose model list is expanded.
     expanded_provider: Option<String>,
+    /// Open forms and text inputs of the Providers page.
+    providers_ui: pages::providers::UiState,
     focus_handle: FocusHandle,
     search: Entity<InputState>,
     /// What the connected server advertises (`environment.capabilities`).
@@ -225,6 +227,7 @@ impl SettingsPage {
             light_theme: crate::prefs::Prefs::global(cx).light_theme,
             section: Section::General,
             expanded_provider: None,
+            providers_ui: Default::default(),
             focus_handle: cx.focus_handle(),
             search,
             capabilities: Value::Null,
@@ -548,6 +551,9 @@ impl Render for SettingsPage {
         let wide = window.viewport_size().width >= px(1000.);
         let section = self.section;
         let scoped = section.scoped();
+        if section == Section::Providers {
+            pages::providers::sync(self, window, cx);
+        }
         let can_restore = section.modified(self, cx) && (!scoped || self.server_ready());
         let navigation = self.render_navigation(wide, cx);
         let content = section.render(self, cx);
@@ -822,6 +828,54 @@ mod tests {
             window.render_frame(cx);
             window.click("settings-restore-defaults", cx);
             assert!(Prefs::global(cx).hidden_models.is_empty());
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn provider_cards_toggle_configure_edit_and_remove_instances(cx: &mut TestAppContext) {
+        let (handle, page) = open_page(cx, size(px(900.), px(3000.)));
+        load(
+            &page,
+            cx,
+            json!({
+                "providers": { "codex": { "enabled": true, "binaryPath": "codex", "customModels": [] } },
+                "providerInstances": {
+                    "codex_work": { "driver": "codex", "enabled": true, "future": 1,
+                                    "config": { "customModels": ["a"], "keep": true } }
+                }
+            }),
+            true,
+        );
+        page.update(cx, |page, _| page.section = Section::Providers);
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            // Disabling an instance resends the whole map with unknown fields kept.
+            window.click("provider-enabled-codex_work", cx);
+            let sent = pending(&page, cx);
+            assert_eq!(sent.len(), 1);
+            let entry = &sent[0]["providerInstances"]["codex_work"];
+            assert_eq!(entry["enabled"], false);
+            assert_eq!(entry["future"], 1);
+            assert_eq!(entry["config"]["keep"], true);
+            window.render_frame(cx);
+            // Custom models: remove one from the open form.
+            window.click("provider-config-codex_work", cx);
+            window.render_frame(cx);
+            assert!(window.try_find("provider-config-panel-codex_work").is_some());
+            window.click("provider-model-remove-codex_work-a", cx);
+            let sent = pending(&page, cx);
+            assert_eq!(sent.len(), 2);
+            assert_eq!(sent[1]["providerInstances"]["codex_work"]["config"]["customModels"], json!([]));
+            window.render_frame(cx);
+            // Removal asks first.
+            window.click("provider-remove-start-codex_work", cx);
+            window.render_frame(cx);
+            assert_eq!(pending(&page, cx).len(), 2);
+            window.click("provider-remove-confirm-codex_work", cx);
+            let sent = pending(&page, cx);
+            assert_eq!(sent.len(), 3);
+            assert!(sent[2]["providerInstances"].get("codex_work").is_none());
         })
         .unwrap();
     }
