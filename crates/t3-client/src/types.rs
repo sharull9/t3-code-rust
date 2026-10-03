@@ -120,6 +120,9 @@ pub struct ServerConfig {
     pub providers: Vec<ServerProvider>,
     #[serde(default)]
     pub usage_limit_sources: Vec<crate::quotas::LimitSource>,
+    /// Effective keybindings (defaults merged with the user's overrides).
+    #[serde(default, deserialize_with = "crate::quotas::compatible_array")]
+    pub keybindings: Vec<crate::keybindings::ResolvedKeybinding>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

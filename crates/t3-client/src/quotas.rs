@@ -92,7 +92,7 @@ pub struct LimitSource {
     pub error: Option<String>,
 }
 
-fn compatible_array<'de, D, T>(deserializer: D) -> Result<Vec<T>, D::Error>
+pub(crate) fn compatible_array<'de, D, T>(deserializer: D) -> Result<Vec<T>, D::Error>
 where
     D: Deserializer<'de>,
     T: serde::de::DeserializeOwned,
@@ -123,6 +123,11 @@ pub fn apply_config_event(
         Some("providerStatuses") => {
             let providers = serde_json::from_value(event["payload"]["providers"].clone())?;
             current.get_or_insert_with(ServerConfig::default).providers = providers;
+        }
+        Some("keybindingsUpdated") => {
+            let rules: Vec<Value> = serde_json::from_value(event["payload"]["keybindings"].clone())?;
+            current.get_or_insert_with(ServerConfig::default).keybindings =
+                rules.into_iter().filter_map(|rule| serde_json::from_value(rule).ok()).collect();
         }
         Some("usageLimitSourcesUpdated") => {
             let sources = serde_json::from_value(event["payload"]["sources"].clone())?;
