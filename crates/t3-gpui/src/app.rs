@@ -44,6 +44,7 @@ gpui_kit::actions!(
     [NewThread, ToggleSidebar, FocusComposer, ToggleWorkspace, ShowSettings, DismissModal]
 );
 pub fn init(cx: &mut App) {
+    crate::settings::init(cx);
     cx.bind_keys([
         KeyBinding::new("ctrl-n", NewThread, Some("T3App")),
         KeyBinding::new("ctrl-b", ToggleSidebar, Some("T3App")),
@@ -115,7 +116,7 @@ impl T3App {
         let project_picker = cx.new(|cx| ProjectPicker::new(window, cx));
         let workspace = cx.new(|cx| WorkspacePanel::new(window, cx));
         let directory_picker = cx.new(|cx| DirectoryPicker::new(window, cx));
-        let settings = cx.new(SettingsPage::new);
+        let settings = cx.new(|cx| SettingsPage::new(window, cx));
         let usage = cx.new(UsageView::new);
         cx.on_release(|this, cx| {
             this.capture_current_drafts(cx);
@@ -161,6 +162,12 @@ impl T3App {
                         this.settings.update(cx, |settings, cx| settings.set_open(false, cx));
                         this.switching_server = true;
                         this.pairing_link.update(cx, |input, cx| input.focus(window, cx));
+                    }
+                    SettingsEvent::UpdateServerSettings { request_id, patch } => {
+                        this.backend.send(Command::UpdateSettings {
+                            request_id: *request_id,
+                            patch: patch.clone(),
+                        })
                     }
                     SettingsEvent::Theme(light) => {
                         let light = *light;
@@ -499,6 +506,8 @@ impl T3App {
                 }
                 self.sync_thread_shell(cx);
                 let shell = self.shell.clone();
+                self.settings
+                    .update(cx, |panel, cx| panel.set_projects(&shell.projects, cx));
                 self.sidebar.update(cx, |sidebar, cx| sidebar.set_shell(shell, cx));
                 // The thread this session's `thread.create` was waiting on
                 // has streamed in: open it now that the sidebar has it too.
@@ -537,7 +546,17 @@ impl T3App {
                 }
             }
             Event::Error(message) => self.error = Some(message.into()),
+            Event::Settings(settings) => {
+                self.settings.update(cx, |panel, cx| panel.set_server_settings(settings, cx));
+            }
+            Event::SettingsSaved { request_id, result } => {
+                self.settings.update(cx, |panel, cx| panel.settings_saved(request_id, result, cx));
+            }
             Event::Config(config) => {
+                if let Some(environment) = &config.environment {
+                    let capabilities = environment.capabilities.clone();
+                    self.settings.update(cx, |panel, cx| panel.set_capabilities(capabilities, cx));
+                }
                 self.usage.update(cx, |usage, cx| usage.set_config(config.clone(), cx));
                 self.handle_event(Event::Providers(config.providers), window, cx);
             }
@@ -1123,6 +1142,10 @@ impl T3App {
                 page.focus(window, cx);
             }
         });
+        if open {
+            // Settings can change from other clients; refresh when viewed.
+            self.backend.send(Command::LoadSettings);
+        }
         if !open {
             if self.status == Status::NeedsPairing || self.switching_server {
                 self.pairing_link.update(cx, |input, cx| input.focus(window, cx));
@@ -1738,7 +1761,7 @@ mod recovery_tests {
             assert_eq!(page.focused(), Some(true));
             window.input("Do not edit the hidden composer", cx);
             assert!(app.read(cx).thread.as_ref().unwrap().read(cx).draft(cx).is_empty());
-            window.click("settings-nav-keyboard", cx);
+            window.click("settings-nav-keybindings", cx);
             window.render_frame(cx);
             assert!(window.find("settings-close").visible());
             window.press("escape", cx);
