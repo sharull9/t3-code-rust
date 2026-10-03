@@ -13,6 +13,8 @@ futures.workspace = true
 gpui-kit.workspace = true
 # Already in the tree through chrono's `clock`; names the zone for usage windows.
 iana-time-zone = "0.1"
+# Already in the tree through GPUI; converts pasted bitmaps to PNG.
+image = { version = "0.25", default-features = false, features = ["bmp", "ico", "png", "tiff"] }
 serde_json.workspace = true
 serde.workspace = true
 url.workspace = true

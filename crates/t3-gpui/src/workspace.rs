@@ -818,7 +818,7 @@ impl WorkspacePanel {
                         h_flex()
                             .flex_shrink_0()
                             .gap_1p5()
-                            .text_xs()
+                            .text_size(crate::ui::code_size(cx))
                             .font_family(mono.clone())
                             .child(
                                 div()
@@ -991,7 +991,7 @@ impl WorkspacePanel {
                     .border_color(theme.border)
                     .bg(theme.background)
                     .overflow_y_scrollbar()
-                    .text_xs()
+                    .text_size(crate::ui::code_size(cx))
                     .font_family(theme.mono_font_family.clone())
                     .child(if output.trim().is_empty() {
                         div()
@@ -1082,7 +1082,7 @@ fn code_block(text: String, mono: SharedString, cx: &App) -> impl IntoElement {
         .border_1()
         .border_color(theme.border)
         .bg(theme.background)
-        .text_xs()
+        .text_size(crate::ui::code_size(cx))
         .font_family(mono)
         .child(text)
 }
@@ -1100,7 +1100,7 @@ fn diff_block(diff: &str, mono: SharedString, cx: &App) -> impl IntoElement {
         .border_color(theme.border)
         .bg(theme.background)
         .overflow_hidden()
-        .text_xs()
+        .text_size(crate::ui::code_size(cx))
         .font_family(mono)
         .children(diff.lines().take(MAX_DIFF_LINES).map(|line| {
             let (color, background) = if line.starts_with("+++") || line.starts_with("---") {

@@ -249,6 +249,9 @@ pub enum WorkspaceRequest {
     RunGitAction { cwd: String, action: GitAction, thread_id: Option<String> },
     /// Replaces the project's whole action list (`project.meta.update`).
     SetProjectScripts { project_id: String, scripts: Vec<crate::ProjectScript> },
+    /// `projects.searchEntries`: fuzzy file search for `@` mentions. An empty
+    /// query returns recently used entries.
+    SearchEntries { cwd: String, query: String, limit: u32 },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -261,6 +264,7 @@ pub enum WorkspaceResponse {
     BrowseDirectories(WorkspaceBrowseResult),
     Terminal(WorkspaceTerminal),
     GitAction(GitActionOutcome),
+    Entries(WorkspaceDirectory),
     Ack,
 }
 
@@ -346,6 +350,11 @@ impl WorkspaceRequest {
                 close_terminal_payload(thread_id, terminal_id.as_deref()),
                 ResponseKind::Ack,
             ),
+            Self::SearchEntries { cwd, query, limit } => (
+                "projects.searchEntries",
+                json!({ "cwd": cwd, "query": query.trim(), "limit": limit }),
+                ResponseKind::Entries,
+            ),
         };
         let value: Value = connection.rpc().call(method, payload).await?;
         match response {
@@ -358,6 +367,7 @@ impl WorkspaceRequest {
                 decode(value).map(WorkspaceResponse::BrowseDirectories)
             }
             ResponseKind::Terminal => decode(value).map(WorkspaceResponse::Terminal),
+            ResponseKind::Entries => decode(value).map(WorkspaceResponse::Entries),
             ResponseKind::Ack => Ok(WorkspaceResponse::Ack),
         }
     }
@@ -412,6 +422,7 @@ enum ResponseKind {
     DiffPreview,
     BrowseDirectories,
     Terminal,
+    Entries,
     Ack,
 }
 

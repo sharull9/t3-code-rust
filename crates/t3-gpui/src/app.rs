@@ -33,6 +33,9 @@ use crate::usage::{UsageEvent, UsageView};
 use crate::user_input::UserInputPanel;
 use crate::workspace::{WorkspaceEvent, WorkspacePanel, WorkspaceScope, WorkspaceTab};
 
+/// Workspace-result scope that routes `@` file searches back to the composer.
+const COMPOSER_FILES_SCOPE: &str = "__composer_files";
+
 /// Compatibility fallback when neither the project, current thread nor server
 /// config supplies a model. Prefer server-advertised models above this value.
 fn fallback_model_selection() -> serde_json::Value {
@@ -52,18 +55,14 @@ gpui_kit::actions!(
     ]
 );
 pub fn init(cx: &mut App) {
-    cx.bind_keys([
-        KeyBinding::new("ctrl-n", NewThread, Some("T3App")),
-        KeyBinding::new("ctrl-b", ToggleSidebar, Some("T3App")),
-        KeyBinding::new("ctrl-l", FocusComposer, Some("T3App")),
-        KeyBinding::new("ctrl-j", ToggleWorkspace, Some("T3App")),
-        KeyBinding::new("ctrl-i", ToggleInfo, Some("T3App")),
-        KeyBinding::new("ctrl-,", ShowSettings, Some("T3App")),
-        KeyBinding::new("escape", DismissModal, Some("T3App")),
-    ]);
+    crate::settings::init(cx);
+    // The user can rebind these; see `keymap`.
+    crate::keymap::apply(cx);
 }
 pub struct T3App {
     focus_handle: FocusHandle,
+    /// Whether the light palette is currently applied.
+    light_applied: bool,
     backend: Backend,
     status: Status,
     error: Option<SharedString>,
@@ -114,6 +113,34 @@ impl T3App {
         Self::new_with_backend(backend, events, window, cx)
     }
 
+    /// Re-applies the theme when preferences or (in System mode) the OS
+    /// appearance change, and redraws views that cache their last frame.
+    fn appearance_subscriptions(
+        mut subscriptions: Vec<Subscription>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Vec<Subscription> {
+        subscriptions.push(cx.observe_global::<crate::prefs::Prefs>(|this, cx| {
+            let light = ui::is_light(crate::prefs::Prefs::global(cx).theme, cx.window_appearance());
+            if light != this.light_applied {
+                this.light_applied = light;
+                ui::apply_theme(light, cx);
+            }
+            if let Some(thread) = &this.thread {
+                thread.update(cx, |thread, cx| thread.refresh_appearance(cx));
+            }
+            cx.notify();
+        }));
+        subscriptions.push(window.observe_window_appearance(|window, cx| {
+            let mode = crate::prefs::Prefs::global(cx).theme;
+            if mode == crate::prefs::ThemeMode::System {
+                ui::apply_theme(ui::is_light(mode, window.appearance()), cx);
+                cx.refresh_windows();
+            }
+        }));
+        subscriptions
+    }
+
     fn new_with_backend(
         backend: Backend,
         events: UnboundedReceiver<Event>,
@@ -130,7 +157,7 @@ impl T3App {
         let info = cx.new(|cx| InfoPanel::new(window, cx));
         let script_dialog = cx.new(|cx| ScriptDialog::new(window, cx));
         let directory_picker = cx.new(|cx| DirectoryPicker::new(window, cx));
-        let settings = cx.new(SettingsPage::new);
+        let settings = cx.new(|cx| SettingsPage::new(window, cx));
         let usage = cx.new(UsageView::new);
         cx.on_release(|this, cx| {
             this.capture_current_drafts(cx);
@@ -177,10 +204,27 @@ impl T3App {
                         this.switching_server = true;
                         this.pairing_link.update(cx, |input, cx| input.focus(window, cx));
                     }
-                    SettingsEvent::Theme(light) => {
-                        let light = *light;
-                        ui::apply_theme(light, cx);
-                        crate::prefs::Prefs::update(cx, |prefs| prefs.light_theme = light);
+                    SettingsEvent::UpdateServerSettings { request_id, patch, base } => {
+                        this.backend.send(Command::UpdateSettings {
+                            request_id: *request_id,
+                            patch: patch.clone(),
+                            base: base.clone(),
+                        })
+                    }
+                    SettingsEvent::UpdateKeybindings { request_id, ops } => {
+                        this.backend.send(Command::UpdateKeybindings {
+                            request_id: *request_id,
+                            ops: ops.clone(),
+                        })
+                    }
+                    SettingsEvent::LoadArchived(request_id) => {
+                        this.backend.send(Command::LoadArchived(request_id.clone()))
+                    }
+                    SettingsEvent::ThreadAction { thread_id, action } => {
+                        this.backend.send(Command::ThreadAction {
+                            thread_id: thread_id.clone(),
+                            action: action.clone(),
+                        })
                     }
                     SettingsEvent::ChooseManagedServer => {
                         let paths = cx.prompt_for_paths(PathPromptOptions {
@@ -296,6 +340,7 @@ impl T3App {
 
         Self {
             focus_handle: cx.focus_handle(),
+            light_applied: ui::is_light(crate::prefs::Prefs::global(cx).theme, window.appearance()),
             backend,
             status: Status::Connecting(String::new()),
             error: None,
@@ -330,7 +375,7 @@ impl T3App {
             question_panels: HashMap::new(),
             sending: HashSet::new(),
             _thread_subscription: None,
-            _subscriptions: subscriptions,
+            _subscriptions: Self::appearance_subscriptions(subscriptions, window, cx),
         }
     }
 
@@ -374,7 +419,17 @@ impl T3App {
                 }
             }
             Event::WorkspaceResult { request_id, scope, result } => {
-                if scope.project_id.as_deref() == Some("__directory_picker") {
+                if scope.project_id.as_deref() == Some(COMPOSER_FILES_SCOPE) {
+                    let result = result.and_then(|response| match response {
+                        t3_client::WorkspaceResponse::Entries(directory) => Ok(directory.entries),
+                        _ => Err("Unexpected file search response".into()),
+                    });
+                    if let Some(view) = self.thread.clone().filter(|view| {
+                        scope.thread_id.as_deref() == Some(view.read(cx).thread_id())
+                    }) {
+                        view.update(cx, |view, cx| view.apply_file_results(request_id, result, cx));
+                    }
+                } else if scope.project_id.as_deref() == Some("__directory_picker") {
                     let result = result.and_then(|response| {
                         if let t3_client::WorkspaceResponse::BrowseDirectories(result) = response {
                             Ok(result)
@@ -441,6 +496,7 @@ impl T3App {
                     }
                 });
                 if !connected {
+                    crate::keymap::set_server_keybindings(cx, Vec::new());
                     self.directory_picker.update(cx, |picker, cx| picker.close(cx));
                 }
                 if !connected {
@@ -521,6 +577,8 @@ impl T3App {
                 self.sync_thread_shell(cx);
                 self.sync_info(cx);
                 let shell = self.shell.clone();
+                self.settings
+                    .update(cx, |panel, cx| panel.set_projects(&shell.projects, cx));
                 self.sidebar.update(cx, |sidebar, cx| sidebar.set_shell(shell, cx));
                 // The thread this session's `thread.create` was waiting on
                 // has streamed in: open it now that the sidebar has it too.
@@ -559,7 +617,25 @@ impl T3App {
                 }
             }
             Event::Error(message) => self.error = Some(message.into()),
+            Event::Settings(settings) => {
+                self.settings.update(cx, |panel, cx| panel.set_server_settings(settings, cx));
+            }
+            Event::SettingsSaved { request_id, result } => {
+                self.settings.update(cx, |panel, cx| panel.settings_saved(request_id, result, cx));
+            }
+            Event::KeybindingsSaved { request_id, result } => {
+                if let Ok(rules) = &result {
+                    crate::keymap::set_server_keybindings(cx, rules.clone());
+                }
+                self.settings
+                    .update(cx, |panel, cx| panel.keybindings_saved(request_id, result.map(|_| ()), cx));
+            }
             Event::Config(config) => {
+                crate::keymap::set_server_keybindings(cx, config.keybindings.clone());
+                if let Some(environment) = &config.environment {
+                    let capabilities = environment.capabilities.clone();
+                    self.settings.update(cx, |panel, cx| panel.set_capabilities(capabilities, cx));
+                }
                 self.usage.update(cx, |usage, cx| usage.set_config(config.clone(), cx));
                 self.info.update(cx, |info, cx| {
                     info.set_available_editors(config.available_editors.clone(), cx)
@@ -584,10 +660,16 @@ impl T3App {
                 self.usage.update(cx, |usage, cx| usage.finish_limits(request_id, result, cx));
             }
             Event::Archived { request_id, snapshot } => {
+                self.settings.update(cx, |page, cx| {
+                    page.set_archived(&request_id, snapshot.clone(), cx)
+                });
                 self.sidebar
                     .update(cx, |sidebar, cx| sidebar.set_archived(&request_id, snapshot, cx));
             }
             Event::ThreadActionFinished { thread_id, action, success } => {
+                self.settings.update(cx, |page, cx| {
+                    page.archive_action_finished(&thread_id, &action, success, cx)
+                });
                 self.sidebar.update(cx, |sidebar, cx| {
                     sidebar.action_finished(&thread_id, &action, success, cx)
                 });
@@ -762,6 +844,7 @@ impl T3App {
         });
         self._thread_subscription = Some(cx.subscribe_in(&view, window, Self::on_thread_event));
         self.thread = Some(view);
+        self.sync_thread_shell(cx);
         self.sidebar.update(cx, |sidebar, cx| sidebar.set_open_thread(Some(draft_id), cx));
         self.after_switch(cx);
     }
@@ -841,7 +924,19 @@ impl T3App {
     fn sync_thread_shell(&self, cx: &mut Context<Self>) {
         let Some(thread) = &self.thread else { return };
         let shell = self.shell.thread(thread.read(cx).thread_id()).cloned();
-        thread.update(cx, |view, cx| view.set_shell(shell, cx));
+        let cwd = self.composer_cwd(cx);
+        thread.update(cx, |view, cx| {
+            view.set_cwd(cwd);
+            view.set_shell(shell, cx);
+        });
+    }
+
+    /// The folder the open composer's `@` mentions search: the thread's
+    /// worktree, else its project's root.
+    fn composer_cwd(&self, cx: &App) -> Option<String> {
+        self.open_thread_shell(cx)
+            .and_then(|thread| thread.worktree_path.clone())
+            .or_else(|| self.current_project(cx).map(|project| project.workspace_root.clone()))
     }
 
     fn open_thread(&mut self, thread_id: String, window: &mut Window, cx: &mut Context<Self>) {
@@ -977,6 +1072,28 @@ impl T3App {
                 }
                 return;
             }
+            ThreadViewEvent::SearchFiles { request_id, query } => {
+                let Some(cwd) = self.composer_cwd(cx) else {
+                    view.update(cx, |view, cx| {
+                        view.apply_file_results(*request_id, Err("This thread has no folder.".into()), cx)
+                    });
+                    return;
+                };
+                self.backend.send(Command::Workspace {
+                    request_id: *request_id,
+                    scope: WorkspaceScope {
+                        project_id: Some(COMPOSER_FILES_SCOPE.into()),
+                        thread_id: Some(id),
+                        cwd: Some(cwd.clone()),
+                    },
+                    request: t3_client::WorkspaceRequest::SearchEntries {
+                        cwd,
+                        query: query.clone(),
+                        limit: crate::mentions::FILE_RESULT_LIMIT,
+                    },
+                });
+                return;
+            }
             _ => {}
         }
         if let Some(draft) = view.read(cx).draft_thread().cloned() {
@@ -1045,7 +1162,8 @@ impl T3App {
             ThreadViewEvent::DraftChanged(_)
             | ThreadViewEvent::DraftSettingsChanged(_)
             | ThreadViewEvent::QuestionDraftsChanged(_)
-            | ThreadViewEvent::Attachment(_) => {}
+            | ThreadViewEvent::Attachment(_)
+            | ThreadViewEvent::SearchFiles { .. } => {}
             ThreadViewEvent::Stop => {
                 let turn_id = thread.session.as_ref().and_then(|s| s.active_turn_id.clone());
                 self.backend.send(Command::Interrupt { thread_id: thread.id, turn_id });
@@ -1132,6 +1250,10 @@ impl T3App {
             }
         });
         self.sync_info(cx);
+        if open {
+            // Settings can change from other clients; refresh when viewed.
+            self.backend.send(Command::LoadSettings);
+        }
         if !open {
             if self.status == Status::NeedsPairing || self.switching_server {
                 self.pairing_link.update(cx, |input, cx| input.focus(window, cx));
@@ -1264,6 +1386,7 @@ impl T3App {
 
 impl Render for T3App {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        window.set_rem_size(px(crate::prefs::Prefs::global(cx).font_size_interface as f32));
         let settings_open = self.settings.read(cx).is_open();
         let usage_active = self.usage_open && !settings_open && !self.switching_server;
         let workspace_visible = self.workspace_open && !self.switching_server && !settings_open;
@@ -1747,6 +1870,37 @@ mod recovery_tests {
     use gpui_kit::test::TestWindowExt as _;
 
     #[gpui_kit::test]
+    fn empty_server_keybindings_restore_defaults_after_a_switch(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            init(cx);
+        });
+        let (backend, _commands) = Backend::for_test();
+        let (_events, receiver) = futures::channel::mpsc::unbounded();
+        let (handle, app) = cx.update(|cx| {
+            gpui_kit::open_window(WindowOptions::default(), cx,
+                |window, cx| cx.new(|cx| T3App::new_with_backend(backend, receiver, window, cx))).unwrap()
+        });
+        cx.update_window(handle, |_, window, cx| {
+            let old_config: t3_client::ServerConfig = serde_json::from_value(serde_json::json!({
+                "keybindings": [{ "command": "chat.new", "shortcut": { "key": "k", "modKey": true } }]
+            })).unwrap();
+            app.update(cx, |app, cx| {
+                app.handle_event(Event::Config(old_config.clone()), window, cx);
+                assert!(!crate::keymap::server_keybindings(cx).is_empty());
+                app.handle_event(Event::Config(t3_client::ServerConfig::default()), window, cx);
+                assert!(crate::keymap::server_keybindings(cx).is_empty());
+                let keys = crate::keymap::shortcuts(crate::keymap::Command::NewThread,
+                    &crate::keymap::server_keybindings(cx), crate::prefs::Prefs::global(cx));
+                assert_eq!(keys, ["mod+n", "mod+shift+o"]);
+                app.handle_event(Event::Config(old_config), window, cx);
+                app.handle_event(Event::Status(Status::Connecting("New server".into())), window, cx);
+                assert!(crate::keymap::server_keybindings(cx).is_empty());
+            });
+        }).unwrap();
+    }
+
+    #[gpui_kit::test]
     fn settings_returns_to_empty_usage_and_pairing_views_with_working_shortcuts(cx: &mut TestAppContext) {
         cx.update(|cx| {
             gpui_kit::init(cx);
@@ -1862,7 +2016,7 @@ mod recovery_tests {
             assert_eq!(page.focused(), Some(true));
             window.input("Do not edit the hidden composer", cx);
             assert!(app.read(cx).thread.as_ref().unwrap().read(cx).draft(cx).is_empty());
-            window.click("settings-nav-keyboard", cx);
+            window.click("settings-nav-keybindings", cx);
             window.render_frame(cx);
             assert!(window.find("settings-close").visible());
             window.press("escape", cx);

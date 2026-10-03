@@ -54,6 +54,20 @@ pub enum Command {
         window: t3_client::UsageWindow,
     },
     LoadLimits { request_id: u64 },
+    /// `server.getSettings`; answered with `Event::Settings`.
+    LoadSettings,
+    /// `server.updateSettings`; answered with `Event::SettingsSaved`.
+    UpdateSettings {
+        request_id: u64,
+        patch: Value,
+        base: t3_client::ServerSettings,
+    },
+    /// `server.upsertKeybinding` / `server.removeKeybinding` in order; answered
+    /// with `Event::KeybindingsSaved`.
+    UpdateKeybindings {
+        request_id: u64,
+        ops: Vec<t3_client::KeybindingOp>,
+    },
     ThreadAction {
         thread_id: String,
         action: t3_client::ThreadAction,
@@ -143,6 +157,16 @@ pub enum Event {
     Error(String),
     Config(t3_client::ServerConfig),
     Providers(Vec<t3_client::ServerProvider>),
+    /// The environment's settings, from a load or the config stream.
+    Settings(t3_client::ServerSettings),
+    SettingsSaved {
+        request_id: u64,
+        result: Result<t3_client::ServerSettings, String>,
+    },
+    KeybindingsSaved {
+        request_id: u64,
+        result: Result<Vec<t3_client::ResolvedKeybinding>, String>,
+    },
     LimitsFinished { request_id: u64, result: Result<(), String> },
     Archived {
         request_id: String,
@@ -377,6 +401,9 @@ async fn run(mut commands: mpsc::UnboundedReceiver<Command>, events: Emitter) {
                     }
                     events.emit(Event::Config(config));
                 }
+                if let Ok(settings) = connection.get_settings().await {
+                    events.emit(Event::Settings(settings));
+                }
                 events.emit(Event::Status(Status::Connected(server.clone())));
                 match run_session(
                     &connection,
@@ -440,6 +467,39 @@ enum Offline {
     Elapsed,
 }
 
+enum SettingsRequest {
+    Load,
+    Save { request_id: u64, patch: Value, base: t3_client::ServerSettings },
+}
+
+/// One worker per connection orders reads and writes, and is aborted along
+/// with the session. A refresh before each save rebases whole-entry patches.
+async fn settings_requests(
+    connection: Connection,
+    events: Emitter,
+    mut requests: mpsc::UnboundedReceiver<SettingsRequest>,
+) {
+    while let Some(request) = requests.recv().await {
+        match request {
+            SettingsRequest::Load => match connection.get_settings().await {
+                Ok(settings) => events.emit(Event::Settings(settings)),
+                Err(error) => events.error(format!("Settings unavailable: {}", describe(&error))),
+            },
+            SettingsRequest::Save { request_id, patch, base } => {
+                let result = connection.update_settings_from(&base, patch).await;
+                if let Err(t3_client::settings::SettingsUpdateError::ProviderRemoved { settings, .. }) = &result {
+                    events.emit(Event::Settings(settings.clone()));
+                }
+                let result = result.map_err(|error| match error {
+                    t3_client::settings::SettingsUpdateError::Rpc(error) => describe(&error),
+                    other => other.to_string(),
+                });
+                events.emit(Event::SettingsSaved { request_id, result });
+            }
+        }
+    }
+}
+
 /// Handles commands while there is no connection, until `timeout` (if any).
 async fn wait_offline(
     commands: &mut mpsc::UnboundedReceiver<Command>,
@@ -476,6 +536,9 @@ async fn wait_offline(
                     events.emit(Event::Usage { request_id, result: Err("Reconnect to see usage.".into()) });
                 }
                 Some(Command::LoadLimits { request_id }) => events.emit(Event::LimitsFinished { request_id, result: Err("Reconnect to see limits.".into()) }),
+                Some(Command::LoadSettings) => {}
+                Some(Command::UpdateSettings { request_id, .. }) => events.emit(Event::SettingsSaved { request_id, result: Err("Reconnect to change server settings.".into()) }),
+                Some(Command::UpdateKeybindings { request_id, .. }) => events.emit(Event::KeybindingsSaved { request_id, result: Err("Reconnect to change shared shortcuts.".into()) }),
                 Some(Command::SendMessage { thread, text, attachments }) => {
                     events.error("Cannot send while disconnected. Your draft has been kept.");
                     events.emit(Event::SendFinished { thread_id: thread.id, text, success: false, attachment_ids: attachments.iter().map(|a| a.id.clone()).collect() });
@@ -508,6 +571,8 @@ async fn run_session(
     events: &Emitter,
     open_thread: &mut Option<String>,
 ) -> SessionEnd {
+    let (settings_tx, settings_rx) = mpsc::unbounded_channel();
+    let _settings = TaskGuard(tokio::spawn(settings_requests(connection.clone(), events.clone(), settings_rx)));
     let config_connection = connection.clone();
     let config_events = events.clone();
     let _config = TaskGuard(tokio::spawn(async move {
@@ -523,6 +588,9 @@ async fn run_session(
             .subscribe::<Value>("subscribeServerConfig", serde_json::json!({ "usageLimitSources": true }))
         {
             while let Some(Ok(value)) = updates.next().await {
+                if let Some(settings) = settings_from_config_event(&value) {
+                    config_events.emit(Event::Settings(settings));
+                }
                 if t3_client::quotas::apply_config_event(&mut current, value).unwrap_or(false)
                     && let Some(config) = &current {
                     config_events.emit(Event::Config(config.clone()));
@@ -558,6 +626,19 @@ async fn run_session(
                     operations.spawn(async move {
                         let result = refresh_providers(&connection).await.map(|providers| events.emit(Event::Providers(providers)));
                         events.emit(Event::LimitsFinished { request_id, result });
+                    });
+                }
+                Some(Command::LoadSettings) => {
+                    let _ = settings_tx.send(SettingsRequest::Load);
+                }
+                Some(Command::UpdateSettings { request_id, patch, base }) => {
+                    let _ = settings_tx.send(SettingsRequest::Save { request_id, patch, base });
+                }
+                Some(Command::UpdateKeybindings { request_id, ops }) => {
+                    let connection = connection.clone(); let events = events.clone();
+                    operations.spawn(async move {
+                        let result = connection.apply_keybinding_ops(&ops).await.map_err(|error| describe(&error));
+                        events.emit(Event::KeybindingsSaved { request_id, result });
                     });
                 }
                 Some(Command::OpenAsset(attachment)) => {
@@ -745,6 +826,17 @@ async fn run_session(
     }
 }
 
+/// Settings carried by a `subscribeServerConfig` snapshot or `settingsUpdated`
+/// event; other events carry none.
+fn settings_from_config_event(event: &Value) -> Option<t3_client::ServerSettings> {
+    let settings = match event["type"].as_str()? {
+        "snapshot" => &event["config"]["settings"],
+        "settingsUpdated" => &event["payload"]["settings"],
+        _ => return None,
+    };
+    settings.is_object().then(|| t3_client::ServerSettings::from_value(settings.clone()))
+}
+
 async fn forward_shell(connection: Connection, events: Emitter) -> String {
     let mut stream = match connection.subscribe_shell() {
         Ok(stream) => stream,
@@ -853,6 +945,16 @@ fn clear_credentials() {
 mod tests {
     use super::*;
     use futures::StreamExt as _;
+
+    #[test]
+    fn config_stream_settings_come_from_snapshots_and_settings_updates_only() {
+        let updated = serde_json::json!({ "type": "settingsUpdated", "payload": { "settings": { "defaultRuntimeMode": "auto" } } });
+        assert_eq!(settings_from_config_event(&updated).unwrap().default_runtime_mode(), "auto");
+        let snapshot = serde_json::json!({ "type": "snapshot", "config": { "settings": { "defaultRuntimeMode": "auto" } } });
+        assert!(settings_from_config_event(&snapshot).is_some());
+        assert!(settings_from_config_event(&serde_json::json!({ "type": "snapshot", "config": {} })).is_none());
+        assert!(settings_from_config_event(&serde_json::json!({ "type": "providerStatuses", "payload": {} })).is_none());
+    }
 
     #[tokio::test]
     async fn offline_thread_creation_reports_failure_and_releases_waiter() {

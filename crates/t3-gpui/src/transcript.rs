@@ -35,7 +35,7 @@ use t3_client::{
     Activity, ActivityTone, Message, MessageRole, Session, ThreadState, ThreadStreamItem,
 };
 
-use crate::ui::{self, CONTENT_WIDTH};
+use crate::ui;
 
 pub struct Transcript {
     state: ThreadState,
@@ -264,7 +264,7 @@ impl Render for Transcript {
                     &entity,
                     working_since,
                     cx,
-                ))
+                ), ui::content_width(cx))
                 .when(index == 0, |row| row.pt_2())
                 .into_any_element(),
                 None => div().into_any_element(),
@@ -293,12 +293,12 @@ fn centered(content: impl IntoElement, cx: &App) -> impl IntoElement {
 }
 
 /// Centers a transcript row in the content column.
-fn column(content: impl IntoElement) -> Div {
+fn column(content: impl IntoElement, width: Pixels) -> Div {
     h_flex()
         .w_full()
         .justify_center()
         .px_6()
-        .child(v_flex().w_full().max_w(CONTENT_WIDTH).px_1().py_1().child(content))
+        .child(v_flex().w_full().max_w(width).px_1().py_1().child(content))
 }
 
 fn render_row(
@@ -599,7 +599,7 @@ fn render_activity_group(
                                 .p_2()
                                 .rounded_md()
                                 .bg(theme.secondary)
-                                .text_xs()
+                                .text_size(ui::code_size(cx))
                                 .font_family(theme.mono_font_family.clone())
                                 .child(payload),
                         ),

@@ -5,8 +5,10 @@ mod directory_picker;
 mod drafts;
 mod fonts;
 mod info_panel;
+mod keymap;
 mod limits_view;
 mod managed_server;
+mod mentions;
 mod model_picker;
 mod prefs;
 mod provider_logo;
@@ -36,9 +38,11 @@ fn main() {
             project_picker::init(cx);
             user_input::init(cx);
             model_picker::init(cx);
+            attachments::prune_pasted_images();
             let prefs = prefs::Prefs::load();
-            ui::apply_theme(prefs.light_theme, cx);
+            ui::apply_theme(ui::is_light(prefs.theme, cx.window_appearance()), cx);
             cx.set_global(prefs);
+            keymap::apply(cx);
 
             let bounds = Bounds::centered(None, size(px(1400.), px(900.)), cx);
             let options = WindowOptions {
