@@ -3,6 +3,7 @@
 use futures::StreamExt as _;
 use futures::channel::mpsc::UnboundedReceiver;
 use gpui_kit::assets::IconName;
+use gpui_kit::base::Selectable as _;
 use gpui_kit::component::Disableable as _;
 use gpui_kit::component::alert::Alert;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
@@ -21,6 +22,8 @@ use crate::attachments::{AttachmentPanel, AttachmentPanelEvent};
 use crate::backend::{Backend, Command, Event, Status};
 use crate::directory_picker::{DirectoryPicker, DirectoryPickerEvent};
 use crate::drafts::{DraftStore, DraftThread};
+use crate::info_panel::{INFO_PANEL_WIDTH, InfoPanel, InfoPanelEvent, InfoScope};
+use crate::script_dialog::{ScriptDialog, ScriptDialogEvent};
 use crate::project_picker::{ProjectPicker, ProjectPickerEvent};
 use crate::settings::{SettingsEvent, SettingsPage};
 use crate::sidebar::{Sidebar, SidebarEvent};
@@ -28,7 +31,7 @@ use crate::thread_view::{ThreadView, ThreadViewEvent};
 use crate::ui::{self, SIDEBAR_WIDTH, icon};
 use crate::usage::{UsageEvent, UsageView};
 use crate::user_input::UserInputPanel;
-use crate::workspace::{WorkspaceEvent, WorkspacePanel, WorkspaceScope};
+use crate::workspace::{WorkspaceEvent, WorkspacePanel, WorkspaceScope, WorkspaceTab};
 
 /// Compatibility fallback when neither the project, current thread nor server
 /// config supplies a model. Prefer server-advertised models above this value.
@@ -38,7 +41,15 @@ fn fallback_model_selection() -> serde_json::Value {
 
 gpui_kit::actions!(
     t3_app,
-    [NewThread, ToggleSidebar, FocusComposer, ToggleWorkspace, ShowSettings, DismissModal]
+    [
+        NewThread,
+        ToggleSidebar,
+        FocusComposer,
+        ToggleWorkspace,
+        ToggleInfo,
+        ShowSettings,
+        DismissModal
+    ]
 );
 pub fn init(cx: &mut App) {
     cx.bind_keys([
@@ -46,6 +57,7 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("ctrl-b", ToggleSidebar, Some("T3App")),
         KeyBinding::new("ctrl-l", FocusComposer, Some("T3App")),
         KeyBinding::new("ctrl-j", ToggleWorkspace, Some("T3App")),
+        KeyBinding::new("ctrl-i", ToggleInfo, Some("T3App")),
         KeyBinding::new("ctrl-,", ShowSettings, Some("T3App")),
         KeyBinding::new("escape", DismissModal, Some("T3App")),
     ]);
@@ -81,6 +93,10 @@ pub struct T3App {
     attachment_panels: HashMap<String, Entity<AttachmentPanel>>,
     workspace: Entity<WorkspacePanel>,
     workspace_open: bool,
+    /// The floating Workspace / Version Control card.
+    info: Entity<InfoPanel>,
+    info_open: bool,
+    script_dialog: Entity<ScriptDialog>,
     directory_picker: Entity<DirectoryPicker>,
     settings: Entity<SettingsPage>,
     usage: Entity<UsageView>,
@@ -111,6 +127,8 @@ impl T3App {
         let sidebar = cx.new(|cx| Sidebar::new(window, cx));
         let project_picker = cx.new(|cx| ProjectPicker::new(window, cx));
         let workspace = cx.new(|cx| WorkspacePanel::new(window, cx));
+        let info = cx.new(|cx| InfoPanel::new(window, cx));
+        let script_dialog = cx.new(|cx| ScriptDialog::new(window, cx));
         let directory_picker = cx.new(|cx| DirectoryPicker::new(window, cx));
         let settings = cx.new(SettingsPage::new);
         let usage = cx.new(UsageView::new);
@@ -206,6 +224,15 @@ impl T3App {
                     request: request.clone(),
                 });
             }),
+            cx.subscribe_in(&info, window, |this, _, event: &InfoPanelEvent, window, cx| {
+                this.on_info_event(event, window, cx)
+            }),
+            cx.subscribe(&script_dialog, |this, _, event: &ScriptDialogEvent, cx| {
+                let ScriptDialogEvent::Save { project_id, scripts } = event;
+                this.info.update(cx, |info, cx| {
+                    info.save_scripts(project_id.clone(), scripts.clone(), cx)
+                });
+            }),
             cx.subscribe_in(&pairing_link, window, |this, _, event: &InputEvent, window, cx| {
                 if matches!(event, InputEvent::PressEnter { .. }) {
                     this.pair(window, cx);
@@ -293,6 +320,9 @@ impl T3App {
             attachment_panels: HashMap::new(),
             workspace,
             workspace_open: false,
+            info,
+            info_open: crate::prefs::Prefs::global(cx).info_panel_open,
+            script_dialog,
             directory_picker,
             settings,
             usage,
@@ -360,6 +390,9 @@ impl T3App {
                         .update(cx, |panel, cx| panel.apply_result(request_id, &scope, result, cx));
                 }
             }
+            Event::InfoResult { request_id, result } => {
+                self.info.update(cx, |info, cx| info.apply_result(request_id, result, cx))
+            }
             Event::Terminal { scope, item } => {
                 self.workspace.update(cx, |panel, cx| panel.apply_terminal_event(&scope, item, cx))
             }
@@ -399,6 +432,7 @@ impl T3App {
                 let connected = matches!(status, Status::Connected(_));
                 self.settings.update(cx, |panel, cx| panel.set_connected(connected, cx));
                 self.workspace.update(cx, |panel, cx| panel.set_connected(connected, cx));
+                self.info.update(cx, |info, cx| info.set_connected(connected, cx));
                 let usage_open = self.usage_open;
                 self.usage.update(cx, |usage, cx| {
                     usage.set_connected(connected, cx);
@@ -485,6 +519,7 @@ impl T3App {
                     self.sidebar.update(cx, |sidebar, cx| sidebar.set_open_thread(None, cx));
                 }
                 self.sync_thread_shell(cx);
+                self.sync_info(cx);
                 let shell = self.shell.clone();
                 self.sidebar.update(cx, |sidebar, cx| sidebar.set_shell(shell, cx));
                 // The thread this session's `thread.create` was waiting on
@@ -526,6 +561,9 @@ impl T3App {
             Event::Error(message) => self.error = Some(message.into()),
             Event::Config(config) => {
                 self.usage.update(cx, |usage, cx| usage.set_config(config.clone(), cx));
+                self.info.update(cx, |info, cx| {
+                    info.set_available_editors(config.available_editors.clone(), cx)
+                });
                 self.handle_event(Event::Providers(config.providers), window, cx);
             }
             Event::Providers(providers) => {
@@ -668,6 +706,7 @@ impl T3App {
             model_selection,
             runtime_mode,
             interaction_mode,
+            new_worktree: false,
         };
         if let Some(text) = text {
             self.drafts.insert(draft.id.clone(), text);
@@ -762,6 +801,7 @@ impl T3App {
         if self.workspace_open {
             self.sync_workspace(cx);
         }
+        self.sync_info(cx);
         cx.notify();
     }
 
@@ -891,6 +931,7 @@ impl T3App {
                 }
                 self.capture_current_drafts(cx);
                 self.schedule_draft_save(cx);
+                self.sync_info(cx);
                 return;
             }
             ThreadViewEvent::QuestionDraftsChanged(answers) => {
@@ -941,6 +982,20 @@ impl T3App {
         if let Some(draft) = view.read(cx).draft_thread().cloned() {
             match event {
                 ThreadViewEvent::Send(text, attachments) => {
+                    let worktree_base = if draft.new_worktree {
+                        let root = self.current_project(cx).map(|p| p.workspace_root.clone());
+                        let branch = self.info.read(cx).current_branch().map(str::to_owned);
+                        let (Some(root), Some(branch)) = (root, branch) else {
+                            self.error = Some(
+                                "The checked-out branch is not known yet, so the worktree has no base. Open the info panel (Ctrl+I) to load it, or use the current checkout.".into(),
+                            );
+                            view.update(cx, |view, cx| view.send_finished(text, false, window, cx));
+                            return cx.notify();
+                        };
+                        Some((root, branch))
+                    } else {
+                        None
+                    };
                     self.sending.insert(draft.id.clone());
                     self.pending_new_thread_id = Some(draft.id.clone());
                     self.backend.send(Command::StartThread {
@@ -948,6 +1003,7 @@ impl T3App {
                         draft,
                         text: text.clone(),
                         attachments: attachments.clone(),
+                        worktree_base,
                     });
                 }
                 ThreadViewEvent::OpenAttachment(attachment) => {
@@ -1061,6 +1117,7 @@ impl T3App {
             self.usage.update(cx, |usage, cx| usage.ensure_fresh(cx));
         }
         self.sidebar.update(cx, |sidebar, cx| sidebar.set_usage_open(open, cx));
+        self.sync_info(cx);
         cx.notify();
     }
 
@@ -1074,6 +1131,7 @@ impl T3App {
                 page.focus(window, cx);
             }
         });
+        self.sync_info(cx);
         if !open {
             if self.status == Status::NeedsPairing || self.switching_server {
                 self.pairing_link.update(cx, |input, cx| input.focus(window, cx));
@@ -1119,6 +1177,86 @@ impl T3App {
         self.workspace.update(cx, |panel, cx| panel.set_scope(scope, cx));
     }
 
+    fn toggle_info(&mut self, cx: &mut Context<Self>) {
+        self.info_open = !self.info_open;
+        let open = self.info_open;
+        crate::prefs::Prefs::update(cx, |prefs| prefs.info_panel_open = open);
+        self.sync_info(cx);
+        cx.notify();
+    }
+
+    /// Whether the info card is on screen: toggled on, over an open thread.
+    fn info_visible(&self, cx: &App) -> bool {
+        self.info_open
+            && self.thread.is_some()
+            && !self.usage_open
+            && !self.switching_server
+            && !self.settings.read(cx).is_open()
+    }
+
+    /// Hands the info card the open thread or draft and its project.
+    fn sync_info(&self, cx: &mut Context<Self>) {
+        let visible = self.info_visible(cx);
+        let thread = self.open_thread_shell(cx);
+        let draft = self.thread.as_ref().and_then(|view| view.read(cx).draft_thread().cloned());
+        let project = self.current_project(cx);
+        let scope = InfoScope {
+            project_id: project.map(|p| p.id.clone()),
+            project_title: project.map(|p| p.title.clone()).unwrap_or_default(),
+            project_root: project.map(|p| p.workspace_root.clone()),
+            scripts: project.map(|p| p.scripts.clone()).unwrap_or_default(),
+            thread_id: thread.map(|t| t.id.clone()),
+            draft_new_worktree: draft.map(|d| d.new_worktree),
+            worktree_path: thread.and_then(|t| t.worktree_path.clone()),
+            turn_marker: thread
+                .and_then(|t| t.latest_turn.as_ref())
+                .and_then(|turn| turn.completed_at.clone()),
+        };
+        self.info.update(cx, |info, cx| {
+            info.set_scope(scope, cx);
+            info.set_visible(visible, cx);
+        });
+    }
+
+    fn on_info_event(
+        &mut self,
+        event: &InfoPanelEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match event {
+            InfoPanelEvent::Request { request_id, request } => self
+                .backend
+                .send(Command::Info { request_id: *request_id, request: request.clone() }),
+            InfoPanelEvent::ShowChanges => {
+                self.show_workspace(window, cx);
+                self.workspace.update(cx, |panel, cx| panel.select_tab(WorkspaceTab::Changes, cx));
+            }
+            InfoPanelEvent::RunScript(command) => {
+                self.show_workspace(window, cx);
+                self.workspace.update(cx, |panel, cx| panel.run_command(command.clone(), cx));
+            }
+            InfoPanelEvent::SetDraftWorktree(new_worktree) => {
+                if let Some(thread) = &self.thread {
+                    thread.update(cx, |view, cx| view.set_draft_worktree(*new_worktree, cx));
+                }
+            }
+            InfoPanelEvent::AddScript => {
+                if let Some(project) = self.current_project(cx) {
+                    let (id, scripts) = (project.id.clone(), project.scripts.clone());
+                    self.script_dialog
+                        .update(cx, |dialog, cx| dialog.open(id, scripts, window, cx));
+                }
+            }
+        }
+    }
+
+    fn show_workspace(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.workspace_open {
+            self.toggle_workspace(window, cx);
+        }
+    }
+
     fn open_thread_shell(&self, cx: &App) -> Option<&ThreadShell> {
         self.shell.thread(self.thread.as_ref()?.read(cx).thread_id())
     }
@@ -1128,6 +1266,9 @@ impl Render for T3App {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let settings_open = self.settings.read(cx).is_open();
         let usage_active = self.usage_open && !settings_open && !self.switching_server;
+        let workspace_visible = self.workspace_open && !self.switching_server && !settings_open;
+        let workspace_width = px((f32::from(window.bounds().size.width) * 0.4).clamp(240., 420.));
+        let info_visible = self.info_visible(cx);
         self.usage.update(cx, |usage, _| usage.set_active(usage_active));
         let main = if settings_open {
             self.settings.clone().into_any_element()
@@ -1168,6 +1309,7 @@ impl Render for T3App {
             .on_action(cx.listener(|this, _: &ToggleWorkspace, window, cx| {
                 this.toggle_workspace(window, cx)
             }))
+            .on_action(cx.listener(|this, _: &ToggleInfo, _, cx| this.toggle_info(cx)))
             .on_action(cx.listener(|this, _: &ShowSettings, window, cx| {
                 this.toggle_settings(window, cx)
             }))
@@ -1175,6 +1317,8 @@ impl Render for T3App {
                 if this.settings.read(cx).is_open() {
                     this.set_settings_open(false, window, cx);
                     return;
+                } else if this.script_dialog.read(cx).is_open() {
+                    this.script_dialog.update(cx, |dialog, cx| dialog.close(cx));
                 } else if this.directory_picker.read(cx).is_open() {
                     this.directory_picker.update(cx, |picker, cx| picker.cancel(cx));
                 } else {
@@ -1194,6 +1338,7 @@ impl Render for T3App {
             .child(self.render_title_bar(cx))
             .child(
                 h_flex()
+                    .relative()
                     .flex_1()
                     .min_h_0()
                     .items_stretch()
@@ -1223,23 +1368,38 @@ impl Render for T3App {
                                     .child(main),
                             ),
                     )
-                    .when(self.workspace_open && !self.switching_server && !settings_open, |row| {
+                    .when(workspace_visible, |row| {
                         row.child(
                             div()
-                                .w(px(
-                                    (f32::from(window.bounds().size.width) * 0.4).clamp(240., 420.)
-                                ))
+                                .w(workspace_width)
                                 .flex_shrink_0()
                                 .h_full()
                                 .border_l_1()
                                 .border_color(cx.theme().border)
                                 .child(self.workspace.clone()),
                         )
+                    })
+                    // Floats over the content, left of the workspace panel.
+                    .when(info_visible, |row| {
+                        row.child(
+                            div()
+                                .absolute()
+                                .top_2()
+                                .bottom_2()
+                                .right(if workspace_visible {
+                                    workspace_width + px(8.)
+                                } else {
+                                    px(8.)
+                                })
+                                .w(INFO_PANEL_WIDTH)
+                                .child(self.info.clone()),
+                        )
                     }),
             )
             // Painted last so it stacks above the sidebar and main column.
             .child(self.project_picker.clone())
             .child(self.directory_picker.clone())
+            .child(self.script_dialog.clone())
     }
 }
 
@@ -1318,10 +1478,23 @@ impl T3App {
             .h_full()
             .flex_shrink_0()
             .child(
+                Button::new("info")
+                    .ghost()
+                    .small()
+                    .icon(icon(IconName::TextAlignStart))
+                    .selected(self.info_open)
+                    .accessibility_label("Workspace info")
+                    .tooltip("Workspace and version control (Ctrl+I)")
+                    .occlude()
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .on_click(cx.listener(|this, _, _, cx| this.toggle_info(cx))),
+            )
+            .child(
                 Button::new("workspace")
                     .ghost()
                     .small()
-                    .icon(icon(IconName::Folder))
+                    .icon(icon(IconName::PanelRight))
+                    .selected(self.workspace_open)
                     .accessibility_label("Workspace")
                     .tooltip("Files, changes and terminal (Ctrl+J)")
                     .occlude()

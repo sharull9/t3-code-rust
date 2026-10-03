@@ -27,6 +27,29 @@ pub struct ProjectShell {
     /// client neither lists providers nor edits the selection itself.
     #[serde(default)]
     pub default_model_selection: Option<Value>,
+    /// Project actions (`ProjectScript`), run from the info panel and
+    /// optionally on worktree creation.
+    #[serde(default)]
+    pub scripts: Vec<ProjectScript>,
+}
+
+/// One project action (see `orchestration.ts`'s `ProjectScript`). Written
+/// back whole through `project.meta.update`, so every field round-trips.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectScript {
+    pub id: String,
+    pub name: String,
+    pub command: String,
+    /// `play`, `test`, `lint`, `configure`, `build` or `debug`.
+    pub icon: String,
+    pub run_on_worktree_create: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub r#async: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preview_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_open_preview: Option<bool>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -120,6 +143,9 @@ pub struct ServerConfig {
     pub providers: Vec<ServerProvider>,
     #[serde(default)]
     pub usage_limit_sources: Vec<crate::quotas::LimitSource>,
+    /// Editor IDs (`editor.ts`'s `EditorId`) installed on the server machine.
+    #[serde(default)]
+    pub available_editors: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

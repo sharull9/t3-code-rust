@@ -238,7 +238,9 @@ impl Connection {
     }
 
     /// `thread.create` (see `orchestration.ts`'s `ThreadCreateCommand`).
-    /// Carries the selected model and modes, with no branch/worktree.
+    /// Carries the selected model and modes; `worktree` is `(branch, path)`
+    /// for a thread that runs in its own worktree, `None` for the checkout.
+    #[allow(clippy::too_many_arguments)]
     pub async fn create_thread(
         &self,
         thread_id: &str,
@@ -247,6 +249,7 @@ impl Connection {
         model_selection: Value,
         runtime_mode: &str,
         interaction_mode: &str,
+        worktree: Option<(&str, &str)>,
     ) -> Result<Value, RpcError> {
         self.dispatch(json!({
             "type": "thread.create",
@@ -257,11 +260,39 @@ impl Connection {
             "modelSelection": model_selection,
             "runtimeMode": runtime_mode,
             "interactionMode": interaction_mode,
-            "branch": null,
-            "worktreePath": null,
+            "branch": worktree.map(|(branch, _)| branch),
+            "worktreePath": worktree.map(|(_, path)| path),
             "createdAt": now_iso(),
         }))
         .await
+    }
+
+    /// `vcs.createWorktree`: a new branch `new_ref_name` off `base_ref_name`,
+    /// checked out at a server-chosen path. Returns `(branch, path)`.
+    pub async fn create_worktree(
+        &self,
+        cwd: &str,
+        base_ref_name: &str,
+        new_ref_name: &str,
+    ) -> Result<(String, String), RpcError> {
+        let value: Value = self
+            .rpc()
+            .call(
+                "vcs.createWorktree",
+                json!({
+                    "cwd": cwd,
+                    "refName": base_ref_name,
+                    "newRefName": new_ref_name,
+                    "baseRefName": base_ref_name,
+                    "path": null,
+                }),
+            )
+            .await?;
+        let worktree = &value["worktree"];
+        match (worktree["refName"].as_str(), worktree["path"].as_str()) {
+            (Some(branch), Some(path)) => Ok((branch.to_owned(), path.to_owned())),
+            _ => Err(RpcError::Decode(format!("unexpected worktree result: {value}"))),
+        }
     }
 }
 

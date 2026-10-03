@@ -47,6 +47,14 @@ pub struct WorkspaceGitStatus {
     pub has_working_tree_changes: bool,
     pub ref_name: Option<String>,
     pub working_tree: WorkspaceWorkingTree,
+    #[serde(default)]
+    pub is_default_ref: bool,
+    #[serde(default)]
+    pub has_upstream: bool,
+    #[serde(default)]
+    pub ahead_count: u32,
+    #[serde(default)]
+    pub behind_count: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -192,6 +200,35 @@ pub struct WorkspaceBrowseEntry {
     pub full_path: String,
 }
 
+/// `git.runStackedAction`'s `GitStackedAction`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GitAction {
+    Commit,
+    Push,
+    CreatePr,
+    CommitPush,
+}
+
+impl GitAction {
+    pub fn wire(self) -> &'static str {
+        match self {
+            Self::Commit => "commit",
+            Self::Push => "push",
+            Self::CreatePr => "create_pr",
+            Self::CommitPush => "commit_push",
+        }
+    }
+}
+
+/// What a finished git action reports: the server's toast text and, for a
+/// created pull request, its URL.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GitActionOutcome {
+    pub title: String,
+    pub description: Option<String>,
+    pub pr_url: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WorkspaceRequest {
     ListDirectory { cwd: String, directory_path: Option<String> },
@@ -206,6 +243,12 @@ pub enum WorkspaceRequest {
     RestartTerminal { thread_id: String, terminal_id: String, cwd: String },
     WriteTerminal { thread_id: String, terminal_id: String, data: String },
     CloseTerminal { thread_id: String, terminal_id: Option<String> },
+    OpenInEditor { cwd: String, editor: String },
+    /// Runs to completion: the RPC streams progress and ends with
+    /// `action_finished` or `action_failed`.
+    RunGitAction { cwd: String, action: GitAction, thread_id: Option<String> },
+    /// Replaces the project's whole action list (`project.meta.update`).
+    SetProjectScripts { project_id: String, scripts: Vec<crate::ProjectScript> },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -217,6 +260,7 @@ pub enum WorkspaceResponse {
     DiffPreview(WorkspaceDiffPreview),
     BrowseDirectories(WorkspaceBrowseResult),
     Terminal(WorkspaceTerminal),
+    GitAction(GitActionOutcome),
     Ack,
 }
 
@@ -225,6 +269,27 @@ impl WorkspaceRequest {
     /// decoded here so UI and backend code can stay independent of JSON details.
     pub async fn execute(&self, connection: &Connection) -> Result<WorkspaceResponse, RpcError> {
         let (method, payload, response) = match self {
+            Self::RunGitAction { cwd, action, thread_id } => {
+                return run_git_action(connection, cwd, *action, thread_id.as_deref())
+                    .await
+                    .map(WorkspaceResponse::GitAction);
+            }
+            Self::SetProjectScripts { project_id, scripts } => {
+                connection
+                    .dispatch(json!({
+                        "type": "project.meta.update",
+                        "commandId": crate::new_id(),
+                        "projectId": project_id,
+                        "scripts": scripts,
+                    }))
+                    .await?;
+                return Ok(WorkspaceResponse::Ack);
+            }
+            Self::OpenInEditor { cwd, editor } => (
+                "shell.openInEditor",
+                json!({ "cwd": cwd, "editor": editor }),
+                ResponseKind::Ack,
+            ),
             Self::ListDirectory { cwd, directory_path } => (
                 "projects.listEntries",
                 list_directory_payload(cwd, directory_path.as_deref()),
@@ -295,6 +360,46 @@ impl WorkspaceRequest {
             ResponseKind::Terminal => decode(value).map(WorkspaceResponse::Terminal),
             ResponseKind::Ack => Ok(WorkspaceResponse::Ack),
         }
+    }
+}
+
+async fn run_git_action(
+    connection: &Connection,
+    cwd: &str,
+    action: GitAction,
+    thread_id: Option<&str>,
+) -> Result<GitActionOutcome, RpcError> {
+    let mut payload =
+        json!({ "actionId": crate::new_id(), "cwd": cwd, "action": action.wire() });
+    if let Some(thread_id) = thread_id {
+        payload["threadId"] = json!(thread_id);
+    }
+    let mut progress = connection.rpc().subscribe::<Value>("git.runStackedAction", payload)?;
+    while let Some(event) = progress.next().await {
+        if let Some(outcome) = git_action_outcome(event?)? {
+            return Ok(outcome);
+        }
+    }
+    Err(RpcError::Decode("git action ended without a result".into()))
+}
+
+/// `Some` once a progress event finishes the action; failures become errors.
+fn git_action_outcome(event: Value) -> Result<Option<GitActionOutcome>, RpcError> {
+    match event["kind"].as_str() {
+        Some("action_finished") => {
+            let result = &event["result"];
+            let text = |value: &Value| value.as_str().map(str::to_owned);
+            Ok(Some(GitActionOutcome {
+                title: text(&result["toast"]["title"]).unwrap_or_else(|| "Done".into()),
+                description: text(&result["toast"]["description"]),
+                pr_url: text(&result["pr"]["url"]),
+            }))
+        }
+        Some("action_failed") => Err(RpcError::Failure(json!({
+            "_tag": "GitActionFailed",
+            "message": event["message"].as_str().unwrap_or("Git action failed"),
+        }))),
+        _ => Ok(None),
     }
 }
 
@@ -386,6 +491,26 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(diff.sources[0].diff, "--- a/src/main.rs\n+++ b/src/main.rs\n");
+    }
+
+    #[test]
+    fn git_action_stream_ends_on_finish_or_failure() {
+        assert_eq!(git_action_outcome(json!({ "kind": "phase_started", "phase": "commit" })).unwrap(), None);
+        let finished = git_action_outcome(json!({
+            "kind": "action_finished",
+            "result": {
+                "toast": { "title": "Pushed main", "cta": { "kind": "none" } },
+                "pr": { "status": "created", "url": "https://github.com/o/r/pull/1" }
+            }
+        }))
+        .unwrap()
+        .unwrap();
+        assert_eq!(finished.title, "Pushed main");
+        assert_eq!(finished.pr_url.as_deref(), Some("https://github.com/o/r/pull/1"));
+        assert!(matches!(
+            git_action_outcome(json!({ "kind": "action_failed", "message": "nothing to commit" })),
+            Err(RpcError::Failure(value)) if value["message"] == "nothing to commit"
+        ));
     }
 
     #[test]

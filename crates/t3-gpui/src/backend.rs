@@ -41,6 +41,11 @@ pub enum Command {
         scope: crate::workspace::WorkspaceScope,
         request: t3_client::WorkspaceRequest,
     },
+    /// A request from the info panel, answered by `Event::InfoResult`.
+    Info {
+        request_id: u64,
+        request: t3_client::WorkspaceRequest,
+    },
     OpenThread(String),
     CloseThread,
     LoadArchived(String),
@@ -79,6 +84,9 @@ pub enum Command {
         title: String,
         text: String,
         attachments: Vec<t3_client::attachments::UploadedAttachment>,
+        /// `(project root, base branch)` when `draft.new_worktree` is set:
+        /// the worktree is branched from there before the thread is created.
+        worktree_base: Option<(String, String)>,
     },
 }
 
@@ -115,6 +123,10 @@ pub enum Event {
     WorkspaceResult {
         request_id: u64,
         scope: crate::workspace::WorkspaceScope,
+        result: Result<t3_client::WorkspaceResponse, String>,
+    },
+    InfoResult {
+        request_id: u64,
         result: Result<t3_client::WorkspaceResponse, String>,
     },
     PairFinished(bool),
@@ -453,6 +465,7 @@ async fn wait_offline(
                 Some(Command::SaveDrafts(store)) => save_drafts(store, &events).await,
                 Some(Command::UploadAttachment { thread_id, request_id, attachment }) => events.emit(Event::AttachmentUploaded { thread_id, local_id: attachment.id, request_id, result: Err("Reconnect to upload this attachment.".into()) }),
                 Some(Command::Workspace { request_id, scope, .. }) => events.emit(Event::WorkspaceResult { request_id, scope, result: Err("Reconnect to use the workspace.".into()) }),
+                Some(Command::Info { request_id, .. }) => events.emit(Event::InfoResult { request_id, result: Err("Reconnect to use the workspace.".into()) }),
                 Some(Command::OpenThread(thread_id)) => *open_thread = Some(thread_id),
                 Some(Command::CloseThread) => *open_thread = None,
                 Some(Command::LoadArchived(request_id)) => {
@@ -600,6 +613,10 @@ async fn run_session(
                         operations.spawn(async move { let result = request.execute(&connection).await.map_err(|e| describe(&e)); events.emit(Event::WorkspaceResult { request_id, scope, result }); });
                     }
                 }
+                Some(Command::Info { request_id, request }) => {
+                    let connection = connection.clone(); let events = events.clone();
+                    operations.spawn(async move { let result = request.execute(&connection).await.map_err(|e| describe(&e)); events.emit(Event::InfoResult { request_id, result }); });
+                }
                 Some(Command::OpenThread(thread_id)) => {
                     terminals.clear();
                     *open_thread = Some(thread_id.clone());
@@ -676,13 +693,26 @@ async fn run_session(
                         }
                     });
                 }
-                Some(Command::StartThread { draft, title, text, attachments }) => {
+                Some(Command::StartThread { draft, title, text, attachments, worktree_base }) => {
                     let connection = connection.clone();
                     let events = events.clone();
                     operations.spawn(async move {
                         let attachment_ids = attachments.iter().map(|a| a.id.clone()).collect();
+                        let worktree = match &worktree_base {
+                            // Branch name like the web app's: `t3code/<id prefix>`.
+                            Some((cwd, base)) => match connection.create_worktree(cwd, base, &format!("t3code/{}", &draft.id[..8.min(draft.id.len())])).await {
+                                Ok(worktree) => Some(worktree),
+                                Err(error) => {
+                                    events.error(format!("New worktree failed: {}", describe(&error)));
+                                    events.emit(Event::NewThreadFinished { thread_id: draft.id.clone(), success: false });
+                                    events.emit(Event::SendFinished { thread_id: draft.id, text, success: false, attachment_ids });
+                                    return;
+                                }
+                            },
+                            None => None,
+                        };
                         let created = connection
-                            .create_thread(&draft.id, &draft.project_id, &title, draft.model_selection.clone(), &draft.runtime_mode, &draft.interaction_mode)
+                            .create_thread(&draft.id, &draft.project_id, &title, draft.model_selection.clone(), &draft.runtime_mode, &draft.interaction_mode, worktree.as_ref().map(|(branch, path)| (branch.as_str(), path.as_str())))
                             .await;
                         if let Err(error) = created {
                             events.error(format!("New thread failed: {}", describe(&error)));
@@ -836,10 +866,12 @@ mod tests {
                     model_selection: serde_json::json!({}),
                     runtime_mode: "full-access".into(),
                     interaction_mode: "default".into(),
+                    new_worktree: false,
                 },
                 title: "Fix the build".into(),
                 text: "Fix the build".into(),
                 attachments: Vec::new(),
+                worktree_base: None,
             })
             .unwrap();
         drop(commands);

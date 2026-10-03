@@ -302,6 +302,17 @@ impl ThreadView {
         }
     }
 
+    /// Chooses whether a draft starts in a new worktree (see `DraftThread`).
+    pub fn set_draft_worktree(&mut self, new_worktree: bool, cx: &mut Context<Self>) {
+        if let Some((draft, _)) = &mut self.draft
+            && draft.new_worktree != new_worktree
+        {
+            draft.new_worktree = new_worktree;
+            cx.emit(ThreadViewEvent::DraftSettingsChanged(draft.clone()));
+            cx.notify();
+        }
+    }
+
     fn update_setting(&mut self, action: t3_client::ThreadAction, cx: &mut Context<Self>) {
         if let Some((draft, _)) = &mut self.draft {
             match action {

@@ -43,6 +43,9 @@ pub struct DraftThread {
     pub model_selection: serde_json::Value,
     pub runtime_mode: String,
     pub interaction_mode: String,
+    /// Start the thread in a new worktree instead of the project checkout.
+    #[serde(default)]
+    pub new_worktree: bool,
 }
 
 pub fn default_path() -> Option<PathBuf> {
@@ -193,6 +196,7 @@ mod tests {
             model_selection: serde_json::json!({ "instanceId": "codex", "model": "gpt" }),
             runtime_mode: "full-access".into(),
             interaction_mode: "default".into(),
+            new_worktree: false,
         });
         store.save(&path).unwrap();
         store

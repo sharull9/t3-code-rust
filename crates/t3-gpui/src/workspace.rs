@@ -92,6 +92,8 @@ pub struct WorkspacePanel {
     terminal_input: Entity<InputState>,
     terminal_open: bool,
     terminal_wanted: bool,
+    /// A project action's command, written once the terminal is open.
+    queued_command: Option<String>,
     /// The branch list shows a few local branches until expanded.
     show_all_refs: bool,
     connected: bool,
@@ -135,6 +137,7 @@ impl WorkspacePanel {
             terminal_input,
             terminal_open: false,
             terminal_wanted: false,
+            queued_command: None,
             show_all_refs: false,
             connected: false,
             error: None,
@@ -163,6 +166,7 @@ impl WorkspacePanel {
         self.terminal_history.clear();
         self.terminal_open = false;
         self.terminal_wanted = false;
+        self.queued_command = None;
         self.error = None;
         if let Some(cwd) = self.scope.cwd.clone() {
             self.request(
@@ -214,6 +218,34 @@ impl WorkspacePanel {
         cx.notify();
     }
 
+    /// Runs `command` in this thread's terminal, opening it first if needed.
+    pub fn run_command(&mut self, command: String, cx: &mut Context<Self>) {
+        self.queued_command = Some(command);
+        self.select_tab(WorkspaceTab::Terminal, cx);
+        self.flush_queued_command(cx);
+    }
+
+    fn flush_queued_command(&mut self, cx: &mut Context<Self>) {
+        if !self.terminal_open {
+            return;
+        }
+        let (Some(command), Some(thread_id)) =
+            (self.queued_command.take(), self.scope.thread_id.clone())
+        else {
+            return;
+        };
+        self.request(
+            WorkspaceRequest::WriteTerminal {
+                thread_id,
+                terminal_id: self.terminal_id.clone(),
+                data: format!("{command}
+"),
+            },
+            RequestSlot::TerminalWrite,
+            cx,
+        );
+    }
+
     pub fn apply_result(
         &mut self,
         request_id: u64,
@@ -261,6 +293,7 @@ impl WorkspacePanel {
                 self.set_terminal_history(&terminal.history);
                 self.terminal_open = true;
                 self.tab = WorkspaceTab::Terminal;
+                self.flush_queued_command(cx);
             }
             Ok(WorkspaceResponse::Ack) if pending.slot == RequestSlot::TerminalClose => {
                 self.terminal_open = false;

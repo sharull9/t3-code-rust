@@ -12,6 +12,10 @@ pub struct Prefs {
     /// `"<instanceId>/<model>"` keys, in the order they were starred.
     pub favorite_models: Vec<String>,
     pub light_theme: bool,
+    /// Editor ID (`EditorId`) the info panel's "Open in" button launches.
+    pub preferred_editor: Option<String>,
+    /// Whether the info panel was showing when the app last closed.
+    pub info_panel_open: bool,
 }
 
 impl Global for Prefs {}
@@ -65,4 +69,9 @@ impl Prefs {
     }
 }
 
-static EMPTY: Prefs = Prefs { favorite_models: Vec::new(), light_theme: false };
+static EMPTY: Prefs = Prefs {
+    favorite_models: Vec::new(),
+    light_theme: false,
+    preferred_editor: None,
+    info_panel_open: false,
+};
