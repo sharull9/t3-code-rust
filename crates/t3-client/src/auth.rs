@@ -15,6 +15,8 @@ use crate::Error;
 const GRANT_TYPE_TOKEN_EXCHANGE: &str = "urn:ietf:params:oauth:grant-type:token-exchange";
 const TOKEN_TYPE_BOOTSTRAP: &str = "urn:t3:params:oauth:token-type:environment-bootstrap";
 const TOKEN_TYPE_ACCESS: &str = "urn:ietf:params:oauth:token-type:access_token";
+// Matches packages/contracts/src/environment.ts in T3 Code.
+const ORCHESTRATION_PROTOCOL_VERSION: &str = "2";
 
 /// A parsed pairing link.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -173,11 +175,17 @@ pub async fn websocket_url(
         .await?;
     let WebSocketTicketResult { ticket } = read_json(response).await?;
 
-    let mut url = credentials.base_url.join("/ws")?;
+    websocket_url_with_ticket(&credentials.base_url, &ticket)
+}
+
+fn websocket_url_with_ticket(base_url: &Url, ticket: &str) -> Result<Url, Error> {
+    let mut url = base_url.join("/ws")?;
     let scheme = if url.scheme() == "https" { "wss" } else { "ws" };
     url.set_scheme(scheme)
         .map_err(|()| Error::InvalidPairingLink("cannot build websocket url".into()))?;
-    url.query_pairs_mut().append_pair("wsTicket", &ticket);
+    url.query_pairs_mut()
+        .append_pair("wsTicket", ticket)
+        .append_pair("orchestrationProtocol", ORCHESTRATION_PROTOCOL_VERSION);
     Ok(url)
 }
 
@@ -198,6 +206,23 @@ async fn read_json<T: serde::de::DeserializeOwned>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn websocket_handshake_declares_v2_and_preserves_ticket() {
+        for (base, scheme) in
+            [("http://localhost:3773/", "ws"), ("https://box.tail.ts.net:4000/", "wss")]
+        {
+            let base = Url::parse(base).unwrap();
+            let url = websocket_url_with_ticket(&base, "ticket+with/special?characters&").unwrap();
+            assert_eq!(url.scheme(), scheme);
+            assert_eq!(url.host_str(), base.host_str());
+            assert_eq!(url.port(), base.port());
+            assert_eq!(url.path(), "/ws");
+            let query: std::collections::HashMap<_, _> = url.query_pairs().collect();
+            assert_eq!(query.get("wsTicket").unwrap(), "ticket+with/special?characters&");
+            assert_eq!(query.get("orchestrationProtocol").unwrap(), "2");
+        }
+    }
 
     #[test]
     fn parses_fragment_pairing_link() {

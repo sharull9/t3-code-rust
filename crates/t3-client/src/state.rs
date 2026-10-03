@@ -115,6 +115,12 @@ impl ThreadState {
 
 fn apply_event(thread: &mut ThreadDetail, event: OrchestrationEvent) {
     match event.event_type.as_str() {
+        "message.updated" => {
+            // V2 updates carry the complete message, including while streaming.
+            if let Ok(message) = serde_json::from_value::<Message>(event.payload) {
+                upsert(&mut thread.messages, message, |message| &message.id);
+            }
+        }
         "thread.message-sent" => {
             let Ok(payload) = serde_json::from_value::<MessageSentPayload>(event.payload) else {
                 return;
@@ -156,7 +162,7 @@ fn apply_event(thread: &mut ThreadDetail, event: OrchestrationEvent) {
                 thread.session = Some(payload.session);
             }
         }
-        "thread.meta-updated" => {
+        "thread.meta-updated" | "thread.metadata-updated" => {
             if let Some(title) = event.payload.get("title").and_then(|v| v.as_str()) {
                 thread.title = title.to_owned();
             }
@@ -188,6 +194,60 @@ fn upsert<T>(items: &mut Vec<T>, item: T, key: impl Fn(&T) -> &String) {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn v2_snapshot_and_full_message_updates_synchronize_without_duplicate_text() {
+        let message = json!({
+            "id": "m1", "role": "assistant", "text": "Hel", "runId": "run1",
+            "streaming": true, "attachments": [],
+            "createdAt": "2026-10-03T00:00:00Z", "updatedAt": "2026-10-03T00:00:00Z"
+        });
+        let mut state = ThreadState::default();
+        state.apply(
+            serde_json::from_value(json!({
+                "kind": "snapshot", "snapshotSequence": 10,
+                "projection": {
+                    "thread": { "id": "t1", "projectId": "p1", "title": "V2 thread" },
+                    "messages": [message.clone()]
+                }
+            }))
+            .unwrap(),
+        );
+        let mut completed = message;
+        completed["text"] = json!("Hello");
+        completed["streaming"] = json!(false);
+        let event = json!({
+            "kind": "event", "sequence": 11,
+            "event": { "type": "message.updated", "threadId": "t1", "payload": completed }
+        });
+        state.apply(serde_json::from_value(event.clone()).unwrap());
+        state.apply(serde_json::from_value(event).unwrap());
+        state.apply(ThreadStreamItem::Synchronized);
+        assert!(state.synchronized);
+        assert_eq!(state.sequence, 11);
+        let thread = state.thread.unwrap();
+        assert_eq!(thread.messages.len(), 1);
+        assert_eq!(thread.messages[0].text, "Hello");
+        assert_eq!(thread.messages[0].turn_id.as_deref(), Some("run1"));
+        assert!(!thread.messages[0].streaming);
+    }
+
+    #[test]
+    fn v2_shell_updates_add_and_remove_threads() {
+        let mut state = ShellState::default();
+        state.apply(serde_json::from_value(json!({
+            "kind": "thread.updated", "sequence": 1, "location": "active",
+            "thread": { "id": "t1", "projectId": "p1", "title": "V2", "runtimeMode": "full-access" }
+        })).unwrap());
+        assert_eq!(state.threads.len(), 1);
+        state.apply(
+            serde_json::from_value(json!({
+                "kind": "thread.removed", "sequence": 2, "location": "active", "threadId": "t1"
+            }))
+            .unwrap(),
+        );
+        assert!(state.threads.is_empty());
+    }
 
     fn thread_state() -> ThreadState {
         let mut state = ThreadState::default();

@@ -214,7 +214,8 @@ impl ServerProvider {
 }
 
 fn same_path(a: &str, b: &str) -> bool {
-    let normalize = |path: &str| path.trim_end_matches(['/', '\\']).replace('\\', "/").to_lowercase();
+    let normalize =
+        |path: &str| path.trim_end_matches(['/', '\\']).replace('\\', "/").to_lowercase();
     normalize(a) == normalize(b)
 }
 
@@ -255,9 +256,9 @@ impl ProviderSkill {
             .filter(|word| !word.is_empty())
             .map(|word| {
                 let mut chars = word.chars();
-                chars.next().map_or_else(String::new, |first| {
-                    first.to_uppercase().chain(chars).collect()
-                })
+                chars
+                    .next()
+                    .map_or_else(String::new, |first| first.to_uppercase().chain(chars).collect())
             })
             .collect::<Vec<_>>()
             .join(" ")
@@ -353,11 +354,29 @@ pub struct ShellSnapshot {
 #[serde(tag = "kind", rename_all = "kebab-case", rename_all_fields = "camelCase")]
 pub enum ShellStreamItem {
     Synchronized,
-    Snapshot { snapshot: ShellSnapshot },
-    ProjectUpserted { sequence: u64, project: ProjectShell },
-    ProjectRemoved { sequence: u64, project_id: String },
-    ThreadUpserted { sequence: u64, thread: ThreadShell },
-    ThreadRemoved { sequence: u64, thread_id: String },
+    Snapshot {
+        snapshot: ShellSnapshot,
+    },
+    #[serde(alias = "project.updated")]
+    ProjectUpserted {
+        sequence: u64,
+        project: ProjectShell,
+    },
+    #[serde(alias = "project.removed")]
+    ProjectRemoved {
+        sequence: u64,
+        project_id: String,
+    },
+    #[serde(alias = "thread.updated")]
+    ThreadUpserted {
+        sequence: u64,
+        thread: ThreadShell,
+    },
+    #[serde(alias = "thread.removed")]
+    ThreadRemoved {
+        sequence: u64,
+        thread_id: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -379,7 +398,7 @@ pub struct Message {
     pub attachments: Vec<crate::attachments::UploadedAttachment>,
     pub role: MessageRole,
     pub text: String,
-    #[serde(default)]
+    #[serde(default, alias = "runId")]
     pub turn_id: Option<String>,
     pub streaming: bool,
     pub created_at: String,
@@ -425,6 +444,7 @@ pub struct ThreadDetail {
     pub title: String,
     #[serde(default)]
     pub branch: Option<String>,
+    #[serde(default)]
     pub messages: Vec<Message>,
     /// Tool calls and other non-message activity, interleaved into the
     /// transcript by `created_at`. Optional on the wire so snapshots from
@@ -449,16 +469,53 @@ pub struct OrchestrationEvent {
     pub sequence: u64,
     #[serde(rename = "type")]
     pub event_type: String,
+    #[serde(alias = "threadId")]
     pub aggregate_id: String,
     pub payload: Value,
 }
 
-#[derive(Debug, Clone, Deserialize)]
-#[serde(tag = "kind", rename_all = "kebab-case")]
+#[derive(Debug, Clone)]
 pub enum ThreadStreamItem {
     Synchronized,
     Snapshot { snapshot: ThreadDetailSnapshot },
     Event { event: OrchestrationEvent },
+}
+
+impl<'de> Deserialize<'de> for ThreadStreamItem {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        use serde::de::Error;
+        let mut value = Value::deserialize(deserializer)?;
+        match value.get("kind").and_then(Value::as_str) {
+            Some("synchronized") => Ok(Self::Synchronized),
+            Some("snapshot") => {
+                if let Some(projection) = value.get("projection") {
+                    // V2 puts the sequence and projection directly on the frame.
+                    let mut thread = projection["thread"].clone();
+                    thread["messages"] = projection["messages"].clone();
+                    let snapshot = serde_json::from_value(serde_json::json!({
+                        "snapshotSequence": value["snapshotSequence"],
+                        "thread": thread,
+                    }))
+                    .map_err(D::Error::custom)?;
+                    Ok(Self::Snapshot { snapshot })
+                } else {
+                    let snapshot = serde_json::from_value(value["snapshot"].take())
+                        .map_err(D::Error::custom)?;
+                    Ok(Self::Snapshot { snapshot })
+                }
+            }
+            Some("event") => {
+                // V1 stores the sequence on the event; V2 stores it on the frame.
+                if let Some(sequence) = value.get("sequence").cloned() {
+                    value["event"]["sequence"] = sequence;
+                }
+                let event =
+                    serde_json::from_value(value["event"].take()).map_err(D::Error::custom)?;
+                Ok(Self::Event { event })
+            }
+            _ => Err(D::Error::custom("unknown thread stream item kind")),
+        }
+    }
 }
 
 /// Payload of `thread.message-sent`.

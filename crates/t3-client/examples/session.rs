@@ -2,7 +2,7 @@
 //! project names or message text.
 //! cargo run -p t3-client --example session -- <credentials.json> [workspace-root]
 use std::time::Duration;
-use t3_client::{Connection, Credentials, ShellState};
+use t3_client::{Connection, Credentials, ShellState, ThreadState};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -51,6 +51,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             archived.projects.len(),
             archived.threads.len()
         );
+        let archived_thread = archived.threads.first().map(|thread| thread.id.clone());
         let mut shell = ShellState::default();
         let mut stream = connection.subscribe_shell()?;
         while let Some(item) = stream.next().await {
@@ -61,6 +62,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     shell.projects.len(),
                     shell.threads.len()
                 );
+                if let Some(thread_id) =
+                    shell.threads.first().map(|thread| thread.id.clone()).or(archived_thread)
+                {
+                    let mut detail = ThreadState::default();
+                    let mut thread_stream = connection.subscribe_thread(&thread_id, Some(1))?;
+                    while let Some(item) = thread_stream.next().await {
+                        detail.apply(item?);
+                        if detail.synchronized {
+                            let thread =
+                                detail.thread.ok_or("thread synchronized without snapshot")?;
+                            println!("thread synchronized: {} messages", thread.messages.len());
+                            return Ok::<(), Box<dyn std::error::Error>>(());
+                        }
+                    }
+                    return Err("thread stream ended before synchronization".into());
+                }
                 return Ok::<(), Box<dyn std::error::Error>>(());
             }
         }
