@@ -6,6 +6,7 @@ mod drafts;
 mod fonts;
 mod limits_view;
 mod managed_server;
+mod mentions;
 mod model_picker;
 mod prefs;
 mod provider_logo;
@@ -34,6 +35,7 @@ fn main() {
             project_picker::init(cx);
             user_input::init(cx);
             model_picker::init(cx);
+            attachments::prune_pasted_images();
             let prefs = prefs::Prefs::load();
             ui::apply_theme(prefs.light_theme, cx);
             cx.set_global(prefs);

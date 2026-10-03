@@ -67,6 +67,8 @@ pub struct ModelRow {
     pub driver: String,
     pub model: String,
     pub label: String,
+    /// The signed-in account (email or plan) of the provider instance.
+    pub account: Option<String>,
     pub selected: bool,
     pub favorite: bool,
     /// Picking this model starts a new thread instead of switching.
@@ -92,15 +94,17 @@ pub fn provider_name(provider: &ServerProvider) -> String {
         .unwrap_or_else(|| ui::provider_label(Some(&provider.driver)))
 }
 
-/// The rows for `tab`, or across every provider while searching.
+/// The rows for `tab`, or across every provider while searching. Models
+/// hidden in Settings are left out unless they are the current selection.
 pub fn build_rows(
     providers: &[ServerProvider],
     selection: Option<&Value>,
     started: bool,
     tab: &PickerTab,
     query: &str,
-    favorites: &[String],
+    prefs: &Prefs,
 ) -> Vec<ModelRow> {
+    let favorites = &prefs.favorite_models;
     let query = query.trim().to_lowercase();
     let current_instance = selection.and_then(|s| s["instanceId"].as_str());
     let current_model = selection.and_then(|s| s["model"].as_str());
@@ -114,6 +118,7 @@ pub fn build_rows(
         })
         .flat_map(|provider| {
             let name = provider_name(provider);
+            let account = provider.account().map(str::to_owned);
             provider.models.iter().map(move |model| {
                 let same_instance = current_instance == Some(provider.instance_id.as_str());
                 let selected = same_instance && current_model == Some(model.id.as_str());
@@ -123,6 +128,7 @@ pub fn build_rows(
                     driver: provider.driver.clone(),
                     model: model.id.clone(),
                     label: model.label.clone(),
+                    account: account.clone(),
                     selected,
                     favorite: favorites
                         .contains(&crate::prefs::favorite_key(&provider.instance_id, &model.id)),
@@ -132,11 +138,13 @@ pub fn build_rows(
                 }
             })
         })
+        .filter(|row| row.selected || !prefs.is_hidden(&row.instance_id, &row.model))
         .filter(|row| {
             if !query.is_empty() {
                 return row.label.to_lowercase().contains(&query)
                     || row.model.to_lowercase().contains(&query)
-                    || row.provider.to_lowercase().contains(&query);
+                    || row.provider.to_lowercase().contains(&query)
+                    || row.account.as_ref().is_some_and(|a| a.to_lowercase().contains(&query));
             }
             !matches!(tab, PickerTab::Favorites) || row.favorite
         })
@@ -246,7 +254,7 @@ impl ModelPicker {
             self.started,
             &self.tab,
             &query,
-            &Prefs::global(cx).favorite_models,
+            Prefs::global(cx),
         );
         self.highlighted = self.highlighted.min(self.rows.len().saturating_sub(1));
         cx.notify();
@@ -424,11 +432,18 @@ impl Render for ModelPicker {
             let name = provider_name(provider);
             let active =
                 !searching && matches!(&self.tab, PickerTab::Provider(id) if *id == instance);
+            let prefs = Prefs::global(cx);
+            let visible =
+                provider.models.iter().filter(|m| !prefs.is_hidden(&instance, &m.id)).count();
+            let tooltip = match provider.account() {
+                Some(account) => format!("{name} · {account} · {visible} models"),
+                None => format!("{name} · {visible} models"),
+            };
             rail = rail.child(
                 rail_item(
                     format!("model-tab-{instance}").into(),
                     active,
-                    format!("{name} · {} models", provider.models.len()),
+                    tooltip,
                     provider_mark(&instance, &provider.driver, &name, px(22.))
                         .when(!active, |mark| mark.opacity(0.75))
                         .into_any_element(),
@@ -586,7 +601,16 @@ impl ModelPicker {
                             .text_xs()
                             .text_color(theme.muted_foreground)
                             .child(provider_mark(&row.instance_id, &row.driver, &row.provider, px(11.)))
-                            .child(div().min_w_0().truncate().child(row.provider.clone())),
+                            .child(div().flex_shrink_0().max_w(px(140.)).truncate().child(row.provider.clone()))
+                            .when_some(row.account.clone(), |line, account| {
+                                line.child(div().flex_shrink_0().child("·")).child(
+                                    div()
+                                        .min_w_0()
+                                        .truncate()
+                                        .text_color(theme.muted_foreground.opacity(0.8))
+                                        .child(account),
+                                )
+                            }),
                     ),
             )
             .when(row.needs_new_thread, |item| {
@@ -630,6 +654,7 @@ mod tests {
     fn providers() -> Vec<ServerProvider> {
         serde_json::from_value(json!([
             {"instanceId":"claude-a","driver":"claudeAgent","displayName":"Ai Guru","enabled":true,"installed":true,
+             "auth":{"email":"guru@example.com","label":"Claude Pro Subscription"},
              "models":[{"slug":"opus","name":"Claude Opus"},{"slug":"sonnet","name":"Claude Sonnet"}]},
             {"instanceId":"codex-b","driver":"codex","displayName":"Work","enabled":true,"installed":true,
              "models":[{"slug":"gpt","name":"GPT"}]},
@@ -642,26 +667,50 @@ mod tests {
     fn a_started_thread_keeps_its_provider_and_offers_others_as_new_threads() {
         let selection = json!({ "instanceId": "claude-a", "model": "opus" });
         let tab = PickerTab::Provider("codex-b".into());
-        let rows = build_rows(&providers(), Some(&selection), true, &tab, "", &[]);
+        let rows = build_rows(&providers(), Some(&selection), true, &tab, "", &Prefs::default());
         assert_eq!(rows.len(), 1);
         assert!(rows[0].needs_new_thread);
 
         let tab = PickerTab::Provider("claude-a".into());
-        let rows = build_rows(&providers(), Some(&selection), true, &tab, "", &[]);
+        let rows = build_rows(&providers(), Some(&selection), true, &tab, "", &Prefs::default());
         assert!(rows.iter().all(|row| !row.needs_new_thread));
         assert!(rows[0].selected);
 
-        let rows = build_rows(&providers(), Some(&selection), false, &PickerTab::Provider("codex-b".into()), "", &[]);
+        let rows = build_rows(&providers(), Some(&selection), false, &PickerTab::Provider("codex-b".into()), "", &Prefs::default());
         assert!(!rows[0].needs_new_thread, "an unstarted thread can switch freely");
     }
 
     #[test]
     fn search_spans_usable_providers_and_favorites_keep_star_order() {
-        let rows = build_rows(&providers(), None, false, &PickerTab::Favorites, "gpt", &[]);
+        let rows = build_rows(&providers(), None, false, &PickerTab::Favorites, "gpt", &Prefs::default());
         assert_eq!(rows.iter().map(|r| r.model.as_str()).collect::<Vec<_>>(), ["gpt"]);
-        let favorites = vec!["codex-b/gpt".to_owned(), "claude-a/sonnet".to_owned()];
-        let rows = build_rows(&providers(), None, false, &PickerTab::Favorites, "", &favorites);
+        let prefs = Prefs {
+            favorite_models: vec!["codex-b/gpt".to_owned(), "claude-a/sonnet".to_owned()],
+            ..Prefs::default()
+        };
+        let rows = build_rows(&providers(), None, false, &PickerTab::Favorites, "", &prefs);
         assert_eq!(rows.iter().map(|r| r.model.as_str()).collect::<Vec<_>>(), ["gpt", "sonnet"]);
         assert!(rows.iter().all(|row| row.favorite));
+    }
+
+    #[test]
+    fn hidden_models_leave_the_picker_unless_selected_and_rows_carry_the_account() {
+        let prefs = Prefs {
+            hidden_models: vec!["claude-a/opus".to_owned(), "claude-a/sonnet".to_owned()],
+            ..Prefs::default()
+        };
+        let tab = PickerTab::Provider("claude-a".into());
+        let rows = build_rows(&providers(), None, false, &tab, "", &prefs);
+        assert!(rows.is_empty());
+        let rows = build_rows(&providers(), None, false, &PickerTab::Favorites, "claude", &prefs);
+        assert!(rows.is_empty(), "search skips hidden models too");
+
+        let selection = json!({ "instanceId": "claude-a", "model": "opus" });
+        let rows = build_rows(&providers(), Some(&selection), false, &tab, "", &prefs);
+        assert_eq!(rows.iter().map(|r| r.model.as_str()).collect::<Vec<_>>(), ["opus"]);
+        assert_eq!(rows[0].account.as_deref(), Some("guru@example.com"));
+
+        let rows = build_rows(&providers(), None, false, &PickerTab::Favorites, "guru@", &Prefs::default());
+        assert_eq!(rows.len(), 2, "the account is searchable");
     }
 }

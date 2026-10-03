@@ -8,7 +8,9 @@
 use gpui_kit::assets::IconName;
 use gpui_kit::component::Disableable as _;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
-use gpui_kit::component::input::{InputEvent, Textarea, TextareaState};
+use gpui_kit::component::input::{
+    Enter, Escape, IndentInline, InputEvent, MoveDown, MoveUp, Textarea, TextareaState,
+};
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
 use gpui_kit::component::popover::Popover;
 use gpui_kit::component::{
@@ -20,6 +22,7 @@ use t3_client::{Session, ThreadShell, ThreadStreamItem};
 
 use crate::attachments::{AttachmentPanel, AttachmentPanelEvent};
 use crate::drafts::DraftThread;
+use crate::mentions::{self, MentionKind, MentionMenu};
 use crate::model_picker::{ModelPicker, ModelPickerEvent};
 use crate::transcript::{Transcript, TranscriptEvent};
 use crate::ui::{self, CONTENT_WIDTH};
@@ -37,6 +40,9 @@ pub enum ThreadViewEvent {
     DraftSettingsChanged(DraftThread),
     /// Continue this thread in a new one on another provider's model.
     ContinueInNewThread(serde_json::Value),
+    /// Search the thread's workspace for `@` mention candidates; the app
+    /// answers with [`ThreadView::apply_file_results`].
+    SearchFiles { request_id: u64, query: String },
 }
 
 pub struct ThreadView {
@@ -58,6 +64,17 @@ pub struct ThreadView {
     /// Set while this view composes a thread that does not exist on the
     /// server yet, with the project title for its heading.
     draft: Option<(DraftThread, SharedString)>,
+    /// The workspace the composer's mentions refer to.
+    cwd: Option<String>,
+    mention: Option<MentionMenu>,
+    /// Start of a mention the user dismissed with Escape; it stays closed
+    /// until the cursor leaves that word.
+    dismissed_mention: Option<usize>,
+    next_file_search: u64,
+    /// Names of the skills the composer can chip; a draft restored before
+    /// they arrived is chipped again once they change.
+    skill_names: Vec<String>,
+    retokenize_pending: bool,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -95,8 +112,10 @@ impl ThreadView {
                     InputEvent::PressEnter { shift: false, .. } => this.submit(window, cx),
                     InputEvent::Change => {
                         cx.emit(ThreadViewEvent::DraftChanged(this.draft(cx)));
+                        this.refresh_mention(cx);
                         cx.notify();
                     }
+                    InputEvent::Blur => this.close_mention(cx),
                     _ => {}
                 }
             })];
@@ -116,7 +135,8 @@ impl ThreadView {
                     } else {
                         format!("{}\n\n{text}", draft.trim_end())
                     };
-                    this.composer.update(cx, |state, cx| state.set_value(draft, window, cx));
+                    let content = this.tokenized(&draft);
+                    this.composer.update(cx, |state, cx| state.set_value(content, window, cx));
                 }
             },
         ));
@@ -163,6 +183,12 @@ impl ThreadView {
             thread_loaded: false,
             model_picker,
             draft: None,
+            cwd: None,
+            mention: None,
+            dismissed_mention: None,
+            next_file_search: 0,
+            skill_names: Vec::new(),
+            retokenize_pending: false,
             _subscriptions: subscriptions,
         }
     }
@@ -214,6 +240,47 @@ impl ThreadView {
             (self.providers.clone(), self.selection(), self.is_started(cx));
         self.model_picker
             .update(cx, |picker, cx| picker.set_context(providers, selection, started, cx));
+        let skill_names: Vec<String> = self
+            .selected_provider()
+            .map(|provider| provider.invocable_skills(self.cwd.as_deref()))
+            .unwrap_or_default()
+            .into_iter()
+            .map(|skill| skill.name.clone())
+            .collect();
+        if skill_names != self.skill_names {
+            self.skill_names = skill_names;
+            self.retokenize_pending = true;
+            cx.notify();
+        }
+    }
+
+    /// Chips the mentions in the composer that are still plain text, such
+    /// as `$skill` in a draft restored before the provider's skills arrived.
+    /// Existing chips and the cursor stay where they are.
+    fn retokenize(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let content = self.tokenized(&self.draft(cx));
+        let existing = self.composer.read(cx).tokens().to_vec();
+        let missing: Vec<_> = content
+            .tokens()
+            .iter()
+            .filter(|span| {
+                !existing.iter().any(|chip| {
+                    chip.range().start < span.range().end && span.range().start < chip.range().end
+                })
+            })
+            .cloned()
+            .collect();
+        if missing.is_empty() {
+            return;
+        }
+        self.composer.update(cx, |state, cx| {
+            let selection = state.selected_range();
+            for span in missing.iter().rev() {
+                let _ = state.replace_range_with_token(span.range(), span.token().clone(), window, cx);
+            }
+            // A chip's text equals the text it replaces, so offsets are unchanged.
+            state.set_selected_range(selection, cx);
+        });
     }
 
     pub fn thread_id(&self) -> &str {
@@ -239,7 +306,8 @@ impl ThreadView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.composer.update(cx, |state, cx| state.set_value(draft, window, cx));
+        let content = self.tokenized(draft);
+        self.composer.update(cx, |state, cx| state.set_value(content, window, cx));
         self.sending = sending;
         cx.notify();
     }
@@ -392,6 +460,220 @@ impl ThreadView {
             || detail_session.is_some_and(|s| s.is_working())
     }
 
+    pub fn set_cwd(&mut self, cwd: Option<String>) {
+        self.cwd = cwd;
+    }
+
+    fn selected_provider(&self) -> Option<&t3_client::ServerProvider> {
+        let selection = self.selection()?;
+        self.providers.iter().find(|p| selection["instanceId"] == p.instance_id)
+    }
+
+    /// `text` with its `@` and `$` mentions as chips.
+    fn tokenized(&self, text: &str) -> gpui_kit::component::input::InputContent {
+        let skills = self
+            .selected_provider()
+            .map(|provider| provider.invocable_skills(self.cwd.as_deref()))
+            .unwrap_or_default();
+        mentions::tokenize(text, |name| {
+            skills.iter().find(|skill| skill.name == name).map(|skill| skill.label())
+        })
+    }
+
+    /// Opens, updates or closes the suggestion menu for the word at the cursor.
+    fn refresh_mention(&mut self, cx: &mut Context<Self>) {
+        let state = self.composer.read(cx);
+        let selection = state.selected_range();
+        let trigger = (selection.is_empty())
+            .then(|| mentions::detect_trigger(&state.value(), state.cursor()))
+            .flatten()
+            // Editing next to an existing chip is not a new mention.
+            .filter(|trigger| {
+                !state.tokens().iter().any(|span| {
+                    span.range().start < trigger.range.end && trigger.range.start < span.range().end
+                })
+            })
+            .filter(|_| self.connected && self.thread_loaded);
+        let Some(trigger) = trigger else {
+            self.dismissed_mention = None;
+            return self.close_mention(cx);
+        };
+        if self.dismissed_mention == Some(trigger.range.start) {
+            return self.close_mention(cx);
+        }
+        self.dismissed_mention = None;
+        if self.mention.as_ref().is_some_and(|menu| menu.trigger == trigger) {
+            return;
+        }
+        let mut menu = MentionMenu::new(trigger.clone());
+        // Keep the previous results on screen until the new search answers.
+        if let Some(previous) = self.mention.take()
+            && previous.trigger.kind == trigger.kind
+            && previous.trigger.range.start == trigger.range.start
+        {
+            menu.items = previous.items;
+        }
+        match trigger.kind {
+            MentionKind::Skill => {
+                let skills = self
+                    .selected_provider()
+                    .map(|provider| provider.invocable_skills(self.cwd.as_deref()))
+                    .unwrap_or_default();
+                menu.items = mentions::search_skills(&skills, &trigger.query);
+            }
+            MentionKind::File => {
+                self.next_file_search += 1;
+                menu.pending_request = Some(self.next_file_search);
+                cx.emit(ThreadViewEvent::SearchFiles {
+                    request_id: self.next_file_search,
+                    query: trigger.query.clone(),
+                });
+            }
+        }
+        self.mention = Some(menu);
+        cx.notify();
+    }
+
+    fn close_mention(&mut self, cx: &mut Context<Self>) {
+        if self.mention.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    /// Results of a [`ThreadViewEvent::SearchFiles`]; stale answers are ignored.
+    pub fn apply_file_results(
+        &mut self,
+        request_id: u64,
+        result: Result<Vec<t3_client::WorkspaceEntry>, String>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(menu) = self.mention.as_mut().filter(|m| m.pending_request == Some(request_id))
+        else {
+            return;
+        };
+        menu.pending_request = None;
+        match result {
+            Ok(entries) => {
+                menu.items = mentions::file_suggestions(&entries);
+                menu.error = None;
+            }
+            Err(error) => {
+                menu.items.clear();
+                menu.error = Some(error.into());
+            }
+        }
+        menu.highlighted = menu.highlighted.min(menu.items.len().saturating_sub(1));
+        cx.notify();
+    }
+
+    fn mention_has_items(&self) -> bool {
+        self.mention.as_ref().is_some_and(|menu| !menu.items.is_empty())
+    }
+
+    /// Replaces the typed `@query`/`$query` with the chosen chip and a space.
+    fn choose_mention(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(menu) = self.mention.take() else { return };
+        let Some(item) = menu.items.get(ix).cloned() else {
+            self.mention = Some(menu);
+            return;
+        };
+        let range = menu.trigger.range.clone();
+        self.composer.update(cx, |state, cx| {
+            if state.replace_range_with_token(range, item.token, window, cx).is_ok() {
+                state.insert(" ", window, cx);
+            }
+            state.focus(window, cx);
+        });
+        cx.notify();
+    }
+
+    fn on_mention_enter(&mut self, action: &Enter, window: &mut Window, cx: &mut Context<Self>) {
+        if !action.shift && self.mention_has_items() {
+            cx.stop_propagation();
+            let ix = self.mention.as_ref().map_or(0, |menu| menu.highlighted);
+            self.choose_mention(ix, window, cx);
+        }
+    }
+
+    fn on_mention_tab(&mut self, _: &IndentInline, window: &mut Window, cx: &mut Context<Self>) {
+        if self.mention_has_items() {
+            cx.stop_propagation();
+            let ix = self.mention.as_ref().map_or(0, |menu| menu.highlighted);
+            self.choose_mention(ix, window, cx);
+        }
+    }
+
+    fn on_mention_escape(&mut self, _: &Escape, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(menu) = self.mention.take() {
+            cx.stop_propagation();
+            self.dismissed_mention = Some(menu.trigger.range.start);
+            cx.notify();
+        }
+    }
+
+    fn on_mention_up(&mut self, _: &MoveUp, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(menu) = self.mention.as_mut() {
+            cx.stop_propagation();
+            menu.move_highlight(-1);
+            cx.notify();
+        }
+    }
+
+    fn on_mention_down(&mut self, _: &MoveDown, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(menu) = self.mention.as_mut() {
+            cx.stop_propagation();
+            menu.move_highlight(1);
+            cx.notify();
+        }
+    }
+
+    /// Pasted images and copied files become attachments; pasted text keeps
+    /// its line breaks with Windows and web artifacts cleaned up. Returns
+    /// whether the paste was handled here.
+    fn paste(&mut self, item: &ClipboardItem, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let mut files = Vec::new();
+        let mut image = None;
+        let mut text = None;
+        for entry in item.entries() {
+            match entry {
+                ClipboardEntry::ExternalPaths(paths) => files.extend(paths.paths().iter().cloned()),
+                ClipboardEntry::Image(pasted) => image = image.or(Some(pasted)),
+                ClipboardEntry::String(string) => text = text.or(Some(string.text())),
+            }
+        }
+        // Office apps put a picture of copied text beside the text itself;
+        // only a bare image is an image paste.
+        let image = image.filter(|_| files.is_empty() && text.is_none_or(|t| t.trim().is_empty()));
+        if (!files.is_empty() || image.is_some()) && !(self.connected && self.thread_loaded) {
+            cx.emit(ThreadViewEvent::Attachment(AttachmentPanelEvent::Rejected(
+                "Wait for the thread to connect before pasting files or images.".into(),
+            )));
+            return true;
+        }
+        if let Some(image) = image {
+            match crate::attachments::save_pasted_image(image) {
+                Ok(path) => files.push(path),
+                Err(error) => {
+                    cx.emit(ThreadViewEvent::Attachment(AttachmentPanelEvent::Rejected(format!(
+                        "Could not paste the image: {error}"
+                    ))));
+                    return true;
+                }
+            }
+        }
+        if !files.is_empty() {
+            self.attachments.update(cx, |panel, cx| panel.add_paths(files, cx));
+            return true;
+        }
+        let Some(text) = text else { return false };
+        let cleaned = clean_pasted_text(text);
+        if cleaned == *text {
+            return false;
+        }
+        self.composer.update(cx, |state, cx| state.replace(cleaned, window, cx));
+        true
+    }
+
     fn submit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let text = self.composer.read(cx).value().trim().to_owned();
         if (text.is_empty() && self.attachments.read(cx).uploaded_attachments().is_empty())
@@ -414,6 +696,9 @@ impl ThreadView {
 
 impl Render for ThreadView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if std::mem::take(&mut self.retokenize_pending) {
+            cx.defer_in(window, |this, window, cx| this.retokenize(window, cx));
+        }
         let theme = cx.theme();
         let working = self.is_working(cx);
         let has_user_input = self.thread_loaded && self.user_input.read(cx).has_requests();
@@ -589,9 +874,27 @@ impl Render for ThreadView {
             .child(action);
 
         let composer_focused = self.composer.read(cx).focus_handle(cx).is_focused(window);
+        let mention_menu = self.mention.as_ref().map(|menu| {
+            let view = cx.entity().downgrade();
+            let on_choose = move |ix: usize, window: &mut Window, cx: &mut App| {
+                let _ = view.update(cx, |view, cx| view.choose_mention(ix, window, cx));
+            };
+            deferred(
+                div()
+                    .absolute()
+                    .bottom_full()
+                    .left_0()
+                    .w_full()
+                    .pb_2()
+                    .child(mentions::render_menu(menu, on_choose, cx)),
+            )
+            .with_priority(1)
+        });
         let composer = v_flex()
+            .relative()
             .w_full()
             .max_w(CONTENT_WIDTH)
+            .children(mention_menu)
             .rounded_xl()
             .border_1()
             .border_color(if composer_focused { theme.primary.opacity(0.45) } else { theme.border })
@@ -600,12 +903,28 @@ impl Render for ThreadView {
                 composer.child(div().px_3().pt_2().child(self.attachments.clone()))
             })
             .child(
-                div().px_3().pt_1().child(
-                    Textarea::new(&self.composer)
-                        .accessibility_id("composer")
-                        .aria_label("Message")
-                        .appearance(false),
-                ),
+                div()
+                    .px_3()
+                    .pt_1()
+                    .capture_action(cx.listener(Self::on_mention_enter))
+                    .capture_action(cx.listener(Self::on_mention_tab))
+                    .capture_action(cx.listener(Self::on_mention_escape))
+                    .capture_action(cx.listener(Self::on_mention_up))
+                    .capture_action(cx.listener(Self::on_mention_down))
+                    .child(
+                        Textarea::new(&self.composer)
+                            .accessibility_id("composer")
+                            .aria_label("Message")
+                            .appearance(false)
+                            .token(mentions::render_token)
+                            .on_paste({
+                                let view = cx.entity().downgrade();
+                                move |item, window, cx| {
+                                    view.update(cx, |view, cx| view.paste(item, window, cx))
+                                        .unwrap_or(false)
+                                }
+                            }),
+                    ),
             )
             .child(
                 h_flex()
@@ -798,6 +1117,12 @@ fn separator(cx: &App) -> impl IntoElement {
     div().w_px().h_4().bg(cx.theme().border)
 }
 
+/// Windows line endings become `\n`, and the non-breaking spaces web pages
+/// copy become plain spaces; indentation and blank lines are kept.
+fn clean_pasted_text(text: &str) -> String {
+    text.replace("\r\n", "\n").replace('\r', "\n").replace(['\u{a0}', '\u{202f}'], " ")
+}
+
 /// Compares the [`ThreadShell`] fields this view actually renders
 /// (`render`'s branch/provider/runtime/mode/session-error chips and
 /// `is_working`'s working spinner), so `set_shell` can skip `cx.notify()`
@@ -958,6 +1283,211 @@ mod composer_tests {
         })
         .unwrap();
         assert_eq!(*attachment_events.borrow(), [true]);
+    }
+
+    #[gpui_kit::test]
+    fn mentions_insert_chips_and_enter_picks_instead_of_sending(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let draft = DraftThread {
+            id: "draft-1".into(),
+            project_id: "project-1".into(),
+            model_selection: json!({ "instanceId": "claude-a", "model": "opus" }),
+            runtime_mode: "full-access".into(),
+            interaction_mode: "default".into(),
+        };
+        let (handle, view) = cx.update(|cx| {
+            gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+                let panel = cx.new(UserInputPanel::new);
+                let attachments = cx.new(AttachmentPanel::new);
+                cx.new(|cx| {
+                    ThreadView::new_draft(draft, "Demo".into(), panel, attachments, window, cx)
+                })
+            })
+            .unwrap()
+        });
+        let providers: Vec<t3_client::ServerProvider> = serde_json::from_value(json!([
+            {"instanceId":"claude-a","driver":"claudeAgent","enabled":true,"installed":true,
+             "models":[{"slug":"opus","name":"Opus"}],
+             "skills":[{"name":"repo-explorer","path":"/s/repo","enabled":true,"scope":"user"},
+                       {"name":"fallow","path":"/s/fallow","enabled":true},
+                       {"name":"agent-only","path":"/s/a","enabled":true,"userInvocable":false}]}
+        ]))
+        .unwrap();
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let capture = events.clone();
+        let _subscription = cx.update(|cx| {
+            cx.subscribe(&view, move |_, event: &ThreadViewEvent, _| match event {
+                ThreadViewEvent::Send(text, _) => capture.borrow_mut().push(format!("send:{text}")),
+                ThreadViewEvent::SearchFiles { request_id, query } => {
+                    capture.borrow_mut().push(format!("search:{request_id}:{query}"))
+                }
+                _ => {}
+            })
+        });
+        view.update(cx, |view, cx| view.set_providers(providers, cx));
+
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            let composer_id = view.read(cx).composer.entity_id();
+            window.click(("input", composer_id), cx);
+            window.input("use $rep", cx);
+        })
+        .unwrap();
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            assert!(window.find(("mention-row", 0usize)).visible());
+            assert!(window.try_find(("mention-row", 1usize)).is_none());
+            window.press("enter", cx);
+        })
+        .unwrap();
+        cx.update_window(handle, |_, window, cx| {
+            assert_eq!(view.read(cx).draft(cx), "use $repo-explorer ");
+            let tokens = view.read(cx).composer.read(cx).tokens().to_vec();
+            assert_eq!(tokens.len(), 1);
+            assert_eq!(tokens[0].token().label().as_ref(), "Repo Explorer");
+            window.input("@", cx);
+        })
+        .unwrap();
+        cx.update_window(handle, |_, window, cx| window.input("ind", cx)).unwrap();
+        let request_id = events
+            .borrow()
+            .iter()
+            .rev()
+            .find_map(|event| event.strip_prefix("search:").map(str::to_owned))
+            .and_then(|event| event.split(':').next()?.parse::<u64>().ok())
+            .expect("a file search");
+        cx.update_window(handle, |_, window, cx| {
+            let entries = vec![t3_client::WorkspaceEntry {
+                path: "src/api/index.ts".into(),
+                kind: "file".into(),
+                ignored: false,
+            }];
+            view.update(cx, |view, cx| view.apply_file_results(request_id, Ok(entries), cx));
+            window.render_frame(cx);
+            window.press("tab", cx);
+        })
+        .unwrap();
+        cx.update_window(handle, |_, window, cx| {
+            assert_eq!(view.read(cx).draft(cx), "use $repo-explorer @src/api/index.ts ");
+            assert_eq!(view.read(cx).composer.read(cx).tokens().len(), 2);
+            assert!(view.read(cx).mention.is_none());
+            window.input("$", cx);
+        })
+        .unwrap();
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            window.press("escape", cx);
+        })
+        .unwrap();
+        cx.update_window(handle, |_, window, cx| {
+            assert!(view.read(cx).mention.is_none(), "Escape dismisses the menu");
+            window.press("backspace", cx);
+            window.press("enter", cx);
+        })
+        .unwrap();
+        assert!(events.borrow().iter().any(|e| e == "send:use $repo-explorer @src/api/index.ts"));
+        assert!(events.borrow().iter().any(|e| e == "search:1:"), "`@` alone browses recent files");
+        assert!(events.borrow().iter().any(|e| e == "search:2:ind"));
+    }
+
+    #[gpui_kit::test]
+    fn restored_drafts_show_mentions_as_chips(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let (handle, view) = cx.update(|cx| {
+            gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+                let panel = cx.new(UserInputPanel::new);
+                cx.new(|cx| ThreadView::new("thread-1".into(), panel, window, cx))
+            })
+            .unwrap()
+        });
+        cx.update_window(handle, |_, window, cx| {
+            view.update(cx, |view, cx| {
+                view.restore_draft("check @\"docs/a b.md\" now", false, window, cx)
+            });
+            let tokens = view.read(cx).composer.read(cx).tokens().to_vec();
+            assert_eq!(tokens.len(), 1);
+            assert_eq!(tokens[0].token().label().as_ref(), "a b.md");
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn skills_in_a_restored_draft_become_chips_once_the_provider_arrives(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let (handle, view) = cx.update(|cx| {
+            gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+                let panel = cx.new(UserInputPanel::new);
+                cx.new(|cx| ThreadView::new("thread-1".into(), panel, window, cx))
+            })
+            .unwrap()
+        });
+        let shell: ThreadShell = serde_json::from_value(json!({
+            "id": "thread-1", "projectId": "project-1", "title": "T", "runtimeMode": "full-access",
+            "createdAt": "2026-10-01T00:00:00Z", "updatedAt": "2026-10-01T00:00:00Z",
+            "modelSelection": { "instanceId": "claude-a", "model": "opus" }
+        }))
+        .unwrap();
+        let providers: Vec<t3_client::ServerProvider> = serde_json::from_value(json!([
+            {"instanceId":"claude-a","driver":"claudeAgent","enabled":true,"installed":true,
+             "models":[{"slug":"opus","name":"Opus"}],
+             "skills":[{"name":"fallow","path":"/s/fallow","enabled":true}]}
+        ]))
+        .unwrap();
+        cx.update_window(handle, |_, window, cx| {
+            view.update(cx, |view, cx| view.restore_draft("run $fallow on @src/a.ts now", false, window, cx));
+            assert_eq!(view.read(cx).composer.read(cx).tokens().len(), 1, "skills are unknown yet");
+            view.update(cx, |view, cx| {
+                view.set_shell(Some(shell), cx);
+                view.set_providers(providers, cx);
+            });
+            window.render_frame(cx);
+        })
+        .unwrap();
+        cx.update_window(handle, |_, _, cx| {
+            let tokens = view.read(cx).composer.read(cx).tokens().to_vec();
+            let labels: Vec<_> = tokens.iter().map(|t| t.token().label().to_string()).collect();
+            assert_eq!(labels, ["Fallow", "a.ts"]);
+            assert_eq!(view.read(cx).draft(cx), "run $fallow on @src/a.ts now");
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn pasting_files_before_the_thread_is_ready_reports_an_error(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let (handle, view) = cx.update(|cx| {
+            gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+                let panel = cx.new(UserInputPanel::new);
+                cx.new(|cx| ThreadView::new("thread-1".into(), panel, window, cx))
+            })
+            .unwrap()
+        });
+        let rejected = Rc::new(RefCell::new(Vec::new()));
+        let capture = rejected.clone();
+        let _subscription = cx.update(|cx| {
+            cx.subscribe(&view, move |_, event: &ThreadViewEvent, _| {
+                if let ThreadViewEvent::Attachment(AttachmentPanelEvent::Rejected(message)) = event {
+                    capture.borrow_mut().push(message.clone());
+                }
+            })
+        });
+        cx.update_window(handle, |_, window, cx| {
+            let item = ClipboardItem {
+                entries: vec![ClipboardEntry::ExternalPaths(ExternalPaths(
+                    vec![std::path::PathBuf::from("C:/missing/file.txt")].into(),
+                ))],
+            };
+            let handled = view.update(cx, |view, cx| view.paste(&item, window, cx));
+            assert!(handled);
+        })
+        .unwrap();
+        assert_eq!(rejected.borrow().len(), 1, "the paste is reported, not silently dropped");
+    }
+
+    #[test]
+    fn pasted_text_keeps_lines_without_windows_artifacts() {
+        assert_eq!(clean_pasted_text("fn a() {\r\n\tb();\r\n}\r\n"), "fn a() {\n\tb();\n}\n");
+        assert_eq!(clean_pasted_text("a\u{a0}b\rc"), "a b\nc");
     }
 
     #[gpui_kit::test]

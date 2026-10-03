@@ -3,12 +3,15 @@ use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::kbd::Kbd;
 use gpui_kit::component::scroll::ScrollableElement as _;
+use gpui_kit::component::switch::Switch;
 use gpui_kit::component::{
     ActiveTheme as _, Disableable as _, Icon, Sizable as _, StyledExt as _, h_flex, v_flex,
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use t3_client::ServerProvider;
+
+use crate::prefs::Prefs;
 
 pub enum SettingsEvent {
     Close,
@@ -65,6 +68,8 @@ pub struct SettingsPage {
     open: bool,
     light_theme: bool,
     section: Section,
+    /// The provider whose model list is expanded.
+    expanded_provider: Option<String>,
     focus_handle: FocusHandle,
 }
 impl EventEmitter<SettingsEvent> for SettingsPage {}
@@ -76,6 +81,7 @@ impl SettingsPage {
             open: false,
             light_theme: crate::prefs::Prefs::global(cx).light_theme,
             section: Section::Appearance,
+            expanded_provider: None,
             focus_handle: cx.focus_handle(),
         }
     }
@@ -147,6 +153,11 @@ impl SettingsPage {
                 .as_deref()
                 .filter(|name| !name.trim().is_empty())
                 .unwrap_or(&provider.instance_id);
+            let instance = provider.instance_id.clone();
+            let expanded = self.expanded_provider.as_deref() == Some(instance.as_str());
+            let prefs = Prefs::global(cx);
+            let hidden =
+                provider.models.iter().filter(|m| prefs.is_hidden(&instance, &m.id)).count();
             let (status, status_color) = if !self.connected {
                 ("Offline".to_owned(), theme.muted_foreground)
             } else if !provider.enabled {
@@ -190,14 +201,53 @@ impl SettingsPage {
                                 .child(status),
                         ),
                 )
+                .children(provider.account().map(|account| {
+                    h_flex()
+                        .id(format!("provider-account-{instance}"))
+                        .gap_1p5()
+                        .text_xs()
+                        .text_color(theme.muted_foreground)
+                        .child(Icon::new(IconName::User).xsmall())
+                        .child(div().min_w_0().truncate().child(account.to_owned()))
+                }))
                 .child(
                     h_flex()
                         .gap_3()
                         .text_xs()
                         .text_color(theme.muted_foreground)
                         .child(format!("Driver: {}", provider.driver))
-                        .child(format!("{} models", provider.models.len())),
+                        .child(if hidden > 0 {
+                            format!("{} models · {hidden} hidden", provider.models.len())
+                        } else {
+                            format!("{} models", provider.models.len())
+                        })
+                        .child(div().flex_1())
+                        .when(!provider.models.is_empty(), |row| {
+                            let instance = instance.clone();
+                            row.child(
+                                Button::new(format!("provider-models-{instance}"))
+                                    .ghost()
+                                    .xsmall()
+                                    .label(if expanded { "Hide models" } else { "Choose models" })
+                                    .icon(Icon::new(if expanded {
+                                        IconName::ChevronUp
+                                    } else {
+                                        IconName::ChevronDown
+                                    }))
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.expanded_provider = if this.expanded_provider.as_deref()
+                                            == Some(instance.as_str())
+                                        {
+                                            None
+                                        } else {
+                                            Some(instance.clone())
+                                        };
+                                        cx.notify();
+                                    })),
+                            )
+                        }),
                 )
+                .when(expanded, |row| row.child(self.render_model_list(provider, cx)))
         });
         v_flex().gap_3()
             .child(section_label(format!("{} instances · {model_count} models", self.providers.len()), cx))
@@ -216,6 +266,74 @@ impl SettingsPage {
                     "No provider instances were reported by this server."
                 } else { "Connect to a server to view provider instances." }))
             }).into_any_element()
+    }
+    /// Which of an instance's models the composer picker offers. Saved on
+    /// this device, like favorites.
+    fn render_model_list(&self, provider: &ServerProvider, cx: &Context<Self>) -> impl IntoElement {
+        let theme = cx.theme();
+        let prefs = Prefs::global(cx);
+        let instance = provider.instance_id.clone();
+        let all_visible = provider.models.iter().all(|m| !prefs.is_hidden(&instance, &m.id));
+        let bulk = {
+            let instance = instance.clone();
+            let models: Vec<String> = provider.models.iter().map(|m| m.id.clone()).collect();
+            Button::new(format!("provider-models-bulk-{instance}"))
+                .ghost()
+                .xsmall()
+                .label(if all_visible { "Hide all" } else { "Show all" })
+                .on_click(cx.listener(move |_, _, _, cx| {
+                    Prefs::set_models_hidden(cx, &instance, models.iter().map(String::as_str), all_visible);
+                    cx.notify();
+                }))
+        };
+        v_flex()
+            .id(format!("provider-model-list-{instance}"))
+            .gap_0p5()
+            .pt_1()
+            .border_t_1()
+            .border_color(theme.border)
+            .child(
+                h_flex()
+                    .gap_2()
+                    .py_1()
+                    .text_xs()
+                    .text_color(theme.muted_foreground)
+                    .child(div().flex_1().child("Models shown in the picker. Saved on this device."))
+                    .child(bulk),
+            )
+            .children(provider.models.iter().map(|model| {
+                let visible = !prefs.is_hidden(&instance, &model.id);
+                let (instance, model_id) = (instance.clone(), model.id.clone());
+                h_flex()
+                    .gap_2()
+                    .py_1()
+                    .child(
+                        h_flex()
+                            .flex_1()
+                            .min_w_0()
+                            .gap_2()
+                            .text_sm()
+                            .when(!visible, |row| row.text_color(theme.muted_foreground))
+                            .child(div().flex_shrink_0().child(model.label.clone()))
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .truncate()
+                                    .text_xs()
+                                    .text_color(theme.muted_foreground)
+                                    .child(model.id.clone()),
+                            ),
+                    )
+                    .child(
+                        Switch::new(SharedString::from(format!("model-visible-{instance}-{model_id}")))
+                            .checked(visible)
+                            .tooltip(if visible { "Hide from picker" } else { "Show in picker" })
+                            .on_change(cx.listener(move |_, checked: &bool, _, cx| {
+                                Prefs::set_model_hidden(cx, &instance, &model_id, !*checked);
+                                cx.notify();
+                            })),
+                    )
+            }))
     }
     fn render_connections(&self, cx: &Context<Self>) -> AnyElement {
         let managed_server_dir = dirs::data_local_dir()
@@ -455,5 +573,41 @@ mod tests {
             *events.borrow(),
             ["light", "refresh", "managed", "switch", "dark", "close"]
         );
+    }
+
+    #[gpui_kit::test]
+    fn model_switches_hide_models_from_the_picker(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let (handle, page) = cx.update(|cx| {
+            gpui_kit::open_window(WindowOptions::default(), cx, |_, cx| cx.new(SettingsPage::new))
+                .unwrap()
+        });
+        let providers = serde_json::from_value::<Vec<ServerProvider>>(json!([
+            {"instanceId":"codex-a","driver":"codex","displayName":"Work","enabled":true,"installed":true,
+             "auth":{"email":"me@example.com"},
+             "models":[{"slug":"m1","name":"Model 1"},{"slug":"m2","name":"Model 2"}]}
+        ])).unwrap();
+        page.update(cx, |page, cx| {
+            page.set_open(true, cx);
+            page.set_connected(true, cx);
+            page.set_providers(providers, cx);
+            page.section = Section::Providers;
+        });
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            assert!(window.try_find("model-visible-codex-a-m1").is_none());
+            window.click("provider-models-codex-a", cx);
+            window.render_frame(cx);
+            window.click("model-visible-codex-a-m1", cx);
+            window.render_frame(cx);
+            assert!(Prefs::global(cx).is_hidden("codex-a", "m1"));
+            assert!(!Prefs::global(cx).is_hidden("codex-a", "m2"));
+            window.click("provider-models-bulk-codex-a", cx);
+            window.render_frame(cx);
+            assert!(Prefs::global(cx).hidden_models.is_empty(), "Show all clears the hidden list");
+            window.click("provider-models-bulk-codex-a", cx);
+            assert!(Prefs::global(cx).is_hidden("codex-a", "m2"), "Hide all hides every model");
+        })
+        .unwrap();
     }
 }

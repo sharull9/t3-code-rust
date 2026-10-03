@@ -30,6 +30,9 @@ use crate::usage::{UsageEvent, UsageView};
 use crate::user_input::UserInputPanel;
 use crate::workspace::{WorkspaceEvent, WorkspacePanel, WorkspaceScope};
 
+/// Workspace-result scope that routes `@` file searches back to the composer.
+const COMPOSER_FILES_SCOPE: &str = "__composer_files";
+
 /// Compatibility fallback when neither the project, current thread nor server
 /// config supplies a model. Prefer server-advertised models above this value.
 fn fallback_model_selection() -> serde_json::Value {
@@ -344,7 +347,17 @@ impl T3App {
                 }
             }
             Event::WorkspaceResult { request_id, scope, result } => {
-                if scope.project_id.as_deref() == Some("__directory_picker") {
+                if scope.project_id.as_deref() == Some(COMPOSER_FILES_SCOPE) {
+                    let result = result.and_then(|response| match response {
+                        t3_client::WorkspaceResponse::Entries(directory) => Ok(directory.entries),
+                        _ => Err("Unexpected file search response".into()),
+                    });
+                    if let Some(view) = self.thread.clone().filter(|view| {
+                        scope.thread_id.as_deref() == Some(view.read(cx).thread_id())
+                    }) {
+                        view.update(cx, |view, cx| view.apply_file_results(request_id, result, cx));
+                    }
+                } else if scope.project_id.as_deref() == Some("__directory_picker") {
                     let result = result.and_then(|response| {
                         if let t3_client::WorkspaceResponse::BrowseDirectories(result) = response {
                             Ok(result)
@@ -723,6 +736,7 @@ impl T3App {
         });
         self._thread_subscription = Some(cx.subscribe_in(&view, window, Self::on_thread_event));
         self.thread = Some(view);
+        self.sync_thread_shell(cx);
         self.sidebar.update(cx, |sidebar, cx| sidebar.set_open_thread(Some(draft_id), cx));
         self.after_switch(cx);
     }
@@ -801,7 +815,19 @@ impl T3App {
     fn sync_thread_shell(&self, cx: &mut Context<Self>) {
         let Some(thread) = &self.thread else { return };
         let shell = self.shell.thread(thread.read(cx).thread_id()).cloned();
-        thread.update(cx, |view, cx| view.set_shell(shell, cx));
+        let cwd = self.composer_cwd(cx);
+        thread.update(cx, |view, cx| {
+            view.set_cwd(cwd);
+            view.set_shell(shell, cx);
+        });
+    }
+
+    /// The folder the open composer's `@` mentions search: the thread's
+    /// worktree, else its project's root.
+    fn composer_cwd(&self, cx: &App) -> Option<String> {
+        self.open_thread_shell(cx)
+            .and_then(|thread| thread.worktree_path.clone())
+            .or_else(|| self.current_project(cx).map(|project| project.workspace_root.clone()))
     }
 
     fn open_thread(&mut self, thread_id: String, window: &mut Window, cx: &mut Context<Self>) {
@@ -936,6 +962,28 @@ impl T3App {
                 }
                 return;
             }
+            ThreadViewEvent::SearchFiles { request_id, query } => {
+                let Some(cwd) = self.composer_cwd(cx) else {
+                    view.update(cx, |view, cx| {
+                        view.apply_file_results(*request_id, Err("This thread has no folder.".into()), cx)
+                    });
+                    return;
+                };
+                self.backend.send(Command::Workspace {
+                    request_id: *request_id,
+                    scope: WorkspaceScope {
+                        project_id: Some(COMPOSER_FILES_SCOPE.into()),
+                        thread_id: Some(id),
+                        cwd: Some(cwd.clone()),
+                    },
+                    request: t3_client::WorkspaceRequest::SearchEntries {
+                        cwd,
+                        query: query.clone(),
+                        limit: crate::mentions::FILE_RESULT_LIMIT,
+                    },
+                });
+                return;
+            }
             _ => {}
         }
         if let Some(draft) = view.read(cx).draft_thread().cloned() {
@@ -989,7 +1037,8 @@ impl T3App {
             ThreadViewEvent::DraftChanged(_)
             | ThreadViewEvent::DraftSettingsChanged(_)
             | ThreadViewEvent::QuestionDraftsChanged(_)
-            | ThreadViewEvent::Attachment(_) => {}
+            | ThreadViewEvent::Attachment(_)
+            | ThreadViewEvent::SearchFiles { .. } => {}
             ThreadViewEvent::Stop => {
                 let turn_id = thread.session.as_ref().and_then(|s| s.active_turn_id.clone());
                 self.backend.send(Command::Interrupt { thread_id: thread.id, turn_id });

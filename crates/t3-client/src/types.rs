@@ -149,6 +149,102 @@ pub struct ServerProvider {
     pub auth: crate::quotas::ProviderAuth,
     #[serde(default)]
     pub usage_limits: Option<crate::quotas::UsageLimits>,
+    #[serde(default)]
+    pub skills: Vec<ProviderSkill>,
+    /// Skills discovered per workspace, in addition to the global `skills`.
+    #[serde(default)]
+    pub workspace_snapshots: Vec<ProviderWorkspaceSnapshot>,
+}
+
+impl ServerProvider {
+    /// The account the instance is signed in to: its email, else the plan
+    /// label ("ChatGPT Plus Subscription").
+    pub fn account(&self) -> Option<&str> {
+        [self.auth.email.as_deref(), self.auth.label.as_deref()]
+            .into_iter()
+            .flatten()
+            .map(str::trim)
+            .find(|text| !text.is_empty())
+    }
+
+    /// Skills a user can start from the composer in `cwd`: workspace skills
+    /// first, then global ones, deduplicated by name.
+    pub fn invocable_skills(&self, cwd: Option<&str>) -> Vec<&ProviderSkill> {
+        let workspace = self
+            .workspace_snapshots
+            .iter()
+            .filter(|snapshot| cwd.is_some_and(|cwd| same_path(&snapshot.cwd, cwd)))
+            .flat_map(|snapshot| &snapshot.skills);
+        let mut seen = std::collections::HashSet::new();
+        workspace
+            .chain(&self.skills)
+            .filter(|skill| skill.enabled && skill.user_invocable != Some(false))
+            .filter(|skill| seen.insert(skill.name.trim().to_lowercase()))
+            .collect()
+    }
+}
+
+fn same_path(a: &str, b: &str) -> bool {
+    let normalize = |path: &str| path.trim_end_matches(['/', '\\']).replace('\\', "/").to_lowercase();
+    normalize(a) == normalize(b)
+}
+
+/// Port of `ServerProviderSkill`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderSkill {
+    pub name: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub path: String,
+    #[serde(default)]
+    pub scope: Option<String>,
+    #[serde(default = "enabled_default")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub display_name: Option<String>,
+    #[serde(default)]
+    pub short_description: Option<String>,
+    #[serde(default)]
+    pub user_invocable: Option<bool>,
+}
+
+fn enabled_default() -> bool {
+    true
+}
+
+impl ProviderSkill {
+    /// Mirrors `formatProviderSkillDisplayName`: the display name, else the
+    /// name in title case ("repo-explorer" → "Repo Explorer").
+    pub fn label(&self) -> String {
+        if let Some(name) = self.display_name.as_deref().map(str::trim).filter(|n| !n.is_empty()) {
+            return name.to_owned();
+        }
+        self.name
+            .split(['-', '_', ' ', ':'])
+            .filter(|word| !word.is_empty())
+            .map(|word| {
+                let mut chars = word.chars();
+                chars.next().map_or_else(String::new, |first| {
+                    first.to_uppercase().chain(chars).collect()
+                })
+            })
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    pub fn summary(&self) -> Option<&str> {
+        self.short_description.as_deref().or(self.description.as_deref())
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderWorkspaceSnapshot {
+    pub cwd: String,
+    #[serde(default)]
+    pub skills: Vec<ProviderSkill>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
