@@ -257,7 +257,18 @@ impl ServerSettings {
             }
         }
         if let Some(instances) = patch.get_mut("providerInstances") {
-            *instances = rebase_object(self.0.get("providerInstances"), instances, latest.0.get("providerInstances"));
+            let before = self.0.get("providerInstances");
+            let current = latest.0.get("providerInstances");
+            let mut rebased = rebase_object(before, instances, current);
+            // Editing an existing instance must not recreate one deleted on
+            // the server. Only IDs absent from the base are intended additions.
+            if let Some(entries) = rebased.as_object_mut() {
+                entries.retain(|id, _| {
+                    before.and_then(|map| map.get(id)).is_none()
+                        || current.and_then(|map| map.get(id)).is_some()
+                });
+            }
+            *instances = rebased;
         }
         patch
     }
@@ -527,5 +538,33 @@ mod tests {
             "work": { "driver": "codex", "enabled": false, "config": { "binaryPath": "new", "customModels": ["b"] }, "future": 1 },
             "remote": { "driver": "cursor" }
         } }));
+    }
+
+    #[test]
+    fn provider_edits_do_not_recreate_instances_removed_remotely() {
+        let base = ServerSettings::from_value(json!({ "providerInstances": {
+            "removed": { "driver": "codex", "enabled": true, "config": { "binaryPath": "codex" } },
+            "kept": { "driver": "claude", "enabled": true }
+        } }));
+        let mut patch = base.raw().clone();
+        patch["providerInstances"]["removed"]["enabled"] = json!(false);
+        patch["providerInstances"]["kept"]["enabled"] = json!(false);
+        patch["providerInstances"]["new"] = json!({ "driver": "cursor", "enabled": true });
+        for latest in [json!({}), json!({ "providerInstances": {} }), json!({ "providerInstances": {
+            "kept": { "driver": "claude", "enabled": true, "future": 1 },
+            "remote": { "driver": "grok", "enabled": true }
+        } })] {
+            let latest = ServerSettings::from_value(latest);
+            let rebased = base.rebase_patch(&patch, &latest);
+            let instances = &rebased["providerInstances"];
+            assert!(instances.get("removed").is_none());
+            assert_eq!(instances["new"], json!({ "driver": "cursor", "enabled": true }));
+            if latest.raw()["providerInstances"].get("kept").is_some() {
+                assert_eq!(instances["kept"], json!({ "driver": "claude", "enabled": false, "future": 1 }));
+                assert_eq!(instances["remote"], latest.raw()["providerInstances"]["remote"]);
+            } else {
+                assert!(instances.get("kept").is_none());
+            }
+        }
     }
 }
