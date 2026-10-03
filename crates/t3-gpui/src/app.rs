@@ -169,6 +169,15 @@ impl T3App {
                             patch: patch.clone(),
                         })
                     }
+                    SettingsEvent::LoadArchived(request_id) => {
+                        this.backend.send(Command::LoadArchived(request_id.clone()))
+                    }
+                    SettingsEvent::ThreadAction { thread_id, action } => {
+                        this.backend.send(Command::ThreadAction {
+                            thread_id: thread_id.clone(),
+                            action: action.clone(),
+                        })
+                    }
                     SettingsEvent::Theme(light) => {
                         let light = *light;
                         ui::apply_theme(light, cx);
@@ -578,10 +587,16 @@ impl T3App {
                 self.usage.update(cx, |usage, cx| usage.finish_limits(request_id, result, cx));
             }
             Event::Archived { request_id, snapshot } => {
+                self.settings.update(cx, |page, cx| {
+                    page.set_archived(&request_id, snapshot.clone(), cx)
+                });
                 self.sidebar
                     .update(cx, |sidebar, cx| sidebar.set_archived(&request_id, snapshot, cx));
             }
             Event::ThreadActionFinished { thread_id, action, success } => {
+                self.settings.update(cx, |page, cx| {
+                    page.archive_action_finished(&thread_id, &action, success, cx)
+                });
                 self.sidebar.update(cx, |sidebar, cx| {
                     sidebar.action_finished(&thread_id, &action, success, cx)
                 });
