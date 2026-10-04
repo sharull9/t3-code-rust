@@ -74,6 +74,9 @@ fn response_is_current(
 /// in it too, so its output is here.
 pub const TERMINAL_ID: &str = "term-1";
 
+/// The terminal shown in the bottom dock, separate from the panel's own.
+pub const DOCK_TERMINAL_ID: &str = "term-2";
+
 pub struct WorkspacePanel {
     scope: WorkspaceScope,
     scope_epoch: u64,
@@ -101,6 +104,8 @@ pub struct WorkspacePanel {
     /// The branch list shows a few local branches until expanded.
     show_all_refs: bool,
     connected: bool,
+    /// Shows only the terminal, docked under the main column.
+    docked: bool,
     error: Option<String>,
     _subscriptions: Vec<Subscription>,
 }
@@ -144,8 +149,21 @@ impl WorkspacePanel {
             queued_command: None,
             show_all_refs: false,
             connected: false,
+            docked: false,
             error: None,
             _subscriptions: subscriptions,
+        }
+    }
+
+    /// A terminal-only panel for the bottom dock. Its request ids start high
+    /// so results routed to both panels never collide.
+    pub fn new_terminal_dock(window: &mut Window, cx: &mut Context<Self>) -> Self {
+        Self {
+            next_request_id: 1 << 32,
+            tab: WorkspaceTab::Terminal,
+            terminal_id: DOCK_TERMINAL_ID.into(),
+            docked: true,
+            ..Self::new(window, cx)
         }
     }
 
@@ -172,7 +190,7 @@ impl WorkspacePanel {
         self.terminal_wanted = false;
         self.queued_command = None;
         self.error = None;
-        if let Some(cwd) = self.scope.cwd.clone() {
+        if let Some(cwd) = self.scope.cwd.clone().filter(|_| !self.docked) {
             self.request(
                 WorkspaceRequest::ListDirectory { cwd: cwd.clone(), directory_path: None },
                 RequestSlot::Directory,
@@ -189,7 +207,7 @@ impl WorkspacePanel {
             return;
         }
         self.connected = connected;
-        if connected {
+        if connected && !self.docked {
             self.refresh_directory(cx);
             if let Some(cwd) = self.scope.cwd.clone() {
                 self.request(
@@ -199,6 +217,8 @@ impl WorkspacePanel {
                 );
                 self.request(WorkspaceRequest::ListRefs { cwd }, RequestSlot::Refs, cx);
             }
+        }
+        if connected {
             if self.terminal_wanted && self.tab == WorkspaceTab::Terminal {
                 self.open_terminal(cx);
             }
@@ -558,6 +578,9 @@ impl WorkspacePanel {
 
 impl Render for WorkspacePanel {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.docked {
+            return self.render_dock(cx).into_any_element();
+        }
         let body = match self.tab {
             WorkspaceTab::Files => self.render_files(cx).into_any_element(),
             WorkspaceTab::Changes => self.render_changes(cx).into_any_element(),
@@ -630,10 +653,33 @@ impl Render for WorkspacePanel {
                     .child(div().min_w_0().child(error))
             }))
             .child(body)
+            .into_any_element()
     }
 }
 
 impl WorkspacePanel {
+    fn render_dock(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme();
+        v_flex()
+            .size_full()
+            .min_h_0()
+            .bg(theme.background)
+            .children(self.error.clone().map(|error| {
+                h_flex()
+                    .mx_3()
+                    .mt_2()
+                    .gap_2()
+                    .p_2()
+                    .rounded_md()
+                    .bg(theme.danger.opacity(0.1))
+                    .text_xs()
+                    .text_color(theme.danger)
+                    .child(icon(IconName::CircleAlert).xsmall().flex_shrink_0())
+                    .child(div().min_w_0().child(error))
+            }))
+            .child(self.render_terminal(cx))
+    }
+
     fn render_files(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
         let mono = theme.mono_font_family.clone();

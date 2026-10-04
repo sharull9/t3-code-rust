@@ -178,6 +178,8 @@ pub fn apply_theme(light: bool, cx: &mut App) {
     theme.success = hex(p.success);
     theme.warning = hex(p.warning);
     theme.danger = hex(p.danger);
+    // Text on a `danger` fill, e.g. the hovered window close button.
+    theme.danger_foreground = hex(0xffffff);
     // Components such as `Button` paint from the resolved tokens, which
     // `Theme::change` derived from the stock palette; rebuild them from ours.
     theme.tokens = ThemeTokens::from(&theme.colors);

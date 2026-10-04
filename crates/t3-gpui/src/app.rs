@@ -97,6 +97,9 @@ pub struct T3App {
     attachment_panels: HashMap<String, Entity<AttachmentPanel>>,
     workspace: Entity<WorkspacePanel>,
     workspace_open: bool,
+    /// The terminal docked under the main column.
+    terminal_dock: Entity<WorkspacePanel>,
+    terminal_dock_open: bool,
     /// The floating Workspace / Version Control card.
     info: Entity<InfoPanel>,
     info_open: bool,
@@ -159,6 +162,7 @@ impl T3App {
         let sidebar = cx.new(|cx| Sidebar::new(window, cx));
         let project_picker = cx.new(|cx| ProjectPicker::new(window, cx));
         let workspace = cx.new(|cx| WorkspacePanel::new(window, cx));
+        let terminal_dock = cx.new(|cx| WorkspacePanel::new_terminal_dock(window, cx));
         let info = cx.new(|cx| InfoPanel::new(window, cx));
         let script_dialog = cx.new(|cx| ScriptDialog::new(window, cx));
         let directory_picker = cx.new(|cx| DirectoryPicker::new(window, cx));
@@ -266,6 +270,14 @@ impl T3App {
                     request: request.clone(),
                 });
             }),
+            cx.subscribe(&terminal_dock, |this, _, event: &WorkspaceEvent, _| {
+                let WorkspaceEvent::Request { request_id, scope, request } = event;
+                this.backend.send(Command::Workspace {
+                    request_id: *request_id,
+                    scope: scope.clone(),
+                    request: request.clone(),
+                });
+            }),
             // The git status arrives after `sync_info`; pass its branch on.
             cx.observe(&info, |this, _, cx| this.sync_draft_branch(cx)),
             cx.subscribe_in(&info, window, |this, _, event: &InfoPanelEvent, window, cx| {
@@ -366,6 +378,8 @@ impl T3App {
             attachment_panels: HashMap::new(),
             workspace,
             workspace_open: false,
+            terminal_dock,
+            terminal_dock_open: false,
             info,
             info_open: crate::prefs::Prefs::global(cx).info_panel_open,
             script_dialog,
@@ -448,7 +462,11 @@ impl T3App {
                         picker.apply_result(request_id, result, window, cx);
                     });
                 } else {
-                    self.workspace
+                    // Each panel only applies the request ids it issued.
+                    self.workspace.update(cx, |panel, cx| {
+                        panel.apply_result(request_id, &scope, result.clone(), cx)
+                    });
+                    self.terminal_dock
                         .update(cx, |panel, cx| panel.apply_result(request_id, &scope, result, cx));
                 }
             }
@@ -456,7 +474,11 @@ impl T3App {
                 self.info.update(cx, |info, cx| info.apply_result(request_id, result, cx))
             }
             Event::Terminal { scope, item } => {
-                self.workspace.update(cx, |panel, cx| panel.apply_terminal_event(&scope, item, cx))
+                self.workspace.update(cx, |panel, cx| {
+                    panel.apply_terminal_event(&scope, item.clone(), cx)
+                });
+                self.terminal_dock
+                    .update(cx, |panel, cx| panel.apply_terminal_event(&scope, item, cx));
             }
             Event::PairFinished(success) => {
                 self.pairing_pending = false;
@@ -466,6 +488,8 @@ impl T3App {
                     self.active_server = None;
                     self.attachment_panels.clear();
                     self.workspace
+                        .update(cx, |panel, cx| panel.set_scope(WorkspaceScope::default(), cx));
+                    self.terminal_dock
                         .update(cx, |panel, cx| panel.set_scope(WorkspaceScope::default(), cx));
                     self.pairing_link.update(cx, |state, cx| state.set_value("", window, cx));
                     self.switching_server = false;
@@ -494,6 +518,7 @@ impl T3App {
                 let connected = matches!(status, Status::Connected(_));
                 self.settings.update(cx, |panel, cx| panel.set_connected(connected, cx));
                 self.workspace.update(cx, |panel, cx| panel.set_connected(connected, cx));
+                self.terminal_dock.update(cx, |panel, cx| panel.set_connected(connected, cx));
                 self.info.update(cx, |info, cx| info.set_connected(connected, cx));
                 let usage_open = self.usage_open;
                 self.usage.update(cx, |usage, cx| {
@@ -526,6 +551,9 @@ impl T3App {
                             self.attachment_panels.clear();
                             self.backend.send(Command::CloseThread);
                             self.workspace.update(cx, |panel, cx| {
+                                panel.set_scope(WorkspaceScope::default(), cx)
+                            });
+                            self.terminal_dock.update(cx, |panel, cx| {
                                 panel.set_scope(WorkspaceScope::default(), cx)
                             });
                         }
@@ -911,6 +939,9 @@ impl T3App {
         self.sync_sidebar_drafts(cx);
         if self.workspace_open {
             self.sync_workspace(cx);
+        }
+        if self.terminal_dock_open {
+            self.sync_terminal_dock(cx);
         }
         self.sync_info(cx);
         cx.notify();
@@ -1349,16 +1380,37 @@ impl T3App {
     }
 
     fn sync_workspace(&self, cx: &mut Context<Self>) {
+        let scope = self.workspace_scope(cx);
+        self.workspace.update(cx, |panel, cx| panel.set_scope(scope, cx));
+    }
+
+    fn workspace_scope(&self, cx: &App) -> WorkspaceScope {
         let thread = self.open_thread_shell(cx);
         let project = self.current_project(cx);
-        let scope = WorkspaceScope {
+        WorkspaceScope {
             project_id: project.map(|p| p.id.clone()),
             thread_id: thread.map(|t| t.id.clone()),
             cwd: thread
                 .and_then(|t| t.worktree_path.clone())
                 .or_else(|| project.map(|p| p.workspace_root.clone())),
-        };
-        self.workspace.update(cx, |panel, cx| panel.set_scope(scope, cx));
+        }
+    }
+
+    fn toggle_terminal_dock(&mut self, cx: &mut Context<Self>) {
+        self.terminal_dock_open = !self.terminal_dock_open;
+        if self.terminal_dock_open {
+            self.sync_terminal_dock(cx);
+        }
+        cx.notify();
+    }
+
+    /// Points the dock at the open thread and (re)opens its terminal.
+    fn sync_terminal_dock(&self, cx: &mut Context<Self>) {
+        let scope = self.workspace_scope(cx);
+        self.terminal_dock.update(cx, |panel, cx| {
+            panel.set_scope(scope, cx);
+            panel.select_tab(WorkspaceTab::Terminal, cx);
+        });
     }
 
     fn toggle_info(&mut self, cx: &mut Context<Self>) {
@@ -1479,6 +1531,7 @@ impl Render for T3App {
         let workspace_visible = self.workspace_open && !self.switching_server && !settings_open;
         let workspace_width = px((f32::from(window.bounds().size.width) * 0.4).clamp(240., 420.));
         let info_visible = self.info_visible(cx);
+        let dock_visible = self.terminal_dock_open && !self.switching_server && !settings_open;
         self.usage.update(cx, |usage, _| usage.set_active(usage_active));
         let main = if settings_open {
             self.settings.clone().into_any_element()
@@ -1581,7 +1634,17 @@ impl Render for T3App {
                                     .min_h_0()
                                     .min_w_0()
                                     .child(main),
-                            ),
+                            )
+                            .when(dock_visible, |column| {
+                                column.child(
+                                    div()
+                                        .h(px(280.))
+                                        .flex_shrink_0()
+                                        .border_t_1()
+                                        .border_color(cx.theme().border)
+                                        .child(self.terminal_dock.clone()),
+                                )
+                            }),
                     )
                     .when(workspace_visible, |row| {
                         row.child(
@@ -1705,6 +1768,18 @@ impl T3App {
                     .on_click(cx.listener(|this, _, _, cx| this.toggle_info(cx))),
             )
             .child(
+                Button::new("terminal-dock")
+                    .ghost()
+                    .small()
+                    .icon(icon(IconName::PanelBottom))
+                    .selected(self.terminal_dock_open)
+                    .accessibility_label("Terminal")
+                    .tooltip("Terminal")
+                    .occlude()
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .on_click(cx.listener(|this, _, _, cx| this.toggle_terminal_dock(cx))),
+            )
+            .child(
                 Button::new("workspace")
                     .ghost()
                     .small()
@@ -1715,19 +1790,6 @@ impl T3App {
                     .occlude()
                     .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                     .on_click(cx.listener(|this, _, window, cx| this.toggle_workspace(window, cx))),
-            )
-            .child(
-                Button::new("settings")
-                    .ghost()
-                    .small()
-                    .icon(icon(IconName::Settings))
-                    .accessibility_label("Settings")
-                    .tooltip("Settings (Ctrl+,)")
-                    .occlude()
-                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        this.toggle_settings(window, cx)
-                    })),
             );
         TitleBar::new().pl_0().child(
             h_flex().w_full().h_full().min_w_0().child(brand).child(breadcrumb).child(controls),
@@ -2036,7 +2098,7 @@ mod recovery_tests {
                 app.handle_event(Event::Status(Status::Connected("Test server".into())), window, cx);
             });
             window.render_frame(cx);
-            window.click("settings", cx);
+            window.click("sidebar-settings", cx);
             assert!(app.read(cx).settings.read(cx).is_open());
             window.render_frame(cx);
             assert_eq!(window.find("settings-page").bounds(), window.find("main-content").bounds());
