@@ -131,6 +131,66 @@ pub struct ThreadShell {
     pub latest_user_message_at: Option<String>,
     #[serde(default)]
     pub latest_turn: Option<LatestTurn>,
+    /// The run in progress, which "Stop" interrupts.
+    #[serde(default)]
+    pub active_run_id: Option<String>,
+    /// Where the thread came from: a fork or a delegated subagent of
+    /// another thread. Absent on servers that predate thread lineage.
+    #[serde(default)]
+    pub lineage: Option<ThreadLineage>,
+    /// V2 shells report run state here instead of `session`, `latestTurn`
+    /// and the pending flags; [`ThreadShell::adopt_v2_status`] folds them in.
+    #[serde(default)]
+    status: Option<String>,
+    #[serde(default)]
+    activity_run_status: Option<String>,
+    #[serde(default)]
+    activity_run_started_at: Option<String>,
+    #[serde(default)]
+    latest_run_requested_at: Option<String>,
+    #[serde(default)]
+    latest_run_started_at: Option<String>,
+    #[serde(default)]
+    latest_run_completed_at: Option<String>,
+    #[serde(default)]
+    pending_runtime_request: Option<PendingRuntimeRequest>,
+    #[serde(default)]
+    last_error: Option<String>,
+}
+
+/// `OrchestrationV2PendingRuntimeRequestSummary`, reduced to what decides
+/// between an approval and a question.
+#[derive(Debug, Clone, Deserialize)]
+struct PendingRuntimeRequest {
+    kind: String,
+}
+
+/// Decodes a shell thread, folding V2 run state into the V1 fields.
+fn shell_thread<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<ThreadShell, D::Error> {
+    let mut thread = ThreadShell::deserialize(deserializer)?;
+    thread.adopt_v2_status();
+    Ok(thread)
+}
+
+fn shell_threads<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Vec<ThreadShell>, D::Error> {
+    let mut threads = Vec::<ThreadShell>::deserialize(deserializer)?;
+    threads.iter_mut().for_each(ThreadShell::adopt_v2_status);
+    Ok(threads)
+}
+
+/// `ThreadLineage`: a thread's parent and the root of its family.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadLineage {
+    #[serde(default)]
+    pub parent_thread_id: Option<String>,
+    /// "fork" | "subagent" | absent.
+    #[serde(default)]
+    pub relationship_to_parent: Option<String>,
+    #[serde(default)]
+    pub root_thread_id: Option<String>,
 }
 
 /// Configured instances and model IDs come from the connected server.
@@ -305,6 +365,14 @@ pub struct LatestTurn {
 }
 
 impl ThreadShell {
+    /// The thread that delegated this one, when it is a subagent.
+    pub fn subagent_parent_id(&self) -> Option<&str> {
+        let lineage = self.lineage.as_ref()?;
+        (lineage.relationship_to_parent.as_deref() == Some("subagent"))
+            .then_some(lineage.parent_thread_id.as_deref())
+            .flatten()
+    }
+
     /// Mirrors `Sidebar.tsx`'s classification: settled is an explicit,
     /// user-driven (or server auto-settle) state, never derived from turn
     /// status. A thread with no `settledOverride` is active.
@@ -340,6 +408,61 @@ impl ThreadShell {
         }
         latest.or(if self.updated_at.is_empty() { None } else { Some(self.updated_at.as_str()) })
     }
+
+    /// Fills `session`, `latest_turn` and the pending flags from a V2
+    /// shell's `status`, `latestRun*` and `pendingRuntimeRequest`, so the
+    /// Working badge, its timer and Stop behave as they do on V1 servers.
+    /// V1 fields, when present, win.
+    pub(crate) fn adopt_v2_status(&mut self) {
+        // `activityRunStatus` names the run doing the work, which can differ
+        // from the latest run's `status` (say, a queued run behind it).
+        let status = self.activity_run_status.as_deref().or(self.status.as_deref());
+        let working = matches!(
+            status,
+            Some("preparing" | "queued" | "starting" | "running" | "waiting")
+        );
+        if self.session.is_none()
+            && let Some(status) = status
+        {
+            let status = match status {
+                "preparing" | "queued" | "starting" => SessionStatus::Starting,
+                "running" | "waiting" => SessionStatus::Running,
+                "failed" => SessionStatus::Error,
+                "interrupted" | "cancelled" => SessionStatus::Interrupted,
+                "idle" => SessionStatus::Idle,
+                _ => SessionStatus::Ready,
+            };
+            self.session = Some(Session {
+                status,
+                provider_name: None,
+                active_turn_id: self.active_run_id.clone(),
+                last_error: self.last_error.clone(),
+            });
+        }
+        if self.latest_turn.is_none()
+            && (self.latest_run_requested_at.is_some()
+                || self.latest_run_started_at.is_some()
+                || self.latest_run_completed_at.is_some())
+        {
+            let started_at = if working {
+                self.activity_run_started_at.clone().or(self.latest_run_started_at.clone())
+            } else {
+                self.latest_run_started_at.clone()
+            };
+            self.latest_turn = Some(LatestTurn {
+                requested_at: self.latest_run_requested_at.clone(),
+                started_at,
+                completed_at: self.latest_run_completed_at.clone(),
+            });
+        }
+        if let Some(request) = &self.pending_runtime_request {
+            if request.kind == "user_input" {
+                self.has_pending_user_input = true;
+            } else {
+                self.has_pending_approvals = true;
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -347,6 +470,7 @@ impl ThreadShell {
 pub struct ShellSnapshot {
     pub snapshot_sequence: u64,
     pub projects: Vec<ProjectShell>,
+    #[serde(deserialize_with = "shell_threads")]
     pub threads: Vec<ThreadShell>,
 }
 
@@ -373,6 +497,7 @@ pub enum ShellStreamItem {
     #[serde(alias = "thread.updated")]
     ThreadUpserted {
         sequence: u64,
+        #[serde(deserialize_with = "shell_thread")]
         thread: ThreadShell,
     },
     #[serde(alias = "thread.removed")]

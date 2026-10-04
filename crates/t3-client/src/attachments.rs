@@ -37,7 +37,7 @@ pub enum AttachmentKind {
     File,
 }
 
-/// Exact metadata shape accepted in `thread.turn.start.message.attachments`.
+/// Exact metadata shape accepted in `message.dispatch`'s `attachments`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UploadedAttachment {

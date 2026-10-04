@@ -293,6 +293,43 @@ mod tests {
         assert!(state.threads.is_empty());
     }
 
+    #[test]
+    fn v2_shell_run_state_fills_session_turn_and_pending_flags() {
+        let mut state = ShellState::default();
+        state.apply(serde_json::from_value(json!({
+            "kind": "thread.updated", "sequence": 1, "location": "active",
+            "thread": {
+                "id": "t1", "projectId": "p1", "title": "V2", "runtimeMode": "full-access",
+                "status": "completed", "activityRunStatus": "running", "activeRunId": "run2",
+                "latestRunRequestedAt": "2026-10-04T00:00:00Z",
+                "latestRunStartedAt": "2026-10-04T00:00:01Z",
+                "activityRunStartedAt": "2026-10-03T23:59:00Z",
+                "latestRunCompletedAt": null,
+                "pendingRuntimeRequest": { "id": "r1", "kind": "user_input", "createdAt": "2026-10-04T00:00:02Z" }
+            }
+        })).unwrap());
+        let thread = &state.threads[0];
+        let session = thread.session.as_ref().unwrap();
+        assert!(session.is_working());
+        assert_eq!(session.active_turn_id.as_deref(), Some("run2"));
+        let turn = thread.latest_turn.as_ref().unwrap();
+        assert_eq!(turn.started_at.as_deref(), Some("2026-10-03T23:59:00Z"));
+        assert!(thread.has_pending_user_input && !thread.has_pending_approvals);
+
+        state.apply(serde_json::from_value(json!({
+            "kind": "thread.updated", "sequence": 2, "location": "active",
+            "thread": {
+                "id": "t1", "projectId": "p1", "title": "V2", "runtimeMode": "full-access",
+                "status": "failed", "activeRunId": null, "lastError": "boom",
+                "pendingRuntimeRequest": null
+            }
+        })).unwrap());
+        let session = state.threads[0].session.as_ref().unwrap();
+        assert_eq!(session.status, SessionStatus::Error);
+        assert_eq!(session.last_error.as_deref(), Some("boom"));
+        assert!(!state.threads[0].has_pending_user_input);
+    }
+
     fn thread_state() -> ThreadState {
         let mut state = ThreadState::default();
         state.apply(

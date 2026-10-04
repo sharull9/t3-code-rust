@@ -14,7 +14,7 @@ use gpui_kit::component::Disableable as _;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
-use gpui_kit::component::scroll::ScrollableElement as _;
+use gpui_kit::component::scroll::{ScrollableElement as _, Scrollbar};
 use gpui_kit::component::{
     ActiveTheme as _, Sizable as _, Size, StyledExt as _, WindowExt as _, h_flex, v_flex,
 };
@@ -66,6 +66,7 @@ pub struct Sidebar {
     /// Shown in their own collapsible shelf above "Settled".
     working: Vec<ThreadShell>,
     working_expanded: bool,
+    working_scroll: ScrollHandle,
     usage_open: bool,
     /// Unarchived, settled threads matching the search query (see
     /// `ThreadShell::is_settled`), newest-settled first. Collapsed behind
@@ -73,6 +74,16 @@ pub struct Sidebar {
     /// searching.
     settled: Vec<ThreadShell>,
     settled_expanded: bool,
+    settled_scroll: ScrollHandle,
+    /// Unarchived subagent threads by the thread that delegated them,
+    /// oldest first. They render nested under that parent instead of in
+    /// the lists above.
+    subagents: HashMap<String, Vec<ThreadShell>>,
+    /// Parents whose subagents are shown.
+    subagents_expanded: HashSet<String>,
+    /// Parents with a subagent somewhere below them matching the search,
+    /// which opens their subagents while searching.
+    subagent_hits: HashSet<String>,
     archive_mode: bool,
     archive_request: Option<String>,
     archived: Vec<ThreadShell>,
@@ -126,9 +137,14 @@ impl Sidebar {
             active: Vec::new(),
             working: Vec::new(),
             working_expanded: true,
+            working_scroll: ScrollHandle::new(),
             usage_open: false,
             settled: Vec::new(),
             settled_expanded: false,
+            settled_scroll: ScrollHandle::new(),
+            subagents: HashMap::new(),
+            subagents_expanded: HashSet::new(),
+            subagent_hits: HashSet::new(),
             projects: HashMap::new(),
             _subscriptions: subscriptions,
         }
@@ -202,6 +218,14 @@ impl Sidebar {
     }
 
     pub fn set_open_thread(&mut self, thread_id: Option<String>, cx: &mut Context<Self>) {
+        // Reveal an opened subagent by expanding the threads above it.
+        let mut parent =
+            thread_id.as_deref().and_then(|id| self.shell.thread(id)?.subagent_parent_id());
+        for _ in 0..MAX_SUBAGENT_DEPTH {
+            let Some(id) = parent else { break };
+            self.subagents_expanded.insert(id.to_owned());
+            parent = self.shell.thread(id).and_then(ThreadShell::subagent_parent_id);
+        }
         self.open_thread_id = thread_id;
         cx.notify();
     }
@@ -300,17 +324,49 @@ impl Sidebar {
 
         let query = self.search.read(cx).value().trim().to_lowercase();
         let project_title = |id: &str| self.projects.get(id).map(|p| p.title.as_str());
-        let matching: Vec<&ThreadShell> = self
+        let matches = |t: &ThreadShell| {
+            query.is_empty()
+                || t.title.to_lowercase().contains(&query)
+                || project_title(&t.project_id)
+                    .is_some_and(|title| title.to_lowercase().contains(&query))
+        };
+        let unarchived: HashMap<&str, &ThreadShell> = self
             .shell
             .threads
             .iter()
             .filter(|t| t.archived_at.is_none())
-            .filter(|t| {
-                query.is_empty()
-                    || t.title.to_lowercase().contains(&query)
-                    || project_title(&t.project_id)
-                        .is_some_and(|title| title.to_lowercase().contains(&query))
-            })
+            .map(|t| (t.id.as_str(), t))
+            .collect();
+
+        // Subagents nest under their parent rather than joining the lists.
+        let mut subagents: HashMap<String, Vec<ThreadShell>> = HashMap::new();
+        let mut top_level = Vec::new();
+        for thread in self.shell.threads.iter().filter(|t| t.archived_at.is_none()) {
+            match nesting_parent(thread, &unarchived) {
+                Some(parent) => {
+                    subagents.entry(parent.to_owned()).or_default().push(thread.clone())
+                }
+                None => top_level.push(thread),
+            }
+        }
+        for children in subagents.values_mut() {
+            children.sort_by(|a, b| a.created_at.cmp(&b.created_at).then_with(|| a.id.cmp(&b.id)));
+        }
+        let mut subagent_hits = HashSet::new();
+        if !query.is_empty() {
+            for child in subagents.values().flatten().filter(|child| matches(child)) {
+                let mut parent = nesting_parent(child, &unarchived);
+                while let Some(id) = parent {
+                    if !subagent_hits.insert(id.to_owned()) {
+                        break;
+                    }
+                    parent = unarchived.get(id).and_then(|t| nesting_parent(t, &unarchived));
+                }
+            }
+        }
+        let matching: Vec<&ThreadShell> = top_level
+            .into_iter()
+            .filter(|t| matches(t) || subagent_hits.contains(&t.id))
             .collect();
 
         let is_working = |t: &ThreadShell| matches!(thread_badge(t), Some(Badge::Working));
@@ -334,6 +390,8 @@ impl Sidebar {
         self.active = active;
         self.working = working;
         self.settled = settled;
+        self.subagents = subagents;
+        self.subagent_hits = subagent_hits;
         cx.notify();
     }
 }
@@ -358,27 +416,22 @@ impl Render for Sidebar {
                 .map(|(ix, draft)| self.render_draft_card(ix, draft, cx).into_any_element())
                 .collect()
         };
+        // Searching surfaces collapsed matches too, rather than making the
+        // user expand a shelf first to find what they typed for.
+        let searching = !query.is_empty();
         let mut active_cards: Vec<_> = self
             .active
             .iter()
             .enumerate()
-            .map(|(ix, thread)| {
-                let active = self.open_thread_id.as_deref() == Some(thread.id.as_str());
-                self.render_thread_card("active-thread", ix, thread, active, cx).into_any_element()
-            })
+            .map(|(ix, thread)| self.render_thread_group("active-thread", ix, thread, searching, cx))
             .collect();
-        // Searching surfaces collapsed matches too, rather than making the
-        // user expand a shelf first to find what they typed for.
-        let searching = !self.search.read(cx).value().trim().is_empty();
         let working_expanded = self.working_expanded || searching;
         let working_cards: Vec<_> = if working_expanded && !self.archive_mode {
             self.working
                 .iter()
                 .enumerate()
                 .map(|(ix, thread)| {
-                    let active = self.open_thread_id.as_deref() == Some(thread.id.as_str());
-                    self.render_thread_card("working-thread", ix, thread, active, cx)
-                        .into_any_element()
+                    self.render_thread_group("working-thread", ix, thread, searching, cx)
                 })
                 .collect()
         } else {
@@ -390,9 +443,7 @@ impl Render for Sidebar {
                 .iter()
                 .enumerate()
                 .map(|(ix, thread)| {
-                    let active = self.open_thread_id.as_deref() == Some(thread.id.as_str());
-                    self.render_thread_card("settled-thread", ix, thread, active, cx)
-                        .into_any_element()
+                    self.render_thread_group("settled-thread", ix, thread, searching, cx)
                 })
                 .collect()
         } else {
@@ -617,15 +668,12 @@ impl Render for Sidebar {
                         .border_color(theme.sidebar_border)
                         .child(divider)
                         .when(!working_cards.is_empty(), |shelf| {
-                            shelf.child(
-                                div()
-                                    .id("working-list")
-                                    .max_h(working_max_h)
-                                    .overflow_y_scrollbar()
-                                    .child(
-                                        v_flex().gap_0p5().pb_2().children(working_cards),
-                                    ),
-                            )
+                            shelf.child(capped_scroll(
+                                "working-list",
+                                &self.working_scroll,
+                                working_max_h,
+                                v_flex().gap_0p5().pb_2().children(working_cards),
+                            ))
                         }),
                 )
             })
@@ -639,15 +687,12 @@ impl Render for Sidebar {
                         .border_color(theme.sidebar_border)
                         .child(divider)
                         .when(!settled_cards.is_empty(), |shelf| {
-                            shelf.child(
-                                div()
-                                    .id("settled-list")
-                                    .max_h(settled_max_h)
-                                    .overflow_y_scrollbar()
-                                    .child(
-                                        v_flex().gap_0p5().pb_2().children(settled_cards),
-                                    ),
-                            )
+                            shelf.child(capped_scroll(
+                                "settled-list",
+                                &self.settled_scroll,
+                                settled_max_h,
+                                v_flex().gap_0p5().pb_2().children(settled_cards),
+                            ))
                         }),
                 )
             })
@@ -822,25 +867,19 @@ impl Sidebar {
             )
     }
 
-    fn render_thread_card(
+    /// The "…" menu on a thread's card: rename, pin, settle and archive.
+    fn thread_menu(
         &self,
-        list: &'static str,
-        ix: usize,
         thread: &ThreadShell,
-        active: bool,
         cx: &mut Context<Self>,
-    ) -> impl IntoElement {
-        let theme = cx.theme();
-        let project = self.projects.get(&thread.project_id);
-        let thread_id = thread.id.clone();
+    ) -> impl IntoElement + use<> {
         let menu_view = cx.entity().downgrade();
         let menu_thread_id = thread.id.clone();
         let pinned = thread.pinned_at.is_some();
         let settled = thread.is_settled();
         let connected = matches!(self.status, Status::Connected(_));
-        let archived = thread.archived_at.is_some();
         let title = thread.title.clone();
-        let menu = Button::new(SharedString::from(format!("thread-menu-{}", thread.id)))
+        Button::new(SharedString::from(format!("thread-menu-{}", thread.id)))
             .ghost()
             .xsmall()
             .icon(icon(IconName::Ellipsis))
@@ -907,7 +946,215 @@ impl Sidebar {
                     }));
                 }
                 menu
-            });
+            })
+    }
+
+    /// A thread's card with its subagents nested below it, joined by tree
+    /// lines, when they're expanded.
+    fn render_thread_group(
+        &self,
+        list: &'static str,
+        ix: usize,
+        thread: &ThreadShell,
+        searching: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let active = self.open_thread_id.as_deref() == Some(thread.id.as_str());
+        let card = self.render_thread_card(list, ix, thread, active, cx).into_any_element();
+        match self.subagents.get(&thread.id) {
+            Some(children) if self.subagents_shown(&thread.id, searching) => v_flex()
+                .child(card)
+                .child(self.render_subagents(children, searching, 1, cx))
+                .into_any_element(),
+            _ => card,
+        }
+    }
+
+    fn subagents_shown(&self, parent_id: &str, searching: bool) -> bool {
+        self.subagents_expanded.contains(parent_id)
+            || (searching && self.subagent_hits.contains(parent_id))
+    }
+
+    /// The chip on a parent's card that shows or hides its subagents: the
+    /// count and a chevron, tinted while any of them is working.
+    fn render_subagents_toggle(
+        &self,
+        thread: &ThreadShell,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let children = self.subagents.get(&thread.id)?;
+        let searching = !self.search.read(cx).value().trim().is_empty();
+        let expanded = self.subagents_shown(&thread.id, searching);
+        let working =
+            children.iter().any(|child| matches!(thread_badge(child), Some(Badge::Working)));
+        let count = children.len();
+        let id = thread.id.clone();
+        let theme = cx.theme();
+        Some(
+            h_flex()
+                .id(SharedString::from(format!("subagents-toggle-{}", thread.id)))
+                .test_support()
+                .flex_none()
+                .gap_1()
+                .px_1p5()
+                .h(px(18.))
+                .rounded_md()
+                .text_xs()
+                .text_color(if working { theme.info } else { theme.muted_foreground })
+                .bg(theme.muted.opacity(0.5))
+                .hover(|style| style.bg(theme.list_hover))
+                .cursor_pointer()
+                .tooltip(move |window, cx| {
+                    let noun = if count == 1 { "subagent" } else { "subagents" };
+                    let verb = if expanded { "Hide" } else { "Show" };
+                    gpui_kit::component::tooltip::Tooltip::new(format!("{verb} {count} {noun}"))
+                        .build(window, cx)
+                })
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    cx.stop_propagation();
+                    if !this.subagents_expanded.remove(&id) {
+                        this.subagents_expanded.insert(id.clone());
+                    }
+                    cx.notify();
+                }))
+                .child(icon(IconName::Bot).xsmall())
+                .child(count.to_string())
+                .child(
+                    icon(if expanded { IconName::ChevronDown } else { IconName::ChevronRight })
+                        .xsmall(),
+                )
+                .into_any_element(),
+        )
+    }
+
+    /// Subagent rows hanging off a vertical rule from their parent, each
+    /// with its own elbow; the last one's rule stops at its elbow.
+    fn render_subagents(
+        &self,
+        children: &[ThreadShell],
+        searching: bool,
+        depth: usize,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let line = cx.theme().muted_foreground.opacity(0.35);
+        let elbow_y = SUBAGENT_ROW_GAP + SUBAGENT_CARD_HEIGHT / 2.;
+        let rows: Vec<_> = children
+            .iter()
+            .enumerate()
+            .map(|(ix, child)| {
+                let last = ix + 1 == children.len();
+                let nested = self
+                    .subagents
+                    .get(&child.id)
+                    .filter(|_| depth < MAX_SUBAGENT_DEPTH)
+                    .filter(|_| self.subagents_shown(&child.id, searching))
+                    .map(|grandchildren| {
+                        self.render_subagents(grandchildren, searching, depth + 1, cx)
+                    });
+                div()
+                    .flex()
+                    .child(
+                        div()
+                            .relative()
+                            .flex_none()
+                            .w(px(14.))
+                            .child(
+                                div()
+                                    .absolute()
+                                    .left_0()
+                                    .top_0()
+                                    .w(px(1.))
+                                    .when(last, |rule| rule.h(px(elbow_y)))
+                                    .when(!last, |rule| rule.h_full())
+                                    .bg(line),
+                            )
+                            .child(
+                                div()
+                                    .absolute()
+                                    .left_0()
+                                    .top(px(elbow_y))
+                                    .w(px(12.))
+                                    .h(px(1.))
+                                    .bg(line),
+                            ),
+                    )
+                    .child(
+                        v_flex()
+                            .flex_1()
+                            .min_w_0()
+                            .pt(px(SUBAGENT_ROW_GAP))
+                            .child(self.render_subagent_card(child, cx))
+                            .children(nested),
+                    )
+            })
+            .collect();
+        v_flex().pl(px(10.)).children(rows).into_any_element()
+    }
+
+    /// A compact card for a subagent: icon, title, status and actions.
+    fn render_subagent_card(&self, thread: &ThreadShell, cx: &mut Context<Self>) -> AnyElement {
+        let menu = self.thread_menu(thread, cx);
+        let toggle = self.render_subagents_toggle(thread, cx);
+        let active = self.open_thread_id.as_deref() == Some(thread.id.as_str());
+        let trailing = thread_trailing(
+            thread,
+            SharedString::from(format!("subagent-working-{}", thread.id)),
+            cx,
+        );
+        let theme = cx.theme();
+        let thread_id = thread.id.clone();
+        h_flex()
+            .id(SharedString::from(format!("subagent-thread-{}", thread.id)))
+            .test_support()
+            .h(px(SUBAGENT_CARD_HEIGHT))
+            .gap_2()
+            .pl_2()
+            .pr_1()
+            .rounded_md()
+            .border_1()
+            .border_color(transparent_black())
+            .text_xs()
+            .cursor_pointer()
+            .when(active, |card| {
+                card.bg(theme.sidebar_accent).border_color(theme.primary.opacity(0.25))
+            })
+            .when(!active, |card| card.hover(|style| style.bg(theme.list_hover)))
+            .on_click(cx.listener(move |_, _, _, cx| {
+                cx.emit(SidebarEvent::OpenThread(thread_id.clone()));
+            }))
+            .child(icon(IconName::Bot).xsmall().text_color(theme.muted_foreground))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .font_medium()
+                    .when(active, |title| title.font_semibold())
+                    .when(!active, |title| title.text_color(theme.foreground.opacity(0.85)))
+                    .child(ui::display_title(&thread.title)),
+            )
+            .children(toggle)
+            .child(trailing)
+            .child(menu)
+            .into_any_element()
+    }
+
+    fn render_thread_card(
+        &self,
+        list: &'static str,
+        ix: usize,
+        thread: &ThreadShell,
+        active: bool,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let menu = self.thread_menu(thread, cx);
+        let toggle = self.render_subagents_toggle(thread, cx);
+        let theme = cx.theme();
+        let project = self.projects.get(&thread.project_id);
+        let thread_id = thread.id.clone();
+        let pinned = thread.pinned_at.is_some();
+        let archived = thread.archived_at.is_some();
+        let connected = matches!(self.status, Status::Connected(_));
         // Distinct from `list` so the loader's id never collides with the
         // card's own id (both would otherwise share `(list, ix)`).
         let working_key: &'static str = match list {
@@ -916,28 +1163,7 @@ impl Sidebar {
             _ => "settled-working",
         };
 
-        let trailing = match thread_badge(thread) {
-            Some(badge) => h_flex()
-                .gap_1()
-                .text_color(badge.color(cx))
-                .child(match badge {
-                    Badge::Working => {
-                        ui::loader((working_key, ix), Size::XSmall).into_any_element()
-                    }
-                    _ => icon(IconName::CircleAlert).xsmall().into_any_element(),
-                })
-                .child(match badge {
-                    Badge::Working => working_since(thread)
-                        .and_then(ui::elapsed)
-                        .map_or_else(|| "Working".to_owned(), |time| format!("Working {time}")),
-                    _ => badge.label().to_owned(),
-                })
-                .into_any_element(),
-            None => div()
-                .text_color(theme.muted_foreground)
-                .children(ui::relative_time(&thread.updated_at))
-                .into_any_element(),
-        };
+        let trailing = thread_trailing(thread, (working_key, ix), cx);
         let unsent = self.unsent.contains(&thread.id);
         // The account the thread runs on: its provider instance's mark.
         let account = thread
@@ -1028,13 +1254,22 @@ impl Sidebar {
                     }),
             )
             .child(
-                div()
-                    .truncate()
-                    .text_sm()
-                    .font_medium()
-                    .when(active, |title| title.font_semibold())
-                    .when(!active, |title| title.text_color(theme.foreground.opacity(0.85)))
-                    .child(ui::display_title(&thread.title)),
+                h_flex()
+                    .gap_2()
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .text_sm()
+                            .font_medium()
+                            .when(active, |title| title.font_semibold())
+                            .when(!active, |title| {
+                                title.text_color(theme.foreground.opacity(0.85))
+                            })
+                            .child(ui::display_title(&thread.title)),
+                    )
+                    .children(toggle),
             )
             .when(thread.branch.is_some() || account.is_some(), |card| {
                 card.child(
@@ -1054,6 +1289,76 @@ impl Sidebar {
                         .children(account.map(|mark| div().pr_0p5().child(mark))),
                 )
             })
+    }
+}
+
+/// A list that grows with its content up to `max_h`, then scrolls.
+///
+/// `overflow_y_scrollbar` can't do this: it moves `max_h` onto a wrapper
+/// whose scroll area is `size_full` of an indefinite height, and leaves the
+/// cap on the content too, so the content never overflows and never
+/// scrolls. Here the capped element is the scroll container itself, with
+/// the scrollbar overlaid.
+fn capped_scroll(
+    id: &'static str,
+    handle: &ScrollHandle,
+    max_h: Pixels,
+    content: impl IntoElement,
+) -> impl IntoElement {
+    div()
+        .relative()
+        .child(div().id(id).max_h(max_h).overflow_y_scroll().track_scroll(handle).child(content))
+        .child(div().absolute().inset_0().child(Scrollbar::vertical(handle)))
+}
+
+/// Subagents of subagents nest at most this deep.
+const MAX_SUBAGENT_DEPTH: usize = 8;
+const SUBAGENT_CARD_HEIGHT: f32 = 28.;
+const SUBAGENT_ROW_GAP: f32 = 2.;
+
+/// The thread a subagent nests under: its parent, when that is unarchived
+/// and the chain above it ends rather than looping back.
+fn nesting_parent<'a>(
+    thread: &'a ThreadShell,
+    threads: &HashMap<&str, &'a ThreadShell>,
+) -> Option<&'a str> {
+    let parent = thread.subagent_parent_id().filter(|id| threads.contains_key(id))?;
+    let mut ancestor = Some(parent);
+    for _ in 0..=threads.len() {
+        let Some(id) = ancestor else { return Some(parent) };
+        if id == thread.id {
+            return None;
+        }
+        ancestor = threads.get(id).and_then(|t| t.subagent_parent_id());
+    }
+    None
+}
+
+/// What a card shows on the right: its status badge, or when it last
+/// changed.
+fn thread_trailing(thread: &ThreadShell, loader_id: impl Into<ElementId>, cx: &App) -> AnyElement {
+    let theme = cx.theme();
+    match thread_badge(thread) {
+        Some(badge) => h_flex()
+            .gap_1()
+            .text_color(badge.color(cx))
+            .child(match badge {
+                Badge::Working => {
+                    ui::loader(loader_id, Size::XSmall).into_any_element()
+                }
+                _ => icon(IconName::CircleAlert).xsmall().into_any_element(),
+            })
+            .child(match badge {
+                Badge::Working => working_since(thread)
+                    .and_then(ui::elapsed)
+                    .map_or_else(|| "Working".to_owned(), |time| format!("Working {time}")),
+                _ => badge.label().to_owned(),
+            })
+            .into_any_element(),
+        None => div()
+            .text_color(theme.muted_foreground)
+            .children(ui::relative_time(&thread.updated_at))
+            .into_any_element(),
     }
 }
 
@@ -1211,6 +1516,92 @@ mod interaction_tests {
         })
         .unwrap();
         assert_eq!(*events.borrow(), 1);
+    }
+
+    #[gpui_kit::test]
+    fn settled_shelf_scrolls_when_open(cx: &mut TestAppContext) {
+        let (handle, sidebar) = sidebar(cx);
+        cx.update_window(handle, |_, window, cx| {
+            sidebar.update(cx, |sidebar, cx| {
+                let threads = (0..40)
+                    .map(|index| {
+                        let mut thread = thread(&format!("settled-{index:02}"), false);
+                        thread.settled_override = Some("settled".into());
+                        thread
+                    })
+                    .collect();
+                sidebar.set_shell(ShellState { threads, ..Default::default() }, cx);
+            });
+            window.render_frame(cx);
+            window.click("settled-divider", cx);
+            window.render_frame(cx);
+            let first = window.find(("settled-thread", 0usize)).bounds();
+            window.scroll(
+                ("settled-thread", 0usize),
+                ScrollDelta::Pixels(point(px(0.), px(-240.))),
+                cx,
+            );
+            window.render_frame(cx);
+            let scrolled = window.try_find(("settled-thread", 0usize));
+            assert!(
+                scrolled.is_none_or(|row| !row.visible() || row.bounds().origin.y < first.origin.y)
+            );
+        })
+        .unwrap();
+    }
+
+    fn subagent(id: &str, parent: &str) -> ThreadShell {
+        let mut thread = thread(id, false);
+        thread.lineage = serde_json::from_value(json!({
+            "parentThreadId": parent,
+            "relationshipToParent": "subagent",
+            "rootThreadId": parent,
+        }))
+        .unwrap();
+        thread
+    }
+
+    #[gpui_kit::test]
+    fn subagents_nest_under_their_parent_behind_a_toggle(cx: &mut TestAppContext) {
+        let (handle, sidebar) = sidebar(cx);
+        cx.update_window(handle, |_, window, cx| {
+            sidebar.update(cx, |sidebar, cx| {
+                let mut fork = subagent("fork", "parent");
+                fork.lineage.as_mut().unwrap().relationship_to_parent = Some("fork".into());
+                let shell = ShellState {
+                    threads: vec![
+                        thread("parent", false),
+                        subagent("child-1", "parent"),
+                        subagent("child-2", "parent"),
+                        subagent("orphan", "missing"),
+                        fork,
+                    ],
+                    ..Default::default()
+                };
+                sidebar.set_shell(shell, cx);
+                let mut top: Vec<_> = sidebar.active.iter().map(|t| t.id.as_str()).collect();
+                top.sort();
+                assert_eq!(top, ["fork", "orphan", "parent"]);
+                assert_eq!(sidebar.subagents["parent"].len(), 2);
+            });
+            window.render_frame(cx);
+            assert!(window.try_find("subagent-thread-child-1").is_none());
+
+            window.click("subagents-toggle-parent", cx);
+            window.render_frame(cx);
+            let child = window.find("subagent-thread-child-1").bounds();
+            assert!(window.find("subagent-thread-child-2").bounds().origin.y > child.origin.y);
+
+            window.click("subagents-toggle-parent", cx);
+            window.render_frame(cx);
+            assert!(window.try_find("subagent-thread-child-1").is_none());
+
+            // Opening a subagent reveals it.
+            sidebar.update(cx, |sidebar, cx| sidebar.set_open_thread(Some("child-2".into()), cx));
+            window.render_frame(cx);
+            assert!(window.find("subagent-thread-child-2").visible());
+        })
+        .unwrap();
     }
 
     #[gpui_kit::test]

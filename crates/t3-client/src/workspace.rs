@@ -280,8 +280,8 @@ impl WorkspaceRequest {
             }
             Self::SetProjectScripts { project_id, scripts } => {
                 connection
-                    .dispatch(json!({
-                        "type": "project.meta.update",
+                    .mutate_project(json!({
+                        "type": "project.update",
                         "commandId": crate::new_id(),
                         "projectId": project_id,
                         "scripts": scripts,

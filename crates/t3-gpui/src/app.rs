@@ -1157,8 +1157,13 @@ impl T3App {
             | ThreadViewEvent::Attachment(_)
             | ThreadViewEvent::SearchFiles { .. } => {}
             ThreadViewEvent::Stop => {
-                let turn_id = thread.session.as_ref().and_then(|s| s.active_turn_id.clone());
-                self.backend.send(Command::Interrupt { thread_id: thread.id, turn_id });
+                let run_id = thread
+                    .active_run_id
+                    .clone()
+                    .or_else(|| thread.session.as_ref().and_then(|s| s.active_turn_id.clone()));
+                if let Some(run_id) = run_id {
+                    self.backend.send(Command::Interrupt { thread_id: thread.id, run_id });
+                }
             }
         }
     }

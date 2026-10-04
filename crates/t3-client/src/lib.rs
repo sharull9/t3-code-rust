@@ -67,41 +67,29 @@ impl ThreadAction {
             Self::Settle(false) => "thread.unsettle",
             Self::Archive => "thread.archive",
             Self::Unarchive => "thread.unarchive",
-            Self::Rename(_) => "thread.meta.update",
+            Self::Rename(_) => "thread.metadata.update",
             Self::RuntimeMode(_) => "thread.runtime-mode.set",
             Self::InteractionMode(_) => "thread.interaction-mode.set",
-            Self::Model(_) => "thread.meta.update",
-            Self::Approval { .. } => "thread.approval.respond",
-            Self::UserInput { .. } => "thread.user-input.respond",
+            Self::Model(_) => "thread.model-selection.set",
+            Self::Approval { .. } | Self::UserInput { .. } => "runtime-request.respond",
             Self::DismissUserInput { .. } => "thread.user-input.dismiss",
         };
         let mut command = json!({ "type": kind, "commandId": new_id(), "threadId": thread_id });
         match self {
             Self::Settle(false) => command["reason"] = json!("user"),
-            Self::RuntimeMode(mode) => {
-                command["runtimeMode"] = json!(mode);
-                command["createdAt"] = json!(now_iso());
-            }
-            Self::InteractionMode(mode) => {
-                command["interactionMode"] = json!(mode);
-                command["createdAt"] = json!(now_iso());
-            }
+            Self::RuntimeMode(mode) => command["runtimeMode"] = json!(mode),
+            Self::InteractionMode(mode) => command["interactionMode"] = json!(mode),
             Self::Model(model) => command["modelSelection"] = model.clone(),
             Self::Rename(title) => command["title"] = json!(title.trim()),
             Self::Approval { request_id, decision } => {
                 command["requestId"] = json!(request_id);
                 command["decision"] = json!(decision);
-                command["createdAt"] = json!(now_iso());
             }
             Self::UserInput { request_id, answers } => {
                 command["requestId"] = json!(request_id);
                 command["answers"] = answers.clone();
-                command["createdAt"] = json!(now_iso());
             }
-            Self::DismissUserInput { request_id } => {
-                command["requestId"] = json!(request_id);
-                command["createdAt"] = json!(now_iso());
-            }
+            Self::DismissUserInput { request_id } => command["requestId"] = json!(request_id),
             _ => {}
         }
         command
@@ -171,7 +159,7 @@ impl Connection {
         self.rpc.subscribe(methods::SUBSCRIBE_THREAD, params)
     }
 
-    /// Dispatch any `ClientOrchestrationCommand` (see `orchestration.ts`).
+    /// Dispatch any `OrchestrationV2Command` (see `orchestration.ts`).
     pub async fn dispatch(&self, command: Value) -> Result<Value, RpcError> {
         self.rpc.call(methods::DISPATCH_COMMAND, command).await
     }
@@ -187,41 +175,41 @@ impl Connection {
         text: &str,
         attachments: &[attachments::UploadedAttachment],
     ) -> Result<Value, RpcError> {
+        // `deliveryIntent: "auto"` lets the server steer or queue behind a
+        // running turn instead of the client guessing from stale state.
         self.dispatch(json!({
-            "type": "thread.turn.start",
+            "type": "message.dispatch",
             "commandId": new_id(),
             "threadId": thread.id,
-            "message": {
-                "messageId": new_id(),
-                "role": "user",
-                "text": text,
-                "attachments": attachments,
-            },
-            "runtimeMode": thread.runtime_mode,
-            "interactionMode": thread.interaction_mode,
-            "createdAt": now_iso(),
+            "messageId": new_id(),
+            "text": text,
+            "attachments": attachments,
+            "deliveryIntent": "auto",
+            "dispatchMode": { "type": "start_immediately" },
+            "createdBy": CREATED_BY,
+            "creationSource": CREATION_SOURCE,
         }))
         .await
     }
 
-    pub async fn interrupt(
-        &self,
-        thread_id: &str,
-        turn_id: Option<&str>,
-    ) -> Result<Value, RpcError> {
-        let mut command = json!({
-            "type": "thread.turn.interrupt",
+    /// `run.interrupt`: stops the thread's active run.
+    pub async fn interrupt(&self, thread_id: &str, run_id: &str) -> Result<Value, RpcError> {
+        self.dispatch(json!({
+            "type": "run.interrupt",
             "commandId": new_id(),
             "threadId": thread_id,
-            "createdAt": now_iso(),
-        });
-        if let Some(turn_id) = turn_id {
-            command["turnId"] = json!(turn_id);
-        }
-        self.dispatch(command).await
+            "runId": run_id,
+        }))
+        .await
     }
 
-    /// `project.create` (see `orchestration.ts`'s `ProjectCreateCommand`).
+    /// `projects.mutate`: create, update or delete a project
+    /// (`ProjectMutation` in `project.ts`).
+    pub async fn mutate_project(&self, mutation: Value) -> Result<Value, RpcError> {
+        self.rpc.call("projects.mutate", mutation).await
+    }
+
+    /// `project.create` (see `project.ts`'s `ProjectMutation`).
     /// `project_id` is generated client-side, same as the web app's
     /// `newProjectId()`; the folder is expected to already exist (picked via
     /// a native folder dialog), so `createWorkspaceRootIfMissing` is omitted.
@@ -231,13 +219,12 @@ impl Connection {
         title: &str,
         workspace_root: &str,
     ) -> Result<Value, RpcError> {
-        self.dispatch(json!({
+        self.mutate_project(json!({
             "type": "project.create",
             "commandId": new_id(),
             "projectId": project_id,
             "title": title,
             "workspaceRoot": workspace_root,
-            "createdAt": now_iso(),
         }))
         .await
     }
@@ -267,7 +254,8 @@ impl Connection {
             "interactionMode": interaction_mode,
             "branch": worktree.map(|(branch, _)| branch),
             "worktreePath": worktree.map(|(_, path)| path),
-            "createdAt": now_iso(),
+            "createdBy": CREATED_BY,
+            "creationSource": CREATION_SOURCE,
         }))
         .await
     }
@@ -307,9 +295,11 @@ pub fn new_id() -> String {
     uuid::Uuid::new_v4().to_string()
 }
 
-fn now_iso() -> String {
-    chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
-}
+/// `OrchestrationV2CreationFields` for anything the user starts here: the
+/// server has no native-desktop source, and "web" is the closest
+/// interactive client.
+const CREATED_BY: &str = "user";
+const CREATION_SOURCE: &str = "web";
 
 #[cfg(test)]
 mod command_tests {
@@ -327,25 +317,20 @@ mod command_tests {
         assert_eq!(restore["type"], "thread.unarchive");
         assert_eq!(restore["threadId"], "thread-1");
         let rename = ThreadAction::Rename("  New title  ".into()).command("thread-1");
-        assert_eq!(rename["type"], "thread.meta.update");
+        assert_eq!(rename["type"], "thread.metadata.update");
         assert_eq!(rename["title"], "New title");
         assert!(rename.get("modelSelection").is_none());
     }
 
     #[test]
-    fn settings_commands_keep_instance_routing_and_mode_timestamps() {
+    fn settings_commands_keep_instance_routing() {
         let model = json!({ "instanceId": "custom-codex", "model": "model-1", "options": { "effort": "high" } });
-        assert_eq!(ThreadAction::Model(model.clone()).command("thread-1")["modelSelection"], model);
-        for action in [
-            ThreadAction::RuntimeMode("approval-required".into()),
-            ThreadAction::InteractionMode("plan".into()),
-        ] {
-            let command = action.command("thread-1");
-            assert!(
-                chrono::DateTime::parse_from_rfc3339(command["createdAt"].as_str().unwrap())
-                    .is_ok()
-            );
-        }
+        let command = ThreadAction::Model(model.clone()).command("thread-1");
+        assert_eq!(command["type"], "thread.model-selection.set");
+        assert_eq!(command["modelSelection"], model);
+        let mode = ThreadAction::RuntimeMode("approval-required".into()).command("thread-1");
+        assert_eq!(mode["type"], "thread.runtime-mode.set");
+        assert_eq!(mode["runtimeMode"], "approval-required");
     }
 
     #[test]
@@ -367,7 +352,7 @@ mod command_tests {
         let command =
             ThreadAction::UserInput { request_id: "request-1".into(), answers: answers.clone() }
                 .command("thread-1");
-        assert_eq!(command["type"], "thread.user-input.respond");
+        assert_eq!(command["type"], "runtime-request.respond");
         assert_eq!(command["requestId"], "request-1");
         assert_eq!(command["answers"], answers);
         let dismiss =
