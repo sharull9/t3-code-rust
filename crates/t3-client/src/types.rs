@@ -356,6 +356,9 @@ pub enum ShellStreamItem {
     Synchronized,
     Snapshot {
         snapshot: ShellSnapshot,
+        /// Present on partial repository identity enrichment refreshes.
+        #[serde(default)]
+        resolved_repository_identity_roots: Option<Vec<String>>,
     },
     #[serde(alias = "project.updated")]
     ProjectUpserted {

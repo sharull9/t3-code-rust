@@ -27,7 +27,8 @@ async fn refresh_providers(connection: &Connection) -> Result<Vec<t3_client::Ser
 
 pub enum Command {
     Pair(String),
-    StartLocal(PathBuf),
+    /// Run T3 locally on the shared T3 home; `None` discovers the executable.
+    StartLocal(Option<PathBuf>),
     RefreshConfig,
     OpenAsset(t3_client::attachments::UploadedAttachment),
     SaveDrafts(crate::drafts::DraftStore),
@@ -286,7 +287,7 @@ impl Drop for TaskGuard {
 enum SessionEnd {
     Disconnected(String),
     Repair(String),
-    Local(PathBuf),
+    Local(Option<PathBuf>),
     Quit,
 }
 
@@ -301,12 +302,13 @@ async fn run(mut commands: mpsc::UnboundedReceiver<Command>, events: Emitter) {
         Ok(store) => events.emit(Event::DraftsLoaded(store.unwrap_or_default())),
         Err(error) => events.error(format!("Could not load saved drafts: {error}")),
     }
-    let mut credentials = load_credentials().filter(|c| !c.is_expired());
+    let mut pending_local: Option<Option<PathBuf>> = load_local_mode();
+    let mut credentials =
+        load_credentials().filter(|c| pending_local.is_none() && !c.is_expired());
     let mut open_thread: Option<String> = None;
     let mut pending_pair: Option<String> = None;
-    let mut pending_local: Option<PathBuf> = None;
     let mut managed: Option<crate::managed_server::ManagedServer> = None;
-    let mut managed_executable: Option<PathBuf> = None;
+    let mut managed_executable: Option<Option<PathBuf>> = None;
     let mut backoff = Duration::from_secs(1);
 
     loop {
@@ -326,6 +328,7 @@ async fn run(mut commands: mpsc::UnboundedReceiver<Command>, events: Emitter) {
                         key: "managed-local".into(),
                     });
                     managed = Some(server);
+                    save_local_mode(executable.as_deref());
                     managed_executable = Some(executable);
                     open_thread = None;
                     events.emit(Event::PairFinished(true));
@@ -337,24 +340,21 @@ async fn run(mut commands: mpsc::UnboundedReceiver<Command>, events: Emitter) {
             }
         }
         if let Some(server) = &mut managed {
-            match server.try_wait() {
-                Ok(Some(status)) => {
-                    events.error(format!("Local server exited ({status}). Restarting."));
-                    managed = None;
-                    credentials = None;
-                    pending_local = managed_executable.clone();
-                    tokio::time::sleep(backoff).await;
-                    backoff = (backoff * 2).min(MAX_BACKOFF);
-                    continue;
+            if let Some(reason) = server.exited(&http).await {
+                events.error(format!("{reason}. Restarting."));
+                managed = None;
+                credentials = None;
+                pending_local = managed_executable.clone();
+                tokio::time::sleep(backoff).await;
+                backoff = (backoff * 2).min(MAX_BACKOFF);
+                continue;
+            }
+            if server.credentials().is_expired() {
+                if let Err(error) = server.reauthenticate(&http).await {
+                    events.error(error);
+                } else {
+                    credentials = Some(server.credentials().clone());
                 }
-                Ok(None) if server.credentials().is_expired() => {
-                    if let Err(error) = server.reauthenticate(&http).await {
-                        events.error(error);
-                    } else {
-                        credentials = Some(server.credentials().clone());
-                    }
-                }
-                _ => {}
             }
         }
         if let Some(link) = pending_pair.take() {
@@ -364,6 +364,7 @@ async fn run(mut commands: mpsc::UnboundedReceiver<Command>, events: Emitter) {
                         let _ = previous.shutdown().await;
                     }
                     managed_executable = None;
+                    clear_local_mode();
                     open_thread = None;
                     save_credentials(&paired);
                     credentials = Some(paired);
@@ -462,7 +463,7 @@ async fn run(mut commands: mpsc::UnboundedReceiver<Command>, events: Emitter) {
 
 enum Offline {
     Pair(String),
-    Local(PathBuf),
+    Local(Option<PathBuf>),
     Quit,
     Elapsed,
 }
@@ -932,6 +933,39 @@ fn save_credentials(credentials: &Credentials) {
     });
     if let Err(error) = result {
         eprintln!("could not save credentials to {}: {error}", path.display());
+    }
+}
+
+/// Remembers that the user chose the local server, and which executable, so
+/// the next launch starts it again instead of asking to pair.
+fn local_mode_path() -> Option<PathBuf> {
+    Some(dirs::config_dir()?.join("t3-gpui").join("local-server.json"))
+}
+
+fn load_local_mode() -> Option<Option<PathBuf>> {
+    #[derive(serde::Deserialize)]
+    struct Saved {
+        executable: Option<PathBuf>,
+    }
+    let saved: Saved = serde_json::from_slice(&std::fs::read(local_mode_path()?).ok()?).ok()?;
+    Some(saved.executable)
+}
+
+fn save_local_mode(executable: Option<&std::path::Path>) {
+    let Some(path) = local_mode_path() else {
+        return;
+    };
+    let result = path.parent().map_or(Ok(()), std::fs::create_dir_all).and_then(|()| {
+        std::fs::write(&path, serde_json::json!({ "executable": executable }).to_string())
+    });
+    if let Err(error) = result {
+        eprintln!("could not save local server choice to {}: {error}", path.display());
+    }
+}
+
+fn clear_local_mode() {
+    if let Some(path) = local_mode_path() {
+        let _ = std::fs::remove_file(path);
     }
 }
 

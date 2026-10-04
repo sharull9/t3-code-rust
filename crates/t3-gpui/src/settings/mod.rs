@@ -40,6 +40,8 @@ pub fn init(cx: &mut App) {
 pub enum SettingsEvent {
     Close,
     RefreshProviders,
+    /// Run T3 on this machine, finding the server executable automatically.
+    StartLocalServer,
     ChooseManagedServer,
     SwitchServer,
     /// Send `patch` with `server.updateSettings`, then answer through
@@ -875,6 +877,7 @@ mod tests {
                 captured.borrow_mut().push(match event {
                     SettingsEvent::Close => "close",
                     SettingsEvent::RefreshProviders => "refresh",
+                    SettingsEvent::StartLocalServer => "local",
                     SettingsEvent::ChooseManagedServer => "managed",
                     SettingsEvent::SwitchServer => "switch",
                     SettingsEvent::UpdateServerSettings { .. } => "update",
@@ -898,6 +901,7 @@ mod tests {
             window.click("settings-refresh-providers", cx);
             window.click("settings-nav-connections", cx);
             window.render_frame(cx);
+            window.click("settings-local-server", cx);
             window.click("settings-managed-server", cx);
             window.click("settings-switch-server", cx);
             window.click("settings-nav-appearance", cx);
@@ -908,7 +912,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             *events.borrow(),
-            ["refresh", "managed", "switch", "close"]
+            ["refresh", "local", "managed", "switch", "close"]
         );
     }
 

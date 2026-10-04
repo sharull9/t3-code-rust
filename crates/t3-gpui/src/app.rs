@@ -236,21 +236,13 @@ impl T3App {
                         cx.spawn(async move |this, cx| {
                             if let Ok(Ok(Some(paths))) = paths.await {
                                 if let Some(path) = paths.into_iter().next() {
-                                    let _ = this.update(cx, |this, cx| {
-                                        this.capture_current_drafts(cx);
-                                        this.pairing_pending = true;
-                                        this.switching_server = true;
-                                        this.backend.send(Command::StartLocal(path));
-                                        this.settings.update(cx, |settings, cx| {
-                                            settings.set_open(false, cx)
-                                        });
-                                        cx.notify();
-                                    });
+                                    let _ = this.update(cx, |this, cx| this.start_local(Some(path), cx));
                                 }
                             }
                         })
                         .detach();
                     }
+                    SettingsEvent::StartLocalServer => this.start_local(None, cx),
                 }
                 cx.notify();
             }),
@@ -1753,6 +1745,17 @@ impl T3App {
         )
     }
 
+    /// Run T3 on this machine against the shared T3 home: attach to the
+    /// server already running there, or start one. `None` finds the executable.
+    fn start_local(&mut self, executable: Option<std::path::PathBuf>, cx: &mut Context<Self>) {
+        self.capture_current_drafts(cx);
+        self.pairing_pending = true;
+        self.switching_server = true;
+        self.backend.send(Command::StartLocal(executable));
+        self.settings.update(cx, |settings, cx| settings.set_open(false, cx));
+        cx.notify();
+    }
+
     fn render_pairing(&self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
         div().flex().flex_1().items_center().justify_center().p_4().child(
@@ -1792,6 +1795,13 @@ impl T3App {
                                     })),
                             )
                         })
+                        .child(
+                            Button::new("pair-local")
+                                .outline()
+                                .label("Use T3 on this machine")
+                                .disabled(self.pairing_pending)
+                                .on_click(cx.listener(|this, _, _, cx| this.start_local(None, cx))),
+                        )
                         .child(
                             Button::new("pair")
                                 .primary()

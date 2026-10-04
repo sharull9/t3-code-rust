@@ -10,7 +10,7 @@ use std::process::Stdio;
 use std::time::{Duration, Instant};
 
 use serde_json::json;
-use t3_client::{Connection, Credentials, PairingLink, ShellState};
+use t3_client::{Connection, Credentials, PairingLink, ShellState, ThreadState};
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 
@@ -78,9 +78,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let credentials: Credentials =
         t3_client::auth::pair(&http, &link, "T3 GPUI (embedded)").await?;
     println!("logged in, scopes: {}", credentials.scope);
-    let again = t3_client::auth::pair(&http, &link, "T3 GPUI (embedded)").await;
-    println!("bootstrap token reusable: {}", again.is_ok());
-
     let connection = Connection::connect(&http, &credentials).await?;
     let mut stream = connection.subscribe_shell()?;
     let mut shell = ShellState::default();
@@ -96,6 +93,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         shell.threads.len(),
         shell.sequence
     );
+
+    if let Some(thread) = shell.threads.first() {
+        let mut state = ThreadState::default();
+        let mut stream = connection.subscribe_thread(&thread.id, None)?;
+        tokio::time::timeout(Duration::from_secs(15), async {
+            while let Some(item) = stream.next().await {
+                state.apply(item?);
+                if state.synchronized {
+                    return Ok::<(), t3_client::RpcError>(());
+                }
+            }
+            Err(t3_client::RpcError::Disconnected("thread stream ended".into()))
+        }).await??;
+        let thread = state.thread.ok_or("thread synchronized without snapshot")?;
+        println!("thread synchronized: {} messages", thread.messages.len());
+    }
 
     child.kill().await?;
     println!("server stopped");

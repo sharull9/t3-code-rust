@@ -111,6 +111,40 @@ T3 server executable: the app starts it with a private stdin bootstrap, a separa
 is needed for that session. Server discovery, bundling and automatic local startup
 on the next app launch are still pending.
 
+### Test with a copy of your existing T3 data
+
+The native app can own a standalone `t3` server process, so the Electron app
+does not need to run. On Windows, prepare an independent data copy with Python
+3.12 or newer:
+
+```powershell
+py -3 scripts/copy-t3-data.py "$env:LOCALAPPDATA\t3-gpui\server"
+```
+
+The script reads `~/.t3/userdata`, copies settings, provider data and attachments,
+and uses SQLite online backups for both databases. It refuses to overwrite an
+existing destination and skips logs, process metadata, database sidecars and
+provider runtime links. The copy gets a new environment ID, with automatic
+thread continuation and scheduled tasks disabled for testing. Repository and
+worktree paths still point to the existing checkouts; those directories are
+not cloned. Changes in the copied database do not sync back to the original.
+
+Download the standalone Windows CLI archive matching your server version from
+the [T3 releases](https://github.com/pingdotgg/t3code/releases), extract it, and
+select its `t3.exe` in **Settings > Connections > Choose local server executable**.
+Use the CLI executable rather than the Electron installer. The app starts it on
+a private loopback port, using the copied `t3-gpui/server` data directory. Select
+the executable again after restarting the app.
+
+To verify the copied data without opening the UI:
+
+```powershell
+cargo run -p t3-client --example embedded -- "<path-to-t3.exe>" "$env:LOCALAPPDATA\t3-gpui\server" 3898
+```
+
+This starts the standalone server, authenticates, checks shell and thread
+synchronization, then stops the child process without writing credentials.
+
 The compact desktop UI groups tool calls between messages, with expandable per-call
 details and icon-only copy controls. Settings opens as a full page in the main area,
 with Appearance, Providers, Connections and Keyboard sections. Back, Escape or

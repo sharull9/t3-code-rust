@@ -18,10 +18,17 @@ impl ShellState {
     pub fn apply(&mut self, item: ShellStreamItem) {
         match item {
             ShellStreamItem::Synchronized => self.synchronized = true,
-            ShellStreamItem::Snapshot { snapshot } => {
-                self.sequence = snapshot.snapshot_sequence;
-                self.projects = snapshot.projects;
-                self.threads = snapshot.threads;
+            ShellStreamItem::Snapshot { snapshot, resolved_repository_identity_roots } => {
+                if resolved_repository_identity_roots.is_some() {
+                    // These refresh only repository identity, which this client
+                    // does not yet render. They must never change structure or
+                    // sequence, even when delivered after a project mutation.
+                    return;
+                } else {
+                    self.sequence = snapshot.snapshot_sequence;
+                    self.projects = snapshot.projects;
+                    self.threads = snapshot.threads;
+                }
             }
             ShellStreamItem::ProjectUpserted { sequence, project } => {
                 if self.advance(sequence) {
@@ -194,6 +201,43 @@ fn upsert<T>(items: &mut Vec<T>, item: T, key: impl Fn(&T) -> &String) {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn repository_enrichment_keeps_existing_projects_and_threads() {
+        let mut state = ShellState::default();
+        state.apply(serde_json::from_value(json!({
+            "kind": "snapshot", "snapshot": {
+                "snapshotSequence": 10,
+                "projects": [
+                    {"id": "p1", "title": "One", "workspaceRoot": "/one"},
+                    {"id": "p2", "title": "Two", "workspaceRoot": "/two"}
+                ],
+                "threads": [{"id": "t1", "projectId": "p1", "title": "Existing", "runtimeMode": "full-access"}]
+            }
+        })).unwrap());
+        state.apply(serde_json::from_value(json!({
+            "kind": "snapshot", "resolvedRepositoryIdentityRoots": ["/one"],
+            "snapshot": {
+                "snapshotSequence": 99,
+                "projects": [{"id": "p1", "title": "Updated", "workspaceRoot": "/one"}],
+                "threads": []
+            }
+        })).unwrap());
+        assert_eq!(state.projects.len(), 2);
+        assert_eq!(state.projects[0].title, "One");
+        assert_eq!(state.sequence, 10);
+        assert_eq!(state.threads.len(), 1);
+        assert_eq!(state.threads[0].id, "t1");
+
+        // An authoritative reconnect snapshot must still remove absent entries.
+        state.apply(serde_json::from_value(json!({
+            "kind": "snapshot", "snapshot": {
+                "snapshotSequence": 11, "projects": [], "threads": []
+            }
+        })).unwrap());
+        assert!(state.projects.is_empty());
+        assert!(state.threads.is_empty());
+    }
 
     #[test]
     fn v2_snapshot_and_full_message_updates_synchronize_without_duplicate_text() {
