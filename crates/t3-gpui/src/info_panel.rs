@@ -21,6 +21,7 @@ use t3_client::{
 };
 
 use crate::prefs::Prefs;
+use crate::thread_view::DraftBranch;
 use crate::ui::icon;
 
 pub const INFO_PANEL_WIDTH: Pixels = px(310.);
@@ -176,18 +177,47 @@ impl InfoPanel {
     /// Loads the git status, and with it [`Self::current_branch`], even
     /// while the panel is hidden: a draft's new worktree branches from it.
     pub fn load_branch(&mut self, cx: &mut Context<Self>) {
-        let waiting = self.pending.values().any(|(_, slot)| matches!(slot, Slot::Status));
-        if self.status.is_none()
-            && !waiting
-            && let Some(cwd) = self.scope.cwd().map(str::to_owned)
-        {
-            self.request(WorkspaceRequest::GitStatus { cwd }, Slot::Status, cx);
+        let Some(cwd) = self.scope.cwd().map(str::to_owned) else {
+            return;
+        };
+        let waiting = |slot: Slot| self.pending.values().any(|(_, pending)| *pending == slot);
+        let (status, refs) = (waiting(Slot::Status), waiting(Slot::Refs));
+        if self.status.is_none() && !status {
+            self.request(WorkspaceRequest::GitStatus { cwd: cwd.clone() }, Slot::Status, cx);
+        }
+        // The draft's branch picker lists these.
+        if self.refs.is_none() && !refs {
+            self.request(WorkspaceRequest::ListRefs { cwd }, Slot::Refs, cx);
         }
     }
 
     /// The checked-out branch, the base for a draft's new worktree.
     pub fn current_branch(&self) -> Option<&str> {
         self.status.as_ref().and_then(|status| status.ref_name.as_deref())
+    }
+
+    /// The local branches, for a draft's branch picker.
+    pub fn local_branches(&self) -> Vec<DraftBranch> {
+        let Some(refs) = &self.refs else {
+            return Vec::new();
+        };
+        refs.refs
+            .iter()
+            .filter(|reference| !reference.is_remote)
+            .map(|reference| DraftBranch {
+                name: reference.name.clone(),
+                elsewhere: !reference.current && reference.worktree_path.is_some(),
+            })
+            .collect()
+    }
+
+    /// Switches the checkout to `ref_name`, as the branch row does.
+    pub fn checkout_ref(&mut self, ref_name: String, cx: &mut Context<Self>) {
+        let Some(cwd) = self.scope.cwd().map(str::to_owned) else {
+            return;
+        };
+        self.request(WorkspaceRequest::SwitchRef { cwd, ref_name }, Slot::Switch, cx);
+        cx.notify();
     }
 
     /// Writes the project's whole action list.
@@ -238,7 +268,13 @@ impl InfoPanel {
                 self.git_result = Some(Err(error));
                 self.refresh(cx);
             }
-            (Slot::Switch, Ok(_)) => self.refresh(cx),
+            (Slot::Switch, Ok(_)) if self.visible => self.refresh(cx),
+            // A draft's branch picker switched it: re-read for the picker.
+            (Slot::Switch, Ok(_)) => {
+                self.status = None;
+                self.refs = None;
+                self.load_branch(cx);
+            }
             (_, Ok(_)) => {}
             (_, Err(error)) => self.error = Some(error),
         }

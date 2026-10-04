@@ -205,6 +205,10 @@ pub struct ServerConfig {
     pub providers: Vec<ServerProvider>,
     #[serde(default)]
     pub usage_limit_sources: Vec<crate::quotas::LimitSource>,
+    /// The server's working directory: with its worktrees folder, the only
+    /// place `review.getDiffPreview` reads from.
+    #[serde(default)]
+    pub cwd: Option<String>,
     /// Editor IDs (`editor.ts`'s `EditorId`) installed on the server machine.
     #[serde(default)]
     pub available_editors: Vec<String>,

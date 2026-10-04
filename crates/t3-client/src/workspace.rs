@@ -200,7 +200,7 @@ impl Connection {
         wait: bool,
     ) -> Result<(), RpcError> {
         self.rpc()
-            .call(
+            .call::<Value>(
                 "terminal.open",
                 json!({
                     "threadId": thread_id,
@@ -221,9 +221,9 @@ impl Connection {
             None
         };
         self.rpc()
-            .call(
+            .call::<Value>(
                 "terminal.write",
-                json!({ "threadId": thread_id, "terminalId": terminal_id, "data": format!("{command}") }),
+                json!({ "threadId": thread_id, "terminalId": terminal_id, "data": format!("{command}\r") }),
             )
             .await?;
         if let Some(stream) = stream {
@@ -323,6 +323,7 @@ pub enum WorkspaceRequest {
     OpenTerminal { thread_id: String, terminal_id: String, cwd: String },
     RestartTerminal { thread_id: String, terminal_id: String, cwd: String },
     WriteTerminal { thread_id: String, terminal_id: String, data: String },
+    ResizeTerminal { thread_id: String, terminal_id: String, cols: u16, rows: u16 },
     CloseTerminal { thread_id: String, terminal_id: Option<String> },
     OpenInEditor { cwd: String, editor: String },
     /// Runs to completion: the RPC streams progress and ends with
@@ -424,6 +425,11 @@ impl WorkspaceRequest {
             Self::WriteTerminal { thread_id, terminal_id, data } => (
                 "terminal.write",
                 json!({ "threadId": thread_id, "terminalId": terminal_id, "data": data }),
+                ResponseKind::Ack,
+            ),
+            Self::ResizeTerminal { thread_id, terminal_id, cols, rows } => (
+                "terminal.resize",
+                json!({ "threadId": thread_id, "terminalId": terminal_id, "cols": cols, "rows": rows }),
                 ResponseKind::Ack,
             ),
             Self::CloseTerminal { thread_id, terminal_id } => (

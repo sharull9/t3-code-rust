@@ -5,12 +5,12 @@ use std::collections::HashMap;
 use gpui_kit::assets::IconName;
 use gpui_kit::component::Disableable as _;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
-use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::component::tab::{Tab, TabBar};
 use gpui_kit::component::{ActiveTheme as _, Sizable as _, StyledExt as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
+use crate::terminal::{TerminalScreen, TerminalStyle};
 use crate::ui::icon;
 use t3_client::{
     WorkspaceDiffPreview, WorkspaceDirectory, WorkspaceGitStatus, WorkspaceRefs, WorkspaceRequest,
@@ -46,6 +46,7 @@ enum RequestSlot {
     Diff,
     Terminal,
     TerminalWrite,
+    TerminalResize,
     TerminalClose,
     BranchSwitch,
 }
@@ -93,10 +94,16 @@ pub struct WorkspacePanel {
     refs: Option<WorkspaceRefs>,
     diff: Option<WorkspaceDiffPreview>,
     selected_change: Option<String>,
-    terminal_history: String,
+    terminal: TerminalScreen,
     terminal_id: String,
     terminal_status: String,
-    terminal_input: Entity<InputState>,
+    terminal_focus: FocusHandle,
+    /// Keystrokes not yet written: one write is in flight at a time, so
+    /// they reach the shell in order.
+    terminal_input: String,
+    terminal_writing: bool,
+    /// The `(rows, cols)` last sent to the server.
+    terminal_size_sent: Option<(u16, u16)>,
     terminal_open: bool,
     terminal_wanted: bool,
     /// A project action's command, written once the terminal is open.
@@ -104,6 +111,10 @@ pub struct WorkspacePanel {
     /// The branch list shows a few local branches until expanded.
     show_all_refs: bool,
     connected: bool,
+    /// The server's working directory (see `ServerConfig::cwd`).
+    server_cwd: Option<String>,
+    /// This scope's diff already fell back to `server_cwd`.
+    diff_fallback: bool,
     /// Shows only the terminal, docked under the main column.
     docked: bool,
     error: Option<String>,
@@ -114,16 +125,12 @@ impl EventEmitter<WorkspaceEvent> for WorkspacePanel {}
 
 impl WorkspacePanel {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let terminal_input = cx.new(|cx| InputState::new(window, cx).placeholder("Run command…"));
-        let subscriptions = vec![cx.subscribe_in(
-            &terminal_input,
-            window,
-            |this, _, event: &InputEvent, window, cx| {
-                if matches!(event, InputEvent::PressEnter { shift: false, .. }) {
-                    this.send_terminal_input(window, cx);
-                }
-            },
-        )];
+        let terminal_focus = cx.focus_handle();
+        // The cursor is solid only while the terminal has focus.
+        let subscriptions = vec![
+            cx.on_focus(&terminal_focus, window, |_, _, cx| cx.notify()),
+            cx.on_blur(&terminal_focus, window, |_, _, cx| cx.notify()),
+        ];
         Self {
             scope: WorkspaceScope::default(),
             scope_epoch: 0,
@@ -140,15 +147,20 @@ impl WorkspacePanel {
             refs: None,
             diff: None,
             selected_change: None,
-            terminal_history: String::new(),
+            terminal: TerminalScreen::default(),
             terminal_id: TERMINAL_ID.into(),
             terminal_status: "closed".into(),
-            terminal_input,
+            terminal_focus,
+            terminal_input: String::new(),
+            terminal_writing: false,
+            terminal_size_sent: None,
             terminal_open: false,
             terminal_wanted: false,
             queued_command: None,
             show_all_refs: false,
             connected: false,
+            server_cwd: None,
+            diff_fallback: false,
             docked: false,
             error: None,
             _subscriptions: subscriptions,
@@ -185,7 +197,11 @@ impl WorkspacePanel {
         self.refs = None;
         self.diff = None;
         self.selected_change = None;
-        self.terminal_history.clear();
+        self.diff_fallback = false;
+        self.terminal.reset();
+        self.terminal_input.clear();
+        self.terminal_writing = false;
+        self.terminal_size_sent = None;
         self.terminal_open = false;
         self.terminal_wanted = false;
         self.queued_command = None;
@@ -200,6 +216,10 @@ impl WorkspacePanel {
             self.request(WorkspaceRequest::ListRefs { cwd }, RequestSlot::Refs, cx);
         }
         cx.notify();
+    }
+
+    pub fn set_server_cwd(&mut self, cwd: Option<String>) {
+        self.server_cwd = cwd;
     }
 
     pub fn set_connected(&mut self, connected: bool, cx: &mut Context<Self>) {
@@ -226,6 +246,8 @@ impl WorkspacePanel {
             self.pending.clear();
             self.latest.clear();
             self.terminal_open = false;
+            self.terminal_writing = false;
+            self.terminal_size_sent = None;
         }
         cx.notify();
     }
@@ -253,21 +275,9 @@ impl WorkspacePanel {
         if !self.terminal_open {
             return;
         }
-        let (Some(command), Some(thread_id)) =
-            (self.queued_command.take(), self.scope.thread_id.clone())
-        else {
-            return;
-        };
-        self.request(
-            WorkspaceRequest::WriteTerminal {
-                thread_id,
-                terminal_id: self.terminal_id.clone(),
-                data: format!("{command}
-"),
-            },
-            RequestSlot::TerminalWrite,
-            cx,
-        );
+        if let Some(command) = self.queued_command.take() {
+            self.write_terminal(format!("{command}\r"), cx);
+        }
     }
 
     pub fn apply_result(
@@ -280,6 +290,10 @@ impl WorkspacePanel {
         let Some(pending) = self.pending.remove(&request_id) else {
             return;
         };
+        if pending.slot == RequestSlot::TerminalWrite {
+            self.terminal_writing = false;
+            self.flush_terminal_input(cx);
+        }
         if !response_is_current(
             Some(&pending),
             self.scope_epoch,
@@ -317,12 +331,15 @@ impl WorkspacePanel {
                 self.set_terminal_history(&terminal.history);
                 self.terminal_open = true;
                 self.tab = WorkspaceTab::Terminal;
+                // It opened at the server's default size; match the panel.
+                self.terminal_size_sent = None;
+                self.sync_terminal_size(cx);
                 self.flush_queued_command(cx);
             }
             Ok(WorkspaceResponse::Ack) if pending.slot == RequestSlot::TerminalClose => {
                 self.terminal_open = false;
                 self.terminal_wanted = false;
-                self.terminal_history.clear();
+                self.terminal.reset();
             }
             Ok(WorkspaceResponse::Ack) if pending.slot == RequestSlot::BranchSwitch => {
                 self.latest.remove(&RequestSlot::File);
@@ -337,6 +354,25 @@ impl WorkspacePanel {
             Ok(WorkspaceResponse::Ack) => {}
             Ok(_) => {
                 self.error = Some("The server returned an unexpected workspace response.".into())
+            }
+            // The server only diffs inside its own working directory and
+            // worktrees folder; like the web client, fall back to its
+            // directory when the thread's is outside them.
+            Err(error)
+                if pending.slot == RequestSlot::Diff
+                    && error.contains("configured workspace root")
+                    && let Some(server_cwd) = self
+                        .server_cwd
+                        .clone()
+                        .filter(|server_cwd| Some(server_cwd) != self.scope.cwd.as_ref())
+                    && !self.diff_fallback =>
+            {
+                self.diff_fallback = true;
+                self.request(
+                    WorkspaceRequest::DiffPreview { cwd: server_cwd },
+                    RequestSlot::Diff,
+                    cx,
+                );
             }
             Err(error) => self.error = Some(error),
         }
@@ -446,7 +482,7 @@ impl WorkspacePanel {
                 if self.matches_terminal(&thread_id, &terminal_id) {
                     self.terminal_status = "exited".into();
                     self.append_terminal(&format!(
-                        "\r\n[process exited: code={exit_code:?}, signal={exit_signal:?}]\r\n"
+                        "\r\n[process exited: code={exit_code:?}, signal={exit_signal:?}] Press Enter to restart.\r\n"
                     ));
                 }
             }
@@ -465,7 +501,7 @@ impl WorkspacePanel {
             }
             WorkspaceTerminalEvent::Cleared { thread_id, terminal_id } => {
                 if self.matches_terminal(&thread_id, &terminal_id) {
-                    self.terminal_history.clear();
+                    self.terminal.reset();
                 }
             }
             WorkspaceTerminalEvent::Activity { .. } => {}
@@ -478,51 +514,114 @@ impl WorkspacePanel {
     }
 
     fn append_terminal(&mut self, data: &str) {
-        const MAX_TERMINAL_CHARS: usize = 250_000;
-        self.terminal_history.push_str(data);
-        if self.terminal_history.len() > MAX_TERMINAL_CHARS {
-            let mut start = self.terminal_history.len() - MAX_TERMINAL_CHARS;
-            while !self.terminal_history.is_char_boundary(start) {
-                start += 1;
-            }
-            self.terminal_history.drain(..start);
-        }
+        self.terminal.process(data);
     }
 
     fn set_terminal_history(&mut self, history: &str) {
-        self.terminal_history.clear();
-        self.append_terminal(history);
+        self.terminal.reset();
+        self.terminal.process(history);
     }
 
-    fn send_terminal_input(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.terminal_open {
+    /// Queues `data` for the shell, as typed.
+    fn write_terminal(&mut self, data: String, cx: &mut Context<Self>) {
+        if !self.terminal_open || data.is_empty() {
             return;
         }
-        let data = self.terminal_input.read(cx).value().to_string();
-        if data.is_empty() {
-            return;
-        }
-        if data.len() + 1 > 65_536 {
-            self.error = Some("Terminal input exceeds the 64 KiB server limit.".into());
-            cx.notify();
+        self.terminal.scroll_to_bottom();
+        self.terminal_input.push_str(&data);
+        self.flush_terminal_input(cx);
+    }
+
+    fn flush_terminal_input(&mut self, cx: &mut Context<Self>) {
+        // The server takes at most 64 KiB per write.
+        const MAX_WRITE: usize = 60_000;
+        if self.terminal_writing || self.terminal_input.is_empty() || !self.terminal_open {
             return;
         }
         let Some(thread_id) = self.scope.thread_id.clone() else {
             return;
         };
-        if self.scope.cwd.is_none() {
-            return;
+        let mut end = self.terminal_input.len().min(MAX_WRITE);
+        while !self.terminal_input.is_char_boundary(end) {
+            end -= 1;
         }
-        self.terminal_input.update(cx, |input, cx| input.set_value("", window, cx));
+        let data: String = self.terminal_input.drain(..end).collect();
+        self.terminal_writing = true;
         self.request(
-            WorkspaceRequest::WriteTerminal {
-                thread_id,
-                terminal_id: self.terminal_id.clone(),
-                data: format!("{data}\n"),
-            },
+            WorkspaceRequest::WriteTerminal { thread_id, terminal_id: self.terminal_id.clone(), data },
             RequestSlot::TerminalWrite,
             cx,
         );
+    }
+
+    /// Tells the server the screen's size, once it changed.
+    fn sync_terminal_size(&mut self, cx: &mut Context<Self>) {
+        let size = self.terminal.size();
+        if !self.terminal_open || self.terminal_size_sent == Some(size) {
+            return;
+        }
+        let Some(thread_id) = self.scope.thread_id.clone() else {
+            return;
+        };
+        self.terminal_size_sent = Some(size);
+        let (rows, cols) = size;
+        self.request(
+            WorkspaceRequest::ResizeTerminal {
+                thread_id,
+                terminal_id: self.terminal_id.clone(),
+                cols,
+                rows,
+            },
+            RequestSlot::TerminalResize,
+            cx,
+        );
+    }
+
+    fn resize_terminal(&mut self, rows: u16, cols: u16, cx: &mut Context<Self>) {
+        if self.terminal.size() != (rows, cols) {
+            self.terminal.resize(rows, cols);
+            self.sync_terminal_size(cx);
+            cx.notify();
+        }
+    }
+
+    /// Puts keyboard input in the terminal, as opening one does.
+    pub fn focus_terminal(&self, window: &mut Window, cx: &mut App) {
+        self.terminal_focus.focus(window, cx);
+    }
+
+    fn terminal_key_down(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
+        let keystroke = &event.keystroke;
+        // Like a terminal app: once the shell is gone, Enter starts another.
+        if keystroke.key == "enter" && keystroke.modifiers == Modifiers::none() {
+            if matches!(self.terminal_status.as_str(), "exited" | "error") {
+                cx.stop_propagation();
+                return self.restart_terminal(cx);
+            }
+            if !self.terminal_open {
+                cx.stop_propagation();
+                return self.open_terminal(cx);
+            }
+        }
+        let modifiers = &keystroke.modifiers;
+        let paste =
+            keystroke.key == "v" && (modifiers.control || modifiers.platform) && !modifiers.alt;
+        let input = if paste {
+            cx.read_from_clipboard().and_then(|item| item.text()).map(|text| {
+                if self.terminal.bracketed_paste() {
+                    format!("\x1b[200~{text}\x1b[201~")
+                } else {
+                    text
+                }
+            })
+        } else {
+            self.terminal.input_for(keystroke)
+        };
+        if let Some(input) = input {
+            cx.stop_propagation();
+            self.write_terminal(input, cx);
+            cx.notify();
+        }
     }
 
     fn close_terminal(&mut self, cx: &mut Context<Self>) {
@@ -577,14 +676,14 @@ impl WorkspacePanel {
 }
 
 impl Render for WorkspacePanel {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if self.docked {
-            return self.render_dock(cx).into_any_element();
+            return self.render_dock(window, cx).into_any_element();
         }
         let body = match self.tab {
             WorkspaceTab::Files => self.render_files(cx).into_any_element(),
             WorkspaceTab::Changes => self.render_changes(cx).into_any_element(),
-            WorkspaceTab::Terminal => self.render_terminal(cx).into_any_element(),
+            WorkspaceTab::Terminal => self.render_terminal(window, cx).into_any_element(),
         };
         let theme = cx.theme();
         let tabs = [WorkspaceTab::Files, WorkspaceTab::Changes, WorkspaceTab::Terminal];
@@ -605,9 +704,12 @@ impl Render for WorkspacePanel {
                     .prefix(icon(icon_name).xsmall())
                     .disabled(!self.connected)
             }))
-            .on_click(cx.listener(move |this, index: &usize, _, cx| {
+            .on_click(cx.listener(move |this, index: &usize, window, cx| {
                 if let Some(tab) = tabs.get(*index) {
                     this.select_tab(*tab, cx);
+                    if *tab == WorkspaceTab::Terminal {
+                        this.focus_terminal(window, cx);
+                    }
                 }
             }));
         let refresh = Button::new("workspace-refresh")
@@ -658,7 +760,7 @@ impl Render for WorkspacePanel {
 }
 
 impl WorkspacePanel {
-    fn render_dock(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_dock(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
         v_flex()
             .size_full()
@@ -677,7 +779,7 @@ impl WorkspacePanel {
                     .child(icon(IconName::CircleAlert).xsmall().flex_shrink_0())
                     .child(div().min_w_0().child(error))
             }))
-            .child(self.render_terminal(cx))
+            .child(self.render_terminal(window, cx))
     }
 
     fn render_files(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -880,7 +982,12 @@ impl WorkspacePanel {
                             ),
                     )
                     .on_click(cx.listener(move |this, _, _, cx| {
-                        let Some(cwd) = this.scope.cwd.clone() else {
+                        let cwd = if this.diff_fallback {
+                            this.server_cwd.clone()
+                        } else {
+                            this.scope.cwd.clone()
+                        };
+                        let Some(cwd) = cwd else {
                             return;
                         };
                         this.selected_change = Some(path.clone());
@@ -981,90 +1088,132 @@ impl WorkspacePanel {
             .child(content)
     }
 
-    fn render_terminal(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_terminal(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
-        let (status_color, status_label) = match self.terminal_status.as_str() {
-            _ if !self.terminal_open => (theme.muted_foreground, "closed".to_owned()),
-            "running" => (theme.success, "running".to_owned()),
-            "error" => (theme.danger, "error".to_owned()),
-            other => (theme.muted_foreground, other.to_owned()),
+        let exited = matches!(self.terminal_status.as_str(), "exited" | "error");
+        // Small icons in the corner instead of a status bar, as terminal
+        // apps do: restart the shell, or kill it.
+        let actions = h_flex()
+            .absolute()
+            .top_1()
+            .right_1()
+            .gap_0p5()
+            .when(self.terminal_open || exited, |row| {
+                row.child(
+                    Button::new("terminal-restart")
+                        .ghost()
+                        .xsmall()
+                        .icon(icon(IconName::RotateCcw))
+                        .tooltip("Restart terminal")
+                        .disabled(!self.connected)
+                        .on_click(cx.listener(|this, _, _, cx| this.restart_terminal(cx))),
+                )
+            })
+            .when(self.terminal_open, |row| {
+                row.child(
+                    Button::new("terminal-close")
+                        .ghost()
+                        .xsmall()
+                        .icon(icon(IconName::Trash))
+                        .tooltip("Kill terminal")
+                        .disabled(!self.connected)
+                        .on_click(cx.listener(|this, _, _, cx| this.close_terminal(cx))),
+                )
+            });
+        let font_size = crate::ui::code_size(cx);
+        let font_family = theme.mono_font_family.clone();
+        let text_system = window.text_system();
+        let font_id = text_system.resolve_font(&font(font_family.clone()));
+        let cell_width = text_system
+            .advance(font_id, font_size, 'm')
+            .map(|advance| advance.width)
+            .unwrap_or(font_size * 0.6);
+        let cell = size(cell_width, px((f32::from(font_size) * 1.35).round()));
+        let style = TerminalStyle {
+            font_family,
+            font_size,
+            cell,
+            foreground: theme.foreground,
+            background: theme.background,
+            cursor: theme.foreground,
         };
-        let action = if matches!(self.terminal_status.as_str(), "exited" | "error") {
-            Button::new("terminal-restart")
-                .ghost()
-                .xsmall()
-                .icon(icon(IconName::RotateCcw))
-                .label("Restart")
-                .disabled(!self.connected)
-                .on_click(cx.listener(|this, _, _, cx| this.restart_terminal(cx)))
-        } else if self.terminal_open {
-            Button::new("terminal-close")
-                .ghost()
-                .xsmall()
-                .icon(icon(IconName::X))
-                .label("Close")
-                .disabled(!self.connected)
-                .on_click(cx.listener(|this, _, _, cx| this.close_terminal(cx)))
+        let focused = self.terminal_focus.is_focused(window);
+        // The grid fills whatever room the panel has; the shell is told.
+        let view = cx.entity().downgrade();
+        let measure = canvas(
+            move |bounds, window, cx| {
+                let cols = (f32::from(bounds.size.width) / f32::from(cell.width)).floor().max(20.);
+                let rows = (f32::from(bounds.size.height) / f32::from(cell.height)).floor().max(2.);
+                window.defer(cx, move |_, cx| {
+                    let _ = view.update(cx, |this, cx| {
+                        this.resize_terminal(rows as u16, cols as u16, cx)
+                    });
+                });
+            },
+            |_, _, _, _| {},
+        )
+        .absolute()
+        .size_full();
+        let screen = if self.terminal_open {
+            self.terminal.render(focused, &style).into_any_element()
         } else {
-            Button::new("terminal-open")
-                .ghost()
-                .xsmall()
-                .icon(icon(IconName::Play))
-                .label("Open terminal")
-                .disabled(!self.connected)
-                .on_click(cx.listener(|this, _, _, cx| this.open_terminal(cx)))
+            div()
+                .text_color(theme.muted_foreground)
+                .child(if !self.connected {
+                    "Not connected."
+                } else if self.scope.thread_id.is_none() {
+                    "Open a thread to use its terminal."
+                } else if self.terminal_wanted {
+                    "Starting terminal…"
+                } else {
+                    "Terminal closed. Press Enter to start a new one."
+                })
+                .into_any_element()
         };
-        let output = strip_ansi(&self.terminal_history);
 
         v_flex()
             .flex_1()
             .min_h_0()
-            .gap_2()
-            .p_3()
-            .child(
-                h_flex()
-                    .gap_2()
-                    .text_xs()
-                    .text_color(theme.muted_foreground)
-                    .child(div().size_2().flex_shrink_0().rounded_full().bg(status_color))
-                    .child(div().flex_1().child(format!("{} · {status_label}", self.terminal_id)))
-                    .child(action),
-            )
+            .relative()
             .child(
                 div()
-                    .id("terminal-output")
+                    .id("terminal-screen")
+                    .track_focus(&self.terminal_focus)
+                    .key_context("Terminal")
                     .flex_1()
                     .min_h_0()
-                    .p_3()
-                    .rounded_lg()
-                    .border_1()
-                    .border_color(theme.border)
+                    .px_3()
+                    .py_2()
                     .bg(theme.background)
-                    .overflow_y_scrollbar()
-                    .text_size(crate::ui::code_size(cx))
-                    .font_family(theme.mono_font_family.clone())
-                    .child(if output.trim().is_empty() {
+                    .overflow_hidden()
+                    .cursor_text()
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _, window, cx| this.terminal_focus.focus(window, cx)),
+                    )
+                    .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+                        this.terminal_key_down(event, cx)
+                    }))
+                    .on_scroll_wheel(cx.listener(move |this, event: &ScrollWheelEvent, _, cx| {
+                        let lines = f32::from(event.delta.pixel_delta(cell.height).y)
+                            / f32::from(cell.height);
+                        let lines = lines.round() as i32;
+                        if lines != 0 {
+                            this.terminal.scroll(lines);
+                            cx.notify();
+                        }
+                    }))
+                    .child(
                         div()
-                            .text_color(theme.muted_foreground)
-                            .child(if self.terminal_open {
-                                "Output will stream here."
-                            } else {
-                                "Open a terminal in this thread's workspace."
-                            })
-                            .into_any_element()
-                    } else {
-                        div().child(output).into_any_element()
-                    }),
+                            .relative()
+                            .size_full()
+                            .text_size(font_size)
+                            .font_family(theme.mono_font_family.clone())
+                            .child(measure)
+                            .child(screen),
+                    ),
             )
-            .when(self.terminal_open && self.terminal_status == "running", |column| {
-                column.child(
-                    Input::new(&self.terminal_input)
-                        .small()
-                        .w_full()
-                        .prefix(icon(IconName::ChevronRight).xsmall().text_color(theme.primary))
-                        .disabled(!self.connected),
-                )
-            })
+            .child(actions)
     }
 }
 
@@ -1181,45 +1330,6 @@ fn diff_block(diff: &str, mono: SharedString, cx: &App) -> impl IntoElement {
         })
 }
 
-/// Terminal output as plain text: drops ANSI escape sequences (colors, cursor
-/// movement, window titles) and carriage returns, which the output panel
-/// cannot interpret and would otherwise show as noise.
-fn strip_ansi(input: &str) -> String {
-    let mut out = String::with_capacity(input.len());
-    let mut chars = input.chars().peekable();
-    while let Some(c) = chars.next() {
-        match c {
-            '\u{1b}' => match chars.next() {
-                // CSI: parameters, then one final byte in @..~.
-                Some('[') => {
-                    for c in chars.by_ref() {
-                        if ('@'..='~').contains(&c) {
-                            break;
-                        }
-                    }
-                }
-                // OSC: ends with BEL or ESC \.
-                Some(']') => {
-                    while let Some(c) = chars.next() {
-                        if c == '\u{7}' {
-                            break;
-                        }
-                        if c == '\u{1b}' && chars.peek() == Some(&'\\') {
-                            chars.next();
-                            break;
-                        }
-                    }
-                }
-                _ => {}
-            },
-            '\r' => {}
-            c if c.is_control() && c != '\n' && c != '\t' => {}
-            c => out.push(c),
-        }
-    }
-    out
-}
-
 fn parent_path(path: &str) -> String {
     path.rsplit_once('/').map(|(parent, _)| parent.to_owned()).unwrap_or_default()
 }
@@ -1266,7 +1376,7 @@ mod tests {
             thread_id: Some("t2".into()),
             cwd: Some("/current".into()),
         };
-        cx.update_window(handle, |_, window, cx| {
+        cx.update_window(handle, |_, _, cx| {
             panel.update(cx, |panel, cx| panel.set_connected(true, cx));
             panel.update(cx, |panel, cx| panel.set_scope(old_scope.clone(), cx));
             let old_id = *panel.read(cx).latest.get(&RequestSlot::Directory).unwrap();
@@ -1310,8 +1420,7 @@ mod tests {
 
             panel.update(cx, |panel, cx| {
                 panel.terminal_open = true;
-                panel.terminal_input.update(cx, |input, cx| input.set_value("echo hi", window, cx));
-                panel.send_terminal_input(window, cx);
+                panel.write_terminal("echo hi\r".into(), cx);
             });
             let terminal_request_id =
                 *panel.read(cx).latest.get(&RequestSlot::TerminalWrite).unwrap();
@@ -1332,7 +1441,7 @@ mod tests {
                     cx,
                 );
             });
-            assert!(panel.read(cx).terminal_history.contains("echo hi"));
+            assert!(panel.read(cx).terminal.contents().contains("echo hi"));
 
             panel.update(cx, |panel, cx| {
                 panel.select_tab(WorkspaceTab::Terminal, cx);
@@ -1366,7 +1475,7 @@ mod tests {
             WorkspaceEvent::Request {
                 request: WorkspaceRequest::WriteTerminal { data, .. },
                 ..
-            } if data == "echo hi\n"
+            } if data == "echo hi\r"
         )));
         assert!(requests.iter().any(|event| matches!(
             event,
@@ -1380,15 +1489,6 @@ mod tests {
         assert_eq!(entry_depth("", "crates/t3-client/Cargo.toml"), 2);
         assert_eq!(entry_depth("crates", "crates/t3-client"), 0);
         assert_eq!(entry_depth("crates", "crates/t3-client/src/lib.rs"), 2);
-    }
-
-    #[::core::prelude::v1::test]
-    fn terminal_output_drops_escape_sequences() {
-        assert_eq!(
-            strip_ansi("\u{1b}]0;title\u{7}\u{1b}[1;32mok\u{1b}[0m done\r\nnext\u{1b}[2K"),
-            "ok done\nnext"
-        );
-        assert_eq!(strip_ansi("plain\ttext"), "plain\ttext");
     }
 
     #[::core::prelude::v1::test]

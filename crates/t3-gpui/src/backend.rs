@@ -1102,6 +1102,7 @@ mod tests {
                     runtime_mode: "full-access".into(),
                     interaction_mode: "default".into(),
                     new_worktree: false,
+                    base_branch: None,
                 },
                 title: "Fix the build".into(),
                 text: "Fix the build".into(),

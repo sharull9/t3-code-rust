@@ -21,6 +21,8 @@ url.workspace = true
 reqwest.workspace = true
 t3-client.workspace = true
 tokio.workspace = true
+# Parses terminal output (cursor moves, colors, line edits) into a screen grid.
+vt100 = "0.16"
 
 [dev-dependencies]
 gpui-kit = { workspace = true, features = ["test-support"] }

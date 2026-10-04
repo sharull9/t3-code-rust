@@ -46,6 +46,9 @@ pub struct DraftThread {
     /// Start the thread in a new worktree instead of the project checkout.
     #[serde(default)]
     pub new_worktree: bool,
+    /// The branch a new worktree starts from; the checked-out one when unset.
+    #[serde(default)]
+    pub base_branch: Option<String>,
 }
 
 pub fn default_path() -> Option<PathBuf> {
@@ -197,6 +200,7 @@ mod tests {
             runtime_mode: "full-access".into(),
             interaction_mode: "default".into(),
             new_worktree: false,
+            base_branch: None,
         });
         store.save(&path).unwrap();
         store

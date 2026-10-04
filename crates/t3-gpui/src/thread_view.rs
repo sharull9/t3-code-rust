@@ -50,6 +50,17 @@ pub enum ThreadViewEvent {
     OpenUsageLimits,
     /// Cancel on the worktree setup view: stop starting this thread.
     CancelWorktreeSetup,
+    /// The draft's branch picker chose a branch for the local checkout:
+    /// switch the project checkout to it.
+    CheckoutBranch(String),
+}
+
+/// A local branch offered in a draft's branch picker.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DraftBranch {
+    pub name: String,
+    /// Checked out in another worktree, so the local checkout can't switch to it.
+    pub elsewhere: bool,
 }
 
 pub struct ThreadView {
@@ -71,10 +82,12 @@ pub struct ThreadView {
     /// Set while this view composes a thread that does not exist on the
     /// server yet, with the project title for its heading.
     draft: Option<(DraftThread, SharedString)>,
-    /// The project's checked-out branch, shown in a draft's workspace
-    /// picker: what the local checkout is on, and what a new worktree
-    /// branches from. `None` until it loads.
+    /// The checkout's branch, shown in the branch picker: what the thread's
+    /// checkout is on, and what a draft's new worktree branches from. `None`
+    /// until it loads.
     draft_branch: Option<String>,
+    /// The checkout's local branches, for the branch picker.
+    draft_branches: Vec<DraftBranch>,
     /// Progress of this thread starting in a new worktree, until the agent
     /// has its first message (see `worktree_setup`).
     worktree_setup: Option<WorktreeSetup>,
@@ -212,6 +225,7 @@ impl ThreadView {
             model_picker,
             draft: None,
             draft_branch: None,
+            draft_branches: Vec::new(),
             worktree_setup: None,
             setup_details_open: false,
             cwd: None,
@@ -512,10 +526,28 @@ impl ThreadView {
         )
     }
 
-    /// The checked-out branch for the workspace picker (see `draft_branch`).
-    pub fn set_draft_branch(&mut self, branch: Option<String>, cx: &mut Context<Self>) {
-        if self.draft_branch != branch {
+    /// The checked-out branch and local branches for the draft's pickers
+    /// (see `draft_branch`).
+    pub fn set_draft_branch(
+        &mut self,
+        branch: Option<String>,
+        branches: Vec<DraftBranch>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.draft_branch != branch || self.draft_branches != branches {
             self.draft_branch = branch;
+            self.draft_branches = branches;
+            cx.notify();
+        }
+    }
+
+    /// Picks the branch a draft's new worktree starts from.
+    fn set_draft_base_branch(&mut self, branch: String, cx: &mut Context<Self>) {
+        if let Some((draft, _)) = &mut self.draft
+            && draft.base_branch.as_ref() != Some(&branch)
+        {
+            draft.base_branch = Some(branch);
+            cx.emit(ThreadViewEvent::DraftSettingsChanged(draft.clone()));
             cx.notify();
         }
     }
@@ -1165,6 +1197,7 @@ impl Render for ThreadView {
             .text_xs()
             .text_color(theme.muted_foreground)
             .children(self.render_workspace_picker(cx))
+            .children(self.draft.as_ref().and_then(|_| self.render_branch_picker(None, cx)))
             .when(self.draft.is_none(), |footer| {
                 footer.child(Icon::new(IconName::FolderClosed).xsmall()).child(
                     if shell.and_then(|t| t.worktree_path.as_ref()).is_some() {
@@ -1176,9 +1209,7 @@ impl Render for ThreadView {
             })
             .child(div().flex_1())
             .children(self.render_limits(cx))
-            .children(branch.map(|branch| {
-                h_flex().gap_1().child(Icon::new(IconName::GitBranch).xsmall()).child(branch)
-            }));
+            .children(if self.draft.is_none() { self.render_branch_picker(branch, cx) } else { None });
 
         v_flex().size_full().min_h_0().child(transcript).child(
             v_flex()
@@ -1267,28 +1298,20 @@ impl ThreadView {
         let (draft, _) = self.draft.as_ref()?;
         let worktree = draft.new_worktree;
         let view = cx.entity().downgrade();
-        let branch = self.draft_branch.clone();
-        let label = |worktree: bool| -> SharedString {
-            match (worktree, &branch) {
-                (false, Some(branch)) => format!("Local checkout · {branch}").into(),
-                (true, Some(branch)) => format!("New worktree from {branch}").into(),
-                (false, None) => "Local checkout".into(),
-                (true, None) => "New worktree".into(),
-            }
-        };
-        let labels = [label(false), label(true)];
+        let choices = [
+            ("Local checkout", false, IconName::Folder),
+            ("New worktree", true, IconName::FolderGit2),
+        ];
+        let (label, _, icon_name) = choices[worktree as usize];
         Some(
             Button::new("draft-workspace-picker")
                 .ghost()
                 .xsmall()
-                .icon(Icon::new(if worktree { IconName::FolderGit2 } else { IconName::Folder }))
-                .label(labels[worktree as usize].clone())
+                .icon(Icon::new(icon_name))
+                .label(label)
                 .tooltip("Where the new thread runs")
                 .dropdown_menu(move |mut menu, _, _| {
-                    for (label, choice, icon_name) in [
-                        (labels[0].clone(), false, IconName::Folder),
-                        (labels[1].clone(), true, IconName::FolderGit2),
-                    ] {
+                    for (label, choice, icon_name) in choices {
                         let view = view.clone();
                         menu = menu.item(
                             PopupMenuItem::new(label)
@@ -1297,6 +1320,65 @@ impl ThreadView {
                                 .on_click(move |_, _, cx| {
                                     let _ = view.update(cx, |view, cx| {
                                         view.set_draft_worktree(choice, cx)
+                                    });
+                                }),
+                        );
+                    }
+                    menu
+                })
+                .into_any_element(),
+        )
+    }
+
+    /// The thread's branch: what its checkout is on, or what a draft's new
+    /// worktree starts from. Picking one switches the checkout, or sets the
+    /// worktree's base. `fallback` is the branch the thread last reported,
+    /// shown until the checkout's own status loads.
+    fn render_branch_picker(&self, fallback: Option<String>, cx: &Context<Self>) -> Option<AnyElement> {
+        let draft = self.draft.as_ref().map(|(draft, _)| draft);
+        let worktree = draft.is_some_and(|draft| draft.new_worktree);
+        let selected = if worktree {
+            draft.and_then(|draft| draft.base_branch.clone()).or_else(|| self.draft_branch.clone())
+        } else {
+            self.draft_branch.clone().or(fallback)
+        };
+        if draft.is_none() && selected.is_none() {
+            return None;
+        }
+        let label: SharedString = selected.clone().unwrap_or_else(|| "Loading…".into()).into();
+        let branches = self.draft_branches.clone();
+        let view = cx.entity().downgrade();
+        Some(
+            Button::new("draft-branch-picker")
+                .ghost()
+                .xsmall()
+                // Switching mid-turn would move the agent's files under it.
+                .disabled(draft.is_none() && self.is_working(cx))
+                .icon(Icon::new(IconName::GitBranch))
+                .label(label)
+                .tooltip(if worktree { "Branch the worktree starts from" } else { "Checked-out branch" })
+                .dropdown_menu(move |mut menu, _, _| {
+                    menu = menu.scrollable(true).max_h(px(320.));
+                    if branches.is_empty() {
+                        return menu.item(PopupMenuItem::new("Loading branches…").disabled(true));
+                    }
+                    for branch in &branches {
+                        let checked = selected.as_ref() == Some(&branch.name);
+                        // The checkout can't switch to a branch another worktree holds.
+                        let blocked = !worktree && branch.elsewhere;
+                        let name = branch.name.clone();
+                        let view = view.clone();
+                        menu = menu.item(
+                            PopupMenuItem::new(name.clone())
+                                .checked(checked)
+                                .disabled(blocked)
+                                .on_click(move |_, _, cx| {
+                                    let _ = view.update(cx, |view, cx| {
+                                        if worktree {
+                                            view.set_draft_base_branch(name.clone(), cx);
+                                        } else if !checked {
+                                            cx.emit(ThreadViewEvent::CheckoutBranch(name.clone()));
+                                        }
                                     });
                                 }),
                         );
@@ -1634,6 +1716,7 @@ mod composer_tests {
             runtime_mode: "full-access".into(),
             interaction_mode: "default".into(),
             new_worktree: false,
+            base_branch: None,
         };
         let (handle, view) = cx.update(|cx| {
             gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
@@ -1740,6 +1823,7 @@ mod composer_tests {
             runtime_mode: "full-access".into(),
             interaction_mode: "default".into(),
             new_worktree: false,
+            base_branch: None,
         };
         let (handle, view) = cx.update(|cx| {
             gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
@@ -1795,6 +1879,7 @@ mod composer_tests {
             runtime_mode: "full-access".into(),
             interaction_mode: "default".into(),
             new_worktree: false,
+            base_branch: None,
         };
         let (handle, view) = cx.update(|cx| {
             gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {

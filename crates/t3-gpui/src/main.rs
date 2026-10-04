@@ -17,6 +17,7 @@ mod project_picker;
 mod script_dialog;
 mod settings;
 mod sidebar;
+mod terminal;
 mod thread_view;
 mod transcript;
 mod ui;

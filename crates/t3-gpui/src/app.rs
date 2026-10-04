@@ -675,6 +675,7 @@ impl T3App {
                 self.info.update(cx, |info, cx| {
                     info.set_available_editors(config.available_editors.clone(), cx)
                 });
+                self.workspace.update(cx, |panel, _| panel.set_server_cwd(config.cwd.clone()));
                 self.handle_event(Event::Providers(config.providers), window, cx);
             }
             Event::Providers(providers) => {
@@ -844,6 +845,7 @@ impl T3App {
             runtime_mode,
             interaction_mode,
             new_worktree: false,
+            base_branch: None,
         };
         if let Some(text) = text {
             self.drafts.insert(draft.id.clone(), text);
@@ -1132,6 +1134,10 @@ impl T3App {
                 }
                 return;
             }
+            ThreadViewEvent::CheckoutBranch(branch) => {
+                self.info.update(cx, |info, cx| info.checkout_ref(branch.clone(), cx));
+                return;
+            }
             ThreadViewEvent::CancelWorktreeSetup => {
                 self.backend.send(Command::CancelStartThread(id.clone()));
                 self.worktree_setups.remove(&id);
@@ -1167,7 +1173,10 @@ impl T3App {
                 ThreadViewEvent::Send(text, attachments) => {
                     let worktree_base = if draft.new_worktree {
                         let root = self.current_project(cx).map(|p| p.workspace_root.clone());
-                        let branch = self.info.read(cx).current_branch().map(str::to_owned);
+                        let branch = draft
+                            .base_branch
+                            .clone()
+                            .or_else(|| self.info.read(cx).current_branch().map(str::to_owned));
                         let (Some(root), Some(branch)) = (root, branch) else {
                             self.error = Some(
                                 "The checked-out branch is still loading, so the worktree has no base yet. Try sending again in a moment, or use the local checkout.".into(),
@@ -1245,6 +1254,7 @@ impl T3App {
             | ThreadViewEvent::QuestionDraftsChanged(_)
             | ThreadViewEvent::Attachment(_)
             | ThreadViewEvent::SearchFiles { .. }
+            | ThreadViewEvent::CheckoutBranch(_)
             | ThreadViewEvent::CancelWorktreeSetup => {}
             ThreadViewEvent::OpenUsageLimits => {
                 self.set_settings_open(false, window, cx);
@@ -1396,10 +1406,15 @@ impl T3App {
         }
     }
 
-    fn toggle_terminal_dock(&mut self, cx: &mut Context<Self>) {
+    /// Shows the dock with its shell running and typing going to it, like
+    /// opening a terminal app; hiding it hands the keyboard back.
+    fn toggle_terminal_dock(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.terminal_dock_open = !self.terminal_dock_open;
         if self.terminal_dock_open {
             self.sync_terminal_dock(cx);
+            self.terminal_dock.update(cx, |dock, cx| dock.focus_terminal(window, cx));
+        } else if let Some(thread) = &self.thread {
+            thread.update(cx, |view, cx| view.focus_composer(window, cx));
         }
         cx.notify();
     }
@@ -1448,7 +1463,8 @@ impl T3App {
                 .and_then(|t| t.latest_turn.as_ref())
                 .and_then(|turn| turn.completed_at.clone()),
         };
-        let wants_branch = scope.draft_new_worktree.is_some();
+        // The composer's branch picker shows the checkout's branches.
+        let wants_branch = scope.draft_new_worktree.is_some() || scope.thread_id.is_some();
         self.info.update(cx, |info, cx| {
             info.set_scope(scope, cx);
             info.set_visible(visible, cx);
@@ -1469,14 +1485,13 @@ impl T3App {
         view.update(cx, |view, cx| view.set_worktree_setup(setup, cx));
     }
 
-    /// Shows the checked-out branch in the open draft's workspace picker.
+    /// Hands the open thread's branch picker the checked-out and local branches.
     fn sync_draft_branch(&self, cx: &mut Context<Self>) {
         let Some(view) = &self.thread else { return };
-        if view.read(cx).draft_thread().is_none() {
-            return;
-        }
-        let branch = self.info.read(cx).current_branch().map(str::to_owned);
-        view.update(cx, |view, cx| view.set_draft_branch(branch, cx));
+        let info = self.info.read(cx);
+        let branch = info.current_branch().map(str::to_owned);
+        let branches = info.local_branches();
+        view.update(cx, |view, cx| view.set_draft_branch(branch, branches, cx));
     }
 
     fn on_info_event(
@@ -1664,6 +1679,9 @@ impl Render for T3App {
                                 .absolute()
                                 .top_2()
                                 .bottom_2()
+                                // Sized to its content; `bottom_2` only caps it.
+                                .flex()
+                                .items_start()
                                 .right(if workspace_visible {
                                     workspace_width + px(8.)
                                 } else {
@@ -1777,7 +1795,9 @@ impl T3App {
                     .tooltip("Terminal")
                     .occlude()
                     .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                    .on_click(cx.listener(|this, _, _, cx| this.toggle_terminal_dock(cx))),
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.toggle_terminal_dock(window, cx)
+                    })),
             )
             .child(
                 Button::new("workspace")
@@ -2098,7 +2118,10 @@ mod recovery_tests {
                 app.handle_event(Event::Status(Status::Connected("Test server".into())), window, cx);
             });
             window.render_frame(cx);
+            // The sidebar's event reaches the app once this update ends.
             window.click("sidebar-settings", cx);
+        }).unwrap();
+        cx.update_window(handle, |_, window, cx| {
             assert!(app.read(cx).settings.read(cx).is_open());
             window.render_frame(cx);
             assert_eq!(window.find("settings-page").bounds(), window.find("main-content").bounds());
