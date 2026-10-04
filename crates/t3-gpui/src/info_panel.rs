@@ -173,6 +173,18 @@ impl InfoPanel {
         }
     }
 
+    /// Loads the git status, and with it [`Self::current_branch`], even
+    /// while the panel is hidden: a draft's new worktree branches from it.
+    pub fn load_branch(&mut self, cx: &mut Context<Self>) {
+        let waiting = self.pending.values().any(|(_, slot)| matches!(slot, Slot::Status));
+        if self.status.is_none()
+            && !waiting
+            && let Some(cwd) = self.scope.cwd().map(str::to_owned)
+        {
+            self.request(WorkspaceRequest::GitStatus { cwd }, Slot::Status, cx);
+        }
+    }
+
     /// The checked-out branch, the base for a draft's new worktree.
     pub fn current_branch(&self) -> Option<&str> {
         self.status.as_ref().and_then(|status| status.ref_name.as_deref())

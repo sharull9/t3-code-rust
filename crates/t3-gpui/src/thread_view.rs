@@ -1031,11 +1031,7 @@ impl Render for ThreadView {
             .px_3()
             .text_xs()
             .text_color(theme.muted_foreground)
-            .when(self.draft.is_some(), |footer| {
-                footer
-                    .child(Icon::new(IconName::Pencil).xsmall())
-                    .child("Draft · the thread is created when you send")
-            })
+            .children(self.render_workspace_picker(cx))
             .when(self.draft.is_none(), |footer| {
                 footer.child(Icon::new(IconName::FolderClosed).xsmall()).child(
                     if shell.and_then(|t| t.worktree_path.as_ref()).is_some() {
@@ -1130,12 +1126,53 @@ impl ThreadView {
     /// The selected model's account limits, one small meter per window, so
     /// they're in view while writing. Hover for resets; click for the Limits
     /// tab.
+    /// Where a new thread will run: the project's checkout or a new
+    /// worktree, chosen before the first message. Same choice as the info
+    /// panel's folder row.
+    fn render_workspace_picker(&self, cx: &Context<Self>) -> Option<AnyElement> {
+        let (draft, _) = self.draft.as_ref()?;
+        let worktree = draft.new_worktree;
+        let view = cx.entity().downgrade();
+        Some(
+            Button::new("draft-workspace-picker")
+                .ghost()
+                .xsmall()
+                .icon(Icon::new(if worktree { IconName::FolderGit2 } else { IconName::Folder }))
+                .label(if worktree { "New worktree" } else { "Local checkout" })
+                .tooltip("Where the new thread runs")
+                .dropdown_menu(move |mut menu, _, _| {
+                    for (label, choice, icon_name) in [
+                        ("Local checkout", false, IconName::Folder),
+                        ("New worktree", true, IconName::FolderGit2),
+                    ] {
+                        let view = view.clone();
+                        menu = menu.item(
+                            PopupMenuItem::new(label)
+                                .icon(Icon::new(icon_name))
+                                .checked(worktree == choice)
+                                .on_click(move |_, _, cx| {
+                                    let _ = view.update(cx, |view, cx| {
+                                        view.set_draft_worktree(choice, cx)
+                                    });
+                                }),
+                        );
+                    }
+                    menu
+                })
+                .into_any_element(),
+        )
+    }
+
     /// Repaints the transcript after a thumbnail arrives.
     pub fn refresh_thumbnails(&mut self, cx: &mut Context<Self>) {
         self.transcript.update(cx, |_, cx| cx.notify());
     }
 
     fn render_limits(&self, cx: &Context<Self>) -> Option<AnyElement> {
+        // A new thread hasn't spent anything yet; the meters start with it.
+        if self.draft.is_some() {
+            return None;
+        }
         let provider = self.selected_provider()?;
         let limits = provider.usage_limits.as_ref().filter(|limits| limits.unavailable.is_none())?;
         if limits.windows.is_empty() {
@@ -1638,7 +1675,8 @@ mod composer_tests {
 
         cx.update_window(handle, |_, window, cx| {
             window.render_frame(cx);
-            assert!(window.find("composer-limits").visible(), "limits show under the composer");
+            assert!(window.try_find("composer-limits").is_none(), "no limits on a new thread");
+            assert!(window.find("draft-workspace-picker").visible());
             let composer_id = view.read(cx).composer.entity_id();
             window.click(("input", composer_id), cx);
             window.input("/rev", cx);

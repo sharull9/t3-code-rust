@@ -1106,7 +1106,7 @@ impl T3App {
                         let branch = self.info.read(cx).current_branch().map(str::to_owned);
                         let (Some(root), Some(branch)) = (root, branch) else {
                             self.error = Some(
-                                "The checked-out branch is not known yet, so the worktree has no base. Open the info panel (Ctrl+I) to load it, or use the current checkout.".into(),
+                                "The checked-out branch is still loading, so the worktree has no base yet. Try sending again in a moment, or use the local checkout.".into(),
                             );
                             view.update(cx, |view, cx| view.send_finished(text, false, window, cx));
                             return cx.notify();
@@ -1353,9 +1353,15 @@ impl T3App {
                 .and_then(|t| t.latest_turn.as_ref())
                 .and_then(|turn| turn.completed_at.clone()),
         };
+        let wants_branch = scope.draft_new_worktree == Some(true);
         self.info.update(cx, |info, cx| {
             info.set_scope(scope, cx);
             info.set_visible(visible, cx);
+            // A new worktree branches from the checked-out branch; have it
+            // ready by the time the draft is sent.
+            if wants_branch {
+                info.load_branch(cx);
+            }
         });
     }
 
