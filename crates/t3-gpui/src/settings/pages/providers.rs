@@ -71,6 +71,8 @@ pub fn restore_defaults(_: &mut SettingsPage, cx: &mut Context<SettingsPage>) {
 /// inputs behind it (created lazily, see [`sync`]) and the add-instance form.
 #[derive(Default)]
 pub struct UiState {
+    /// One grid of every instance instead of a grid per driver.
+    ungrouped: bool,
     /// The instance whose configuration form is open.
     configuring: Option<String>,
     /// The instance awaiting a "remove" confirmation.
@@ -158,7 +160,52 @@ pub fn render(page: &SettingsPage, cx: &Context<SettingsPage>) -> AnyElement {
     let rows = rows(page);
     let model_count: usize = page.providers.iter().map(|provider| provider.models.len()).sum();
     let ready = page.server_ready();
-    let cards = rows.iter().map(|row| render_card(page, row, cx));
+    let grouped = !page.providers_ui.ungrouped;
+    let list = if grouped {
+        // Drivers in the order their first instance appears.
+        let mut drivers: Vec<String> = Vec::new();
+        for row in &rows {
+            let driver = row.driver();
+            if !drivers.contains(&driver) {
+                drivers.push(driver);
+            }
+        }
+        v_flex()
+            .id("settings-provider-list")
+            .gap_5()
+            .children(drivers.into_iter().map(|driver| {
+                let members: Vec<&Row> = rows.iter().filter(|row| row.driver() == driver).collect();
+                let label = config::driver(&driver)
+                    .map(|driver| driver.label.to_owned())
+                    .unwrap_or_else(|| crate::ui::provider_label(Some(&driver)));
+                v_flex()
+                    .id(SharedString::from(format!("provider-group-{driver}")))
+                    .gap_2()
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .items_center()
+                            .child(crate::provider_logo::logo(&driver, px(16.), theme.foreground))
+                            .child(div().text_sm().font_semibold().child(label))
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(theme.muted_foreground)
+                                    .child(match members.len() {
+                                        1 => "1 instance".to_owned(),
+                                        count => format!("{count} instances"),
+                                    }),
+                            ),
+                    )
+                    .child(card_grid(members.iter().map(|row| render_card(page, row, grouped, cx))))
+            }))
+            .into_any_element()
+    } else {
+        div()
+            .id("settings-provider-list")
+            .child(card_grid(rows.iter().map(|row| render_card(page, row, grouped, cx))))
+            .into_any_element()
+    };
     v_flex()
         .gap_3()
         .child(section_label(format!("{} instances · {model_count} models", rows.len()), cx))
@@ -187,10 +234,28 @@ pub fn render(page: &SettingsPage, cx: &Context<SettingsPage>) -> AnyElement {
                             ui.add_error = None;
                             cx.notify();
                         })),
+                )
+                .child(div().flex_1())
+                .child(
+                    Button::new("provider-group-toggle")
+                        .small()
+                        .when(grouped, |button| button.primary())
+                        .when(!grouped, |button| button.outline())
+                        .icon(Icon::new(IconName::Layers))
+                        .label("Group by provider")
+                        .tooltip(if grouped {
+                            "Show every instance in one grid"
+                        } else {
+                            "Group instances by provider"
+                        })
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.providers_ui.ungrouped = !this.providers_ui.ungrouped;
+                            cx.notify();
+                        })),
                 ),
         )
         .when(page.providers_ui.add_open, |content| content.child(render_add_form(page, cx)))
-        .child(v_flex().id("settings-provider-list").gap_2().children(cards))
+        .child(list)
         .when(rows.is_empty(), |content| {
             content.child(div().text_sm().text_color(theme.muted_foreground).child(if page.connected {
                 "No provider instances were reported by this server."
@@ -198,7 +263,17 @@ pub fn render(page: &SettingsPage, cx: &Context<SettingsPage>) -> AnyElement {
         }).into_any_element()
 }
 
-fn render_card(page: &SettingsPage, row: &Row, cx: &Context<SettingsPage>) -> impl IntoElement {
+/// Instance cards two to a row; an open card spans the row (see `render_card`).
+fn card_grid(cards: impl IntoIterator<Item = impl IntoElement>) -> impl IntoElement {
+    div().grid().grid_cols(2).gap_2().children(cards)
+}
+
+fn render_card(
+    page: &SettingsPage,
+    row: &Row,
+    grouped: bool,
+    cx: &Context<SettingsPage>,
+) -> impl IntoElement {
     let theme = cx.theme();
     let name = row.name();
     let instance = row.id.clone();
@@ -242,11 +317,14 @@ fn render_card(page: &SettingsPage, row: &Row, cx: &Context<SettingsPage>) -> im
     };
     v_flex()
         .id(format!("provider-row-{}", row.id))
+        .min_w_0()
         .gap_2()
         .p_3()
         .rounded_md()
         .border_1()
         .border_color(theme.border)
+        // The configuration form and model list need the full width.
+        .when(configuring || expanded, |card| card.col_span_full())
         .child(
             h_flex()
                 .gap_2()
@@ -285,13 +363,20 @@ fn render_card(page: &SettingsPage, row: &Row, cx: &Context<SettingsPage>) -> im
                 .gap_3()
                 .text_xs()
                 .text_color(theme.muted_foreground)
-                .child(format!("Driver: {driver}"))
+                // Grouped, the group header already names the driver.
+                .when(!grouped, |line| line.child(format!("Driver: {driver}")))
                 .child(if hidden > 0 {
                     format!("{models} models · {hidden} hidden")
                 } else {
                     format!("{models} models")
-                })
-                .child(div().flex_1())
+                }),
+        )
+        // Pinned to the card's bottom so actions line up across a row.
+        .child(div().flex_1())
+        .child(
+            h_flex()
+                .gap_1()
+                .justify_end()
                 .when(row.config.is_some(), |line| {
                     let instance = instance.clone();
                     line.child(
