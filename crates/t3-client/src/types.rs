@@ -156,6 +156,8 @@ pub struct ThreadShell {
     pending_runtime_request: Option<PendingRuntimeRequest>,
     #[serde(default)]
     last_error: Option<String>,
+    #[serde(default)]
+    provider_instance_id: Option<String>,
 }
 
 /// `OrchestrationV2PendingRuntimeRequestSummary`, reduced to what decides
@@ -432,9 +434,12 @@ impl ThreadShell {
                 "idle" => SessionStatus::Idle,
                 _ => SessionStatus::Ready,
             };
+            // V2 names the provider instance rather than the driver; for the
+            // built-in instances the two coincide, and the UI resolves custom
+            // instances against the server's provider list.
             self.session = Some(Session {
                 status,
-                provider_name: None,
+                provider_name: self.provider_instance_id.clone(),
                 active_turn_id: self.active_run_id.clone(),
                 last_error: self.last_error.clone(),
             });

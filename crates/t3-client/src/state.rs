@@ -301,6 +301,7 @@ mod tests {
             "thread": {
                 "id": "t1", "projectId": "p1", "title": "V2", "runtimeMode": "full-access",
                 "status": "completed", "activityRunStatus": "running", "activeRunId": "run2",
+                "providerInstanceId": "codex",
                 "latestRunRequestedAt": "2026-10-04T00:00:00Z",
                 "latestRunStartedAt": "2026-10-04T00:00:01Z",
                 "activityRunStartedAt": "2026-10-03T23:59:00Z",
@@ -312,6 +313,7 @@ mod tests {
         let session = thread.session.as_ref().unwrap();
         assert!(session.is_working());
         assert_eq!(session.active_turn_id.as_deref(), Some("run2"));
+        assert_eq!(session.provider_name.as_deref(), Some("codex"));
         let turn = thread.latest_turn.as_ref().unwrap();
         assert_eq!(turn.started_at.as_deref(), Some("2026-10-03T23:59:00Z"));
         assert!(thread.has_pending_user_input && !thread.has_pending_approvals);

@@ -731,7 +731,14 @@ impl Render for ThreadView {
         let session = transcript_state.session().or_else(|| shell.and_then(|t| t.session.as_ref()));
         let session_error = session.and_then(|s| s.last_error.clone());
         let approvals = &self.approvals;
-        let provider = ui::provider_label(session.and_then(|s| s.provider_name.as_deref()));
+        // V2 sessions carry a provider instance id: show that instance's
+        // display name when the server lists it.
+        let provider = session.and_then(|s| s.provider_name.as_deref());
+        let provider = self
+            .providers
+            .iter()
+            .find(|p| Some(p.instance_id.as_str()) == provider)
+            .map_or_else(|| ui::provider_label(provider), crate::model_picker::provider_name);
         let selection = self.selection();
         let model_id = selection.as_ref().and_then(|m| m["model"].as_str()).unwrap_or(&provider);
         // The server's display name ("Claude Opus 5.5"), not its id ("claude-opus-5-5").
