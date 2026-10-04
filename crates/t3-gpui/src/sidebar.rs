@@ -8,12 +8,13 @@
 //! re-sorting `shell.threads` every frame.
 
 use std::collections::{HashMap, HashSet};
+use std::time::Duration;
 
 use gpui_kit::assets::IconName;
 use gpui_kit::component::Disableable as _;
-use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::button::{Button, ButtonVariant, ButtonVariants as _};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
-use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
+use gpui_kit::component::menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenu, PopupMenuItem};
 use gpui_kit::component::scroll::{ScrollableElement as _, Scrollbar};
 use gpui_kit::component::{
     ActiveTheme as _, Sizable as _, Size, StyledExt as _, WindowExt as _, h_flex, v_flex,
@@ -93,6 +94,8 @@ pub struct Sidebar {
     rename: Entity<InputState>,
     renaming: Option<String>,
     rename_pending: bool,
+    /// The last settle or archive, offered for undo (see [`Self::undo`]).
+    undo: Option<Undo>,
     /// Project lookup by id, rebuilt alongside `active`/`settled` so cards
     /// don't linear-scan `shell.projects` on every render.
     projects: HashMap<String, ProjectShell>,
@@ -121,6 +124,7 @@ impl Sidebar {
             rename,
             renaming: None,
             rename_pending: false,
+            undo: None,
             archive_mode: false,
             archive_request: None,
             archived: Vec::new(),
@@ -311,7 +315,76 @@ impl Sidebar {
             }
             _ => {}
         }
+        let undo = match action {
+            t3_client::ThreadAction::Settle(true) => {
+                Some((t3_client::ThreadAction::Settle(false), "Settled 1 thread"))
+            }
+            t3_client::ThreadAction::Archive => {
+                Some((t3_client::ThreadAction::Unarchive, "Archived 1 thread"))
+            }
+            _ => None,
+        };
+        if let Some((action, message)) = undo.filter(|_| success) {
+            let dismiss = cx.spawn(async move |this, cx| {
+                cx.background_executor().timer(UNDO_TIMEOUT).await;
+                let _ = this.update(cx, |this, cx| {
+                    this.undo = None;
+                    cx.notify();
+                });
+            });
+            self.undo = Some(Undo { thread_id: id.to_owned(), action, message, _dismiss: dismiss });
+        }
         cx.notify();
+    }
+
+    /// Reverses the last settle or archive while its toast is up. Returns
+    /// whether there was one to undo.
+    pub fn undo(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(undo) = self.undo.take() else {
+            return false;
+        };
+        if matches!(undo.action, t3_client::ThreadAction::Unarchive) {
+            self.restoring.push(undo.thread_id.clone());
+        }
+        cx.emit(SidebarEvent::ThreadAction(undo.thread_id, undo.action));
+        cx.notify();
+        true
+    }
+
+    /// "Settled 1 thread, Ctrl+Z to undo", above the footer.
+    fn render_undo_toast(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let undo = self.undo.as_ref()?;
+        let theme = cx.theme();
+        Some(
+            h_flex()
+                .id("undo-toast")
+                .test_support()
+                .flex_none()
+                .mx_2()
+                .mb_2()
+                .px_3()
+                .py_2()
+                .gap_1()
+                .rounded_lg()
+                .border_1()
+                .border_color(theme.border)
+                .bg(theme.popover)
+                .text_xs()
+                .text_color(theme.muted_foreground)
+                .cursor_pointer()
+                .hover(|style| style.bg(theme.list_hover))
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.undo(cx);
+                }))
+                .child(format!("{},", undo.message))
+                .child(
+                    div()
+                        .font_semibold()
+                        .text_color(theme.foreground)
+                        .child(if cfg!(target_os = "macos") { "Cmd+Z to undo" } else { "Ctrl+Z to undo" }),
+                )
+                .into_any_element(),
+        )
     }
 
     /// Rebuilds `active`, `working`, `settled` and `projects` from `shell` and the
@@ -482,6 +555,7 @@ impl Render for Sidebar {
         // capped share of the window's height and scrolls on its own.
         let working_max_h = window.viewport_size().height * 0.3;
         let settled_max_h = window.viewport_size().height * 0.4;
+        let undo_toast = self.render_undo_toast(cx);
 
         let theme = cx.theme();
         let (label, color) = match &self.status {
@@ -696,6 +770,7 @@ impl Render for Sidebar {
                         }),
                 )
             })
+            .children(undo_toast)
             .child(
                 h_flex()
                     .gap_2()
@@ -867,86 +942,36 @@ impl Sidebar {
             )
     }
 
-    /// The "…" menu on a thread's card: rename, pin, settle and archive.
+    /// The "…" menu on a thread's card. The card's right-click menu has the
+    /// same items (see [`ThreadMenu`]).
     fn thread_menu(
         &self,
         thread: &ThreadShell,
         cx: &mut Context<Self>,
     ) -> impl IntoElement + use<> {
-        let menu_view = cx.entity().downgrade();
-        let menu_thread_id = thread.id.clone();
-        let pinned = thread.pinned_at.is_some();
-        let settled = thread.is_settled();
-        let connected = matches!(self.status, Status::Connected(_));
-        let title = thread.title.clone();
+        let menu = self.thread_menu_items(thread, cx);
         Button::new(SharedString::from(format!("thread-menu-{}", thread.id)))
             .ghost()
             .xsmall()
             .icon(icon(IconName::Ellipsis))
             .tooltip("Thread actions")
-            .disabled(!connected || self.restoring.contains(&thread.id))
+            .disabled(!self.thread_menu_enabled(thread))
             .on_click(|_, _, cx| cx.stop_propagation())
-            .dropdown_menu(move |mut menu, _, _| {
-                let view = menu_view.clone();
-                let id = menu_thread_id.clone();
-                let rename_title = title.clone();
-                menu = menu.item(PopupMenuItem::new("Rename").on_click(move |_, window, cx| {
-                    let _ = view.update(cx, |this, cx| {
-                        if this.rename_pending {
-                            return;
-                        }
-                        this.renaming = Some(id.clone());
-                        this.rename.update(cx, |input, cx| {
-                            input.set_value(rename_title.clone(), window, cx);
-                            input.focus(window, cx);
-                        });
-                        cx.notify();
-                    });
-                }));
-                for (label, action) in [
-                    (if pinned { "Unpin" } else { "Pin" }, t3_client::ThreadAction::Pin(!pinned)),
-                    (
-                        if settled { "Move to active" } else { "Settle" },
-                        t3_client::ThreadAction::Settle(!settled),
-                    ),
-                    ("Archive", t3_client::ThreadAction::Archive),
-                ] {
-                    let view = menu_view.clone();
-                    let id = menu_thread_id.clone();
-                    let archive = matches!(action, t3_client::ThreadAction::Archive);
-                    let title = title.clone();
-                    menu = menu.item(PopupMenuItem::new(label).on_click(move |_, window, cx| {
-                        let send = {
-                            let (view, id, action) = (view.clone(), id.clone(), action.clone());
-                            move |cx: &mut App| {
-                                let _ = view.update(cx, |_, cx| {
-                                    cx.emit(SidebarEvent::ThreadAction(id.clone(), action.clone()))
-                                });
-                            }
-                        };
-                        if archive && Prefs::global(cx).confirm_thread_archive {
-                            let title = title.clone();
-                            window.open_alert_dialog(cx, move |alert, _, _| {
-                                let send = send.clone();
-                                alert
-                                    .title("Archive thread?")
-                                    .description(format!(
-                                        "\"{title}\" moves to the archive. You can restore it later."
-                                    ))
-                                    .ok_text("Archive")
-                                    .show_cancel(true)
-                                    .on_ok(move |_, _, cx| {
-                                        send(cx);
-                                        true
-                                    })
-                            });
-                        } else {
-                            send(cx);
-                        }
-                    }));
-                }
-                menu
-            })
+            .dropdown_menu(move |popup, _, _| menu.build(popup))
+    }
+
+    fn thread_menu_items(&self, thread: &ThreadShell, cx: &mut Context<Self>) -> ThreadMenu {
+        ThreadMenu {
+            view: cx.entity().downgrade(),
+            id: thread.id.clone(),
+            title: thread.title.clone(),
+            pinned: thread.pinned_at.is_some(),
+            settled: thread.is_settled(),
+        }
+    }
+
+    fn thread_menu_enabled(&self, thread: &ThreadShell) -> bool {
+        matches!(self.status, Status::Connected(_)) && !self.restoring.contains(&thread.id)
     }
 
     /// A thread's card with its subagents nested below it, joined by tree
@@ -1094,6 +1119,8 @@ impl Sidebar {
     /// A compact card for a subagent: icon, title, status and actions.
     fn render_subagent_card(&self, thread: &ThreadShell, cx: &mut Context<Self>) -> AnyElement {
         let menu = self.thread_menu(thread, cx);
+        let context_menu =
+            self.thread_menu_enabled(thread).then(|| self.thread_menu_items(thread, cx));
         let toggle = self.render_subagents_toggle(thread, cx);
         let active = self.open_thread_id.as_deref() == Some(thread.id.as_str());
         let trailing = thread_trailing(
@@ -1103,7 +1130,7 @@ impl Sidebar {
         );
         let theme = cx.theme();
         let thread_id = thread.id.clone();
-        h_flex()
+        let card = h_flex()
             .id(SharedString::from(format!("subagent-thread-{}", thread.id)))
             .test_support()
             .h(px(SUBAGENT_CARD_HEIGHT))
@@ -1135,8 +1162,8 @@ impl Sidebar {
             )
             .children(toggle)
             .child(trailing)
-            .child(menu)
-            .into_any_element()
+            .child(menu);
+        with_context_menu(card, context_menu)
     }
 
     fn render_thread_card(
@@ -1146,14 +1173,17 @@ impl Sidebar {
         thread: &ThreadShell,
         active: bool,
         cx: &mut Context<Self>,
-    ) -> impl IntoElement {
+    ) -> AnyElement {
         let menu = self.thread_menu(thread, cx);
         let toggle = self.render_subagents_toggle(thread, cx);
+        let archived = thread.archived_at.is_some();
+        // Archived cards only offer Restore.
+        let context_menu = (!archived && self.thread_menu_enabled(thread))
+            .then(|| self.thread_menu_items(thread, cx));
         let theme = cx.theme();
         let project = self.projects.get(&thread.project_id);
         let thread_id = thread.id.clone();
         let pinned = thread.pinned_at.is_some();
-        let archived = thread.archived_at.is_some();
         let connected = matches!(self.status, Status::Connected(_));
         // Distinct from `list` so the loader's id never collides with the
         // card's own id (both would otherwise share `(list, ix)`).
@@ -1180,7 +1210,7 @@ impl Sidebar {
                 )
             });
 
-        v_flex()
+        let card = v_flex()
             .id((list, ix))
             .test_support()
             .gap_1()
@@ -1288,7 +1318,19 @@ impl Sidebar {
                         .when(thread.branch.is_none(), |row| row.child(div().flex_1()))
                         .children(account.map(|mark| div().pr_0p5().child(mark))),
                 )
-            })
+            });
+        with_context_menu(card, context_menu)
+    }
+}
+
+/// `card` with `menu` on right-click, or as is when there's no menu.
+fn with_context_menu<E>(card: E, menu: Option<ThreadMenu>) -> AnyElement
+where
+    E: InteractiveElement + ParentElement + Styled + IntoElement + 'static,
+{
+    match menu {
+        Some(menu) => card.context_menu(move |popup, _, _| menu.build(popup)).into_any_element(),
+        None => card.into_any_element(),
     }
 }
 
@@ -1315,6 +1357,116 @@ fn capped_scroll(
 const MAX_SUBAGENT_DEPTH: usize = 8;
 const SUBAGENT_CARD_HEIGHT: f32 = 28.;
 const SUBAGENT_ROW_GAP: f32 = 2.;
+/// How long "Settled 1 thread, Ctrl+Z to undo" stays up.
+const UNDO_TIMEOUT: Duration = Duration::from_secs(6);
+
+/// The last settle or archive, offered for undo until it times out.
+struct Undo {
+    thread_id: String,
+    /// The action that reverses it.
+    action: t3_client::ThreadAction,
+    message: &'static str,
+    _dismiss: Task<()>,
+}
+
+/// A thread's actions, for both its "…" button and its right-click menu.
+#[derive(Clone)]
+struct ThreadMenu {
+    view: WeakEntity<Sidebar>,
+    id: String,
+    title: String,
+    pinned: bool,
+    settled: bool,
+}
+
+impl ThreadMenu {
+    fn build(&self, menu: PopupMenu) -> PopupMenu {
+        let rename = self.clone();
+        menu.item(PopupMenuItem::new("Rename").icon(icon(IconName::PencilLine)).on_click(
+            move |_, window, cx| {
+                let _ = rename.view.update(cx, |this, cx| {
+                    if this.rename_pending {
+                        return;
+                    }
+                    this.renaming = Some(rename.id.clone());
+                    this.rename.update(cx, |input, cx| {
+                        input.set_value(rename.title.clone(), window, cx);
+                        input.focus(window, cx);
+                    });
+                    cx.notify();
+                });
+            },
+        ))
+        .item(self.action_item(
+            if self.pinned { "Unpin" } else { "Pin" },
+            IconName::Pin,
+            t3_client::ThreadAction::Pin(!self.pinned),
+        ))
+        .item(self.action_item(
+            if self.settled { "Move to active" } else { "Settle" },
+            IconName::Check,
+            t3_client::ThreadAction::Settle(!self.settled),
+        ))
+        .separator()
+        .item(self.action_item("Archive", IconName::Archive, t3_client::ThreadAction::Archive))
+        .item(self.action_item("Delete", IconName::Trash, t3_client::ThreadAction::Delete))
+    }
+
+    /// An item that dispatches `action`, behind a confirmation for archive
+    /// (when enabled in settings) and always for delete.
+    fn action_item(
+        &self,
+        label: &'static str,
+        icon_name: IconName,
+        action: t3_client::ThreadAction,
+    ) -> PopupMenuItem {
+        let menu = self.clone();
+        PopupMenuItem::new(label).icon(icon(icon_name)).on_click(move |_, window, cx| {
+            let send = {
+                let (view, id, action) = (menu.view.clone(), menu.id.clone(), action.clone());
+                move |cx: &mut App| {
+                    let _ = view.update(cx, |_, cx| {
+                        cx.emit(SidebarEvent::ThreadAction(id.clone(), action.clone()))
+                    });
+                }
+            };
+            let title = &menu.title;
+            let confirm = match &action {
+                t3_client::ThreadAction::Archive if Prefs::global(cx).confirm_thread_archive => {
+                    Some((
+                        "Archive thread?",
+                        format!("\"{title}\" moves to the archive. You can restore it later."),
+                        "Archive",
+                        ButtonVariant::Primary,
+                    ))
+                }
+                t3_client::ThreadAction::Delete => Some((
+                    "Delete thread?",
+                    format!("\"{title}\" and its history are deleted. This can't be undone."),
+                    "Delete",
+                    ButtonVariant::Danger,
+                )),
+                _ => None,
+            };
+            let Some((heading, description, ok, variant)) = confirm else {
+                return send(cx);
+            };
+            window.open_alert_dialog(cx, move |alert, _, _| {
+                let send = send.clone();
+                alert
+                    .title(heading)
+                    .description(description.clone())
+                    .ok_text(ok)
+                    .ok_variant(variant)
+                    .show_cancel(true)
+                    .on_ok(move |_, _, cx| {
+                        send(cx);
+                        true
+                    })
+            });
+        })
+    }
+}
 
 /// The thread a subagent nests under: its parent, when that is unarchived
 /// and the chain above it ends rather than looping back.
@@ -1701,6 +1853,40 @@ mod interaction_tests {
         })
         .unwrap();
         assert_eq!(actions.borrow().len(), 2);
+    }
+
+    #[gpui_kit::test]
+    fn settle_and_archive_offer_one_undo(cx: &mut TestAppContext) {
+        let (handle, sidebar) = sidebar(cx);
+        let actions = Rc::new(RefCell::new(Vec::new()));
+        let capture = actions.clone();
+        let _subscription = cx.update(|cx| {
+            cx.subscribe(&sidebar, move |_, event: &SidebarEvent, _| {
+                if let SidebarEvent::ThreadAction(id, action) = event {
+                    capture.borrow_mut().push((id.clone(), action.clone()));
+                }
+            })
+        });
+        cx.update_window(handle, |_, window, cx| {
+            sidebar.update(cx, |sidebar, cx| {
+                sidebar.action_finished("t1", &t3_client::ThreadAction::Settle(true), false, cx);
+            });
+            window.render_frame(cx);
+            assert!(window.try_find("undo-toast").is_none(), "a failed settle has nothing to undo");
+            sidebar.update(cx, |sidebar, cx| {
+                sidebar.action_finished("t1", &t3_client::ThreadAction::Settle(true), true, cx);
+                sidebar.action_finished("t2", &t3_client::ThreadAction::Archive, true, cx);
+            });
+            window.render_frame(cx);
+            window.click("undo-toast", cx);
+            assert!(!sidebar.update(cx, |sidebar, cx| sidebar.undo(cx)), "undo is spent");
+        })
+        .unwrap();
+        assert_eq!(
+            *actions.borrow(),
+            vec![("t2".into(), t3_client::ThreadAction::Unarchive)],
+            "only the latest action is undone"
+        );
     }
 
     #[gpui_kit::test]

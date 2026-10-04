@@ -51,7 +51,8 @@ gpui_kit::actions!(
         ToggleWorkspace,
         ToggleInfo,
         ShowSettings,
-        DismissModal
+        DismissModal,
+        UndoThreadAction
     ]
 );
 pub fn init(cx: &mut App) {
@@ -75,6 +76,10 @@ pub struct T3App {
     /// A thread just dispatched via `thread.create`, opened as soon as its
     /// shell entry streams in (see `handle_event`'s `Event::Shell` arm).
     pending_new_thread_id: Option<String>,
+    /// Threads starting in a new worktree, by id, until the agent has their
+    /// first message. Kept here because the draft's view is replaced by the
+    /// thread's own once it streams in.
+    worktree_setups: HashMap<String, crate::worktree_setup::WorktreeSetup>,
     /// Pairing screen opened by hand while already paired, to switch servers.
     switching_server: bool,
     pairing_pending: bool,
@@ -261,6 +266,8 @@ impl T3App {
                     request: request.clone(),
                 });
             }),
+            // The git status arrives after `sync_info`; pass its branch on.
+            cx.observe(&info, |this, _, cx| this.sync_draft_branch(cx)),
             cx.subscribe_in(&info, window, |this, _, event: &InfoPanelEvent, window, cx| {
                 this.on_info_event(event, window, cx)
             }),
@@ -304,7 +311,7 @@ impl T3App {
                     }
                     SidebarEvent::AddProject => this.add_project(window, cx),
                     SidebarEvent::NewThread => {
-                        let projects = this.shell.projects.clone();
+                        let projects = crate::project_picker::recent_projects(&this.shell);
                         this.project_picker
                             .update(cx, |picker, cx| picker.open(projects, window, cx));
                     }
@@ -344,6 +351,7 @@ impl T3App {
             sidebar_open: true,
             project_picker,
             pending_new_thread_id: None,
+            worktree_setups: HashMap::new(),
             switching_server: false,
             pairing_pending: false,
             providers: Vec::new(),
@@ -668,6 +676,15 @@ impl T3App {
                 self.sidebar
                     .update(cx, |sidebar, cx| sidebar.set_archived(&request_id, snapshot, cx));
             }
+            Event::WorktreeSetup { thread_id, stage, update } => {
+                if let Some(setup) = self.worktree_setups.get_mut(&thread_id) {
+                    setup.apply(stage, update);
+                    if setup.finished() {
+                        self.worktree_setups.remove(&thread_id);
+                    }
+                    self.sync_worktree_setup(cx);
+                }
+            }
             Event::ThreadActionFinished { thread_id, action, success } => {
                 self.settings.update(cx, |page, cx| {
                     page.archive_action_finished(&thread_id, &action, success, cx)
@@ -686,6 +703,14 @@ impl T3App {
             }
             Event::SendFinished { thread_id, text, success, attachment_ids } => {
                 self.sending.remove(&thread_id);
+                // A failed step stays up to explain the failure; anything else
+                // that stops the send (offline, Cancel) just clears it.
+                if !success
+                    && self.worktree_setups.get(&thread_id).is_some_and(|setup| !setup.failed())
+                {
+                    self.worktree_setups.remove(&thread_id);
+                    self.sync_worktree_setup(cx);
+                }
                 if success {
                     if self.drafts.get(&thread_id).is_some_and(|draft| draft.trim() == text) {
                         self.drafts.remove(&thread_id);
@@ -846,6 +871,7 @@ impl T3App {
         });
         self._thread_subscription = Some(cx.subscribe_in(&view, window, Self::on_thread_event));
         self.thread = Some(view);
+        self.sync_worktree_setup(cx);
         self.sync_thread_shell(cx);
         self.sidebar.update(cx, |sidebar, cx| sidebar.set_open_thread(Some(draft_id), cx));
         self.after_switch(cx);
@@ -993,6 +1019,7 @@ impl T3App {
         });
         self._thread_subscription = Some(cx.subscribe_in(&view, window, Self::on_thread_event));
         self.thread = Some(view);
+        self.sync_worktree_setup(cx);
         self.sync_thread_shell(cx);
         self.sidebar.update(cx, |sidebar, cx| sidebar.set_open_thread(Some(thread_id.clone()), cx));
         self.backend.send(Command::OpenThread(thread_id));
@@ -1074,6 +1101,12 @@ impl T3App {
                 }
                 return;
             }
+            ThreadViewEvent::CancelWorktreeSetup => {
+                self.backend.send(Command::CancelStartThread(id.clone()));
+                self.worktree_setups.remove(&id);
+                self.sync_worktree_setup(cx);
+                return;
+            }
             ThreadViewEvent::SearchFiles { request_id, query } => {
                 let Some(cwd) = self.composer_cwd(cx) else {
                     view.update(cx, |view, cx| {
@@ -1115,6 +1148,14 @@ impl T3App {
                     } else {
                         None
                     };
+                    let setup_script = worktree_base.as_ref().and_then(|_| {
+                        let project = self.current_project(cx)?;
+                        project.scripts.iter().find(|s| s.run_on_worktree_create).cloned()
+                    });
+                    if worktree_base.is_some() {
+                        self.worktree_setups.insert(draft.id.clone(), Default::default());
+                        self.sync_worktree_setup(cx);
+                    }
                     self.sending.insert(draft.id.clone());
                     self.pending_new_thread_id = Some(draft.id.clone());
                     self.backend.send(Command::StartThread {
@@ -1123,6 +1164,7 @@ impl T3App {
                         text: text.clone(),
                         attachments: attachments.clone(),
                         worktree_base,
+                        setup_script,
                     });
                 }
                 ThreadViewEvent::OpenAttachment(attachment) => {
@@ -1171,7 +1213,8 @@ impl T3App {
             | ThreadViewEvent::DraftSettingsChanged(_)
             | ThreadViewEvent::QuestionDraftsChanged(_)
             | ThreadViewEvent::Attachment(_)
-            | ThreadViewEvent::SearchFiles { .. } => {}
+            | ThreadViewEvent::SearchFiles { .. }
+            | ThreadViewEvent::CancelWorktreeSetup => {}
             ThreadViewEvent::OpenUsageLimits => {
                 self.set_settings_open(false, window, cx);
                 self.usage.update(cx, |usage, cx| usage.show_limits(cx));
@@ -1353,16 +1396,35 @@ impl T3App {
                 .and_then(|t| t.latest_turn.as_ref())
                 .and_then(|turn| turn.completed_at.clone()),
         };
-        let wants_branch = scope.draft_new_worktree == Some(true);
+        let wants_branch = scope.draft_new_worktree.is_some();
         self.info.update(cx, |info, cx| {
             info.set_scope(scope, cx);
             info.set_visible(visible, cx);
-            // A new worktree branches from the checked-out branch; have it
-            // ready by the time the draft is sent.
+            // The draft's workspace picker shows the checked-out branch, and
+            // a new worktree branches from it; have it ready by the time the
+            // draft is sent.
             if wants_branch {
                 info.load_branch(cx);
             }
         });
+        self.sync_draft_branch(cx);
+    }
+
+    /// Hands the open view its thread's worktree setup progress, if any.
+    fn sync_worktree_setup(&self, cx: &mut Context<Self>) {
+        let Some(view) = &self.thread else { return };
+        let setup = self.worktree_setups.get(view.read(cx).thread_id()).cloned();
+        view.update(cx, |view, cx| view.set_worktree_setup(setup, cx));
+    }
+
+    /// Shows the checked-out branch in the open draft's workspace picker.
+    fn sync_draft_branch(&self, cx: &mut Context<Self>) {
+        let Some(view) = &self.thread else { return };
+        if view.read(cx).draft_thread().is_none() {
+            return;
+        }
+        let branch = self.info.read(cx).current_branch().map(str::to_owned);
+        view.update(cx, |view, cx| view.set_draft_branch(branch, cx));
     }
 
     fn on_info_event(
@@ -1439,7 +1501,7 @@ impl Render for T3App {
             .key_context("T3App")
             .on_action(cx.listener(|this, _: &NewThread, window, cx| {
                 if matches!(this.status, Status::Connected(_)) {
-                    let projects = this.shell.projects.clone();
+                    let projects = crate::project_picker::recent_projects(&this.shell);
                     this.project_picker.update(cx, |picker, cx| picker.open(projects, window, cx));
                 }
             }))
@@ -1458,6 +1520,11 @@ impl Render for T3App {
                 this.toggle_workspace(window, cx)
             }))
             .on_action(cx.listener(|this, _: &ToggleInfo, _, cx| this.toggle_info(cx)))
+            .on_action(cx.listener(|this, _: &UndoThreadAction, _, cx| {
+                if !this.sidebar.update(cx, |sidebar, cx| sidebar.undo(cx)) {
+                    cx.propagate();
+                }
+            }))
             .on_action(cx.listener(|this, _: &ShowSettings, window, cx| {
                 this.toggle_settings(window, cx)
             }))
@@ -1747,7 +1814,7 @@ impl T3App {
                                 .label("New thread")
                                 .disabled(!connected || self.shell.projects.is_empty())
                                 .on_click(cx.listener(|this, _, window, cx| {
-                                    let projects = this.shell.projects.clone();
+                                    let projects = crate::project_picker::recent_projects(&this.shell);
                                     this.project_picker
                                         .update(cx, |picker, cx| picker.open(projects, window, cx));
                                 })),

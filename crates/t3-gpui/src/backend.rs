@@ -16,6 +16,8 @@ use t3_client::{
 };
 use tokio::sync::mpsc;
 
+use crate::worktree_setup::{Stage, StageUpdate};
+
 const CLIENT_LABEL: &str = "T3 GPUI";
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
 
@@ -106,7 +108,13 @@ pub enum Command {
         /// `(project root, base branch)` when `draft.new_worktree` is set:
         /// the worktree is branched from there before the thread is created.
         worktree_base: Option<(String, String)>,
+        /// The project's setup script (`run_on_worktree_create`), run in the
+        /// new worktree's terminal before the first message is sent.
+        setup_script: Option<t3_client::ProjectScript>,
     },
+    /// Stops a `StartThread` that hasn't finished, reporting it as failed so
+    /// the message goes back into the composer.
+    CancelStartThread(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -184,6 +192,12 @@ pub enum Event {
     Usage {
         request_id: u64,
         result: Result<t3_client::UsageSummary, String>,
+    },
+    /// A step of a thread starting in a new worktree (see `worktree_setup`).
+    WorktreeSetup {
+        thread_id: String,
+        stage: Stage,
+        update: StageUpdate,
     },
     ThreadActionFinished {
         thread_id: String,
@@ -569,6 +583,8 @@ async fn wait_offline(
                     Command::Interrupt { .. }
                     | Command::CreateProject { .. },
                 ) => events.error("Reconnect before changing this thread or project."),
+                // Nothing is starting while offline.
+                Some(Command::CancelStartThread(_)) => {}
             },
         }
     }
@@ -614,6 +630,9 @@ async fn run_session(
     let mut operations = tokio::task::JoinSet::new();
     let mut terminals: std::collections::HashMap<(String, String), TaskGuard> =
         std::collections::HashMap::new();
+    // Thread starts by draft id, with the message to hand back on cancel.
+    let mut starting: std::collections::HashMap<String, (tokio::task::AbortHandle, String, Vec<String>)> =
+        std::collections::HashMap::new();
     let mut _thread =
         open_thread.clone().map(|thread_id| spawn_thread(connection, thread_id, events));
 
@@ -622,7 +641,7 @@ async fn run_session(
             reason = connection.closed() => return SessionEnd::Disconnected(reason),
             reason = &mut shell => return SessionEnd::Disconnected(reason),
             Some(result) = operations.join_next(), if !operations.is_empty() => {
-                if let Err(error) = result { events.error(format!("Backend request stopped: {error}")); }
+                if let Err(error) = result && !error.is_cancelled() { events.error(format!("Backend request stopped: {error}")); }
             }
             command = commands.recv() => match command {
                 None => return SessionEnd::Quit,
@@ -803,52 +822,104 @@ async fn run_session(
                         }
                     });
                 }
-                Some(Command::StartThread { draft, title, text, attachments, worktree_base }) => {
+                Some(Command::StartThread { draft, title, text, attachments, worktree_base, setup_script }) => {
                     let connection = connection.clone();
                     let events = events.clone();
-                    operations.spawn(async move {
-                        let attachment_ids = attachments.iter().map(|a| a.id.clone()).collect();
+                    let attachment_ids: Vec<String> = attachments.iter().map(|a| a.id.clone()).collect();
+                    let (thread_id, cancel_text, cancel_ids) = (draft.id.clone(), text.clone(), attachment_ids.clone());
+                    let handle = operations.spawn(async move {
+                        // Worktree threads report each step for the setup view.
+                        let in_worktree = worktree_base.is_some();
+                        let stage = |stage: Stage, update: StageUpdate| {
+                            if in_worktree {
+                                events.emit(Event::WorktreeSetup { thread_id: draft.id.clone(), stage, update });
+                            }
+                        };
                         let worktree = match &worktree_base {
                             // Branch name like the web app's: `t3code/<id prefix>`.
-                            Some((cwd, base)) => match connection.create_worktree(cwd, base, &format!("t3code/{}", &draft.id[..8.min(draft.id.len())])).await {
-                                Ok(worktree) => Some(worktree),
-                                Err(error) => {
-                                    events.error(format!("New worktree failed: {}", describe(&error)));
-                                    events.emit(Event::NewThreadFinished { thread_id: draft.id.clone(), success: false });
-                                    events.emit(Event::SendFinished { thread_id: draft.id, text, success: false, attachment_ids });
-                                    return;
+                            Some((cwd, base)) => {
+                                stage(Stage::Checkout, StageUpdate::Started);
+                                match connection.create_worktree(cwd, base, &format!("t3code/{}", &draft.id[..8.min(draft.id.len())])).await {
+                                    Ok(worktree) => {
+                                        stage(Stage::Checkout, StageUpdate::Done(Some(format!("{} from {base} at {}", worktree.0, worktree.1))));
+                                        Some(worktree)
+                                    }
+                                    Err(error) => {
+                                        stage(Stage::Checkout, StageUpdate::Failed(describe(&error)));
+                                        events.error(format!("New worktree failed: {}", describe(&error)));
+                                        events.emit(Event::NewThreadFinished { thread_id: draft.id.clone(), success: false });
+                                        events.emit(Event::SendFinished { thread_id: draft.id.clone(), text, success: false, attachment_ids });
+                                        return;
+                                    }
                                 }
-                            },
+                            }
                             None => None,
                         };
                         let created = connection
                             .create_thread(&draft.id, &draft.project_id, &title, draft.model_selection.clone(), &draft.runtime_mode, &draft.interaction_mode, worktree.as_ref().map(|(branch, path)| (branch.as_str(), path.as_str())))
                             .await;
                         if let Err(error) = created {
+                            stage(Stage::StartAgent, StageUpdate::Failed(describe(&error)));
                             events.error(format!("New thread failed: {}", describe(&error)));
                             events.emit(Event::NewThreadFinished { thread_id: draft.id.clone(), success: false });
-                            events.emit(Event::SendFinished { thread_id: draft.id, text, success: false, attachment_ids });
+                            events.emit(Event::SendFinished { thread_id: draft.id.clone(), text, success: false, attachment_ids });
                             return;
                         }
                         events.emit(Event::NewThreadFinished { thread_id: draft.id.clone(), success: true });
+                        match (&worktree_base, &worktree, &setup_script) {
+                            (Some((root, _)), Some((_, path)), Some(script)) => {
+                                // In the terminal the workspace panel opens, so its output is
+                                // there on Ctrl+J. "Wait for finish" holds the message until it's done.
+                                let wait = script.r#async == Some(false);
+                                stage(Stage::SetupScript, StageUpdate::Started);
+                                match connection.run_setup_script(&draft.id, crate::workspace::TERMINAL_ID, root, path, &script.command, wait).await {
+                                    Ok(()) => stage(Stage::SetupScript, StageUpdate::Done(Some(format!(
+                                        "{} ({}){}", script.name, script.command, if wait { "" } else { ", still running in the terminal" }
+                                    )))),
+                                    // Not fatal: the agent can still start without it.
+                                    Err(error) => {
+                                        stage(Stage::SetupScript, StageUpdate::Failed(describe(&error)));
+                                        events.error(format!("Setup script \"{}\" failed to start: {}", script.name, describe(&error)));
+                                    }
+                                }
+                            }
+                            _ => stage(Stage::SetupScript, StageUpdate::Skipped("The project has no setup script".into())),
+                        }
+                        stage(Stage::StartAgent, StageUpdate::Started);
                         let thread: ThreadShell = match serde_json::from_value(serde_json::json!({
                             "id": draft.id, "projectId": draft.project_id, "title": title,
                             "runtimeMode": draft.runtime_mode, "interactionMode": draft.interaction_mode,
                         })) {
                             Ok(thread) => thread,
                             Err(error) => {
+                                stage(Stage::StartAgent, StageUpdate::Failed(error.to_string()));
                                 events.error(format!("Send failed: {error}"));
-                                events.emit(Event::SendFinished { thread_id: draft.id, text, success: false, attachment_ids });
+                                events.emit(Event::SendFinished { thread_id: draft.id.clone(), text, success: false, attachment_ids });
                                 return;
                             }
                         };
                         let result = connection.send_message_with_attachments(&thread, &text, &attachments).await;
                         let success = result.is_ok();
-                        if let Err(error) = result {
-                            events.error(format!("Send failed: {}", describe(&error)));
+                        match &result {
+                            Ok(_) => stage(Stage::StartAgent, StageUpdate::Done(None)),
+                            Err(error) => {
+                                stage(Stage::StartAgent, StageUpdate::Failed(describe(error)));
+                                events.error(format!("Send failed: {}", describe(error)));
+                            }
                         }
                         events.emit(Event::SendFinished { thread_id: thread.id, text, success, attachment_ids });
                     });
+                    starting.insert(thread_id, (handle, cancel_text, cancel_ids));
+                }
+                Some(Command::CancelStartThread(thread_id)) => {
+                    // A finished start has nothing left to cancel.
+                    if let Some((handle, text, attachment_ids)) = starting.remove(&thread_id)
+                        && !handle.is_finished()
+                    {
+                        handle.abort();
+                        events.emit(Event::NewThreadFinished { thread_id: thread_id.clone(), success: false });
+                        events.emit(Event::SendFinished { thread_id, text, success: false, attachment_ids });
+                    }
                 }
             },
         }
@@ -1036,6 +1107,7 @@ mod tests {
                 text: "Fix the build".into(),
                 attachments: Vec::new(),
                 worktree_base: None,
+                setup_script: None,
             })
             .unwrap();
         drop(commands);

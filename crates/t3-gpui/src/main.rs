@@ -23,6 +23,7 @@ mod ui;
 mod usage;
 mod user_input;
 mod workspace;
+mod worktree_setup;
 
 use gpui_kit::component::TitleBar;
 use gpui_kit::*;

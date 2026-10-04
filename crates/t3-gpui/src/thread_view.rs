@@ -27,6 +27,7 @@ use crate::model_picker::{ModelPicker, ModelPickerEvent};
 use crate::transcript::{Transcript, TranscriptEvent};
 use crate::ui;
 use crate::user_input::{UserInputEvent, UserInputPanel};
+use crate::worktree_setup::{Stage, StageState, WorktreeSetup, format_duration};
 
 pub enum ThreadViewEvent {
     Send(String, Vec<t3_client::attachments::UploadedAttachment>),
@@ -47,6 +48,8 @@ pub enum ThreadViewEvent {
     SearchFiles { request_id: u64, query: String },
     /// The composer's limit meters were clicked: show every limit.
     OpenUsageLimits,
+    /// Cancel on the worktree setup view: stop starting this thread.
+    CancelWorktreeSetup,
 }
 
 pub struct ThreadView {
@@ -68,6 +71,14 @@ pub struct ThreadView {
     /// Set while this view composes a thread that does not exist on the
     /// server yet, with the project title for its heading.
     draft: Option<(DraftThread, SharedString)>,
+    /// The project's checked-out branch, shown in a draft's workspace
+    /// picker: what the local checkout is on, and what a new worktree
+    /// branches from. `None` until it loads.
+    draft_branch: Option<String>,
+    /// Progress of this thread starting in a new worktree, until the agent
+    /// has its first message (see `worktree_setup`).
+    worktree_setup: Option<WorktreeSetup>,
+    setup_details_open: bool,
     /// The workspace the composer's mentions refer to.
     cwd: Option<String>,
     mention: Option<MentionMenu>,
@@ -200,6 +211,9 @@ impl ThreadView {
             thread_loaded: false,
             model_picker,
             draft: None,
+            draft_branch: None,
+            worktree_setup: None,
+            setup_details_open: false,
             cwd: None,
             mention: None,
             dismissed_mention: None,
@@ -384,6 +398,125 @@ impl ThreadView {
             t3_client::ThreadAction::RuntimeMode(mode) => shell.runtime_mode == *mode,
             t3_client::ThreadAction::InteractionMode(mode) => shell.interaction_mode == *mode,
             _ => true,
+        }
+    }
+
+    /// Shows (or with `None`, hides) the worktree setup view.
+    pub fn set_worktree_setup(&mut self, setup: Option<WorktreeSetup>, cx: &mut Context<Self>) {
+        if setup.is_none() {
+            self.setup_details_open = false;
+        }
+        self.worktree_setup = setup;
+        cx.notify();
+    }
+
+    /// "Setting up worktree…": each step with a check, spinner or cross and
+    /// how long it took, then Details and Cancel.
+    fn render_worktree_setup(&self, cx: &Context<Self>) -> Option<AnyElement> {
+        let setup = self.worktree_setup.as_ref()?;
+        let theme = cx.theme();
+        let failed = setup.failed();
+        let muted = theme.muted_foreground;
+        let rows = Stage::ALL.into_iter().zip(&setup.states).enumerate().map(|(ix, (stage, state))| {
+            let (mark, color, trailing) = match state {
+                StageState::Pending => {
+                    (Icon::new(IconName::Circle).xsmall().into_any_element(), muted.opacity(0.6), None)
+                }
+                StageState::Running(_) => (
+                    ui::loader(("worktree-setup-stage", ix), Size::XSmall).into_any_element(),
+                    theme.foreground,
+                    None,
+                ),
+                StageState::Done(elapsed) => (
+                    Icon::new(IconName::CircleCheck).xsmall().text_color(theme.success).into_any_element(),
+                    muted,
+                    Some(format_duration(*elapsed)),
+                ),
+                StageState::Skipped => (
+                    Icon::new(IconName::CircleMinus).xsmall().into_any_element(),
+                    muted.opacity(0.6),
+                    Some("Skipped".to_owned()),
+                ),
+                StageState::Failed => (
+                    Icon::new(IconName::CircleX).xsmall().into_any_element(),
+                    theme.danger,
+                    Some("Failed".to_owned()),
+                ),
+            };
+            h_flex()
+                .gap_2()
+                .text_sm()
+                .text_color(color)
+                .child(mark)
+                .child(div().flex_1().child(stage.label()))
+                .children(trailing.map(|text| div().text_xs().text_color(muted).child(text)))
+        });
+        let details_open = self.setup_details_open;
+        Some(
+            v_flex()
+                .id("worktree-setup")
+                .w_full()
+                .max_w(ui::content_width(cx))
+                .gap_1p5()
+                .px_1()
+                .pb_2()
+                .child(div().text_sm().text_color(if failed { theme.danger } else { muted }).child(
+                    if failed { "Worktree setup failed" } else { "Setting up worktree…" },
+                ))
+                .child(div().h(px(1.)).mb_1().bg(theme.border))
+                .children(rows)
+                .child(
+                    h_flex()
+                        .gap_1()
+                        .pl_4()
+                        .child(
+                            Button::new("worktree-setup-details")
+                                .ghost()
+                                .xsmall()
+                                .icon(Icon::new(if details_open {
+                                    IconName::ChevronDown
+                                } else {
+                                    IconName::ChevronRight
+                                }))
+                                .label("Details")
+                                .disabled(setup.details.is_empty())
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.setup_details_open = !this.setup_details_open;
+                                    cx.notify();
+                                })),
+                        )
+                        .when(!failed, |row| {
+                            row.child(
+                                Button::new("worktree-setup-cancel")
+                                    .ghost()
+                                    .xsmall()
+                                    .icon(Icon::new(IconName::X))
+                                    .label("Cancel")
+                                    .on_click(cx.listener(|_, _, _, cx| {
+                                        cx.emit(ThreadViewEvent::CancelWorktreeSetup)
+                                    })),
+                            )
+                        }),
+                )
+                .when(details_open, |column| {
+                    column.child(
+                        v_flex()
+                            .pl_6()
+                            .gap_0p5()
+                            .text_xs()
+                            .text_color(muted)
+                            .children(setup.details.iter().map(|line| div().child(line.clone()))),
+                    )
+                })
+                .into_any_element(),
+        )
+    }
+
+    /// The checked-out branch for the workspace picker (see `draft_branch`).
+    pub fn set_draft_branch(&mut self, branch: Option<String>, cx: &mut Context<Self>) {
+        if self.draft_branch != branch {
+            self.draft_branch = branch;
+            cx.notify();
         }
     }
 
@@ -1054,6 +1187,7 @@ impl Render for ThreadView {
                 .px_6()
                 .pt_2()
                 .pb_3()
+                .children(self.render_worktree_setup(cx))
                 .children(session_error.map(|error| {
                     div()
                         .w_full()
@@ -1133,17 +1267,27 @@ impl ThreadView {
         let (draft, _) = self.draft.as_ref()?;
         let worktree = draft.new_worktree;
         let view = cx.entity().downgrade();
+        let branch = self.draft_branch.clone();
+        let label = |worktree: bool| -> SharedString {
+            match (worktree, &branch) {
+                (false, Some(branch)) => format!("Local checkout · {branch}").into(),
+                (true, Some(branch)) => format!("New worktree from {branch}").into(),
+                (false, None) => "Local checkout".into(),
+                (true, None) => "New worktree".into(),
+            }
+        };
+        let labels = [label(false), label(true)];
         Some(
             Button::new("draft-workspace-picker")
                 .ghost()
                 .xsmall()
                 .icon(Icon::new(if worktree { IconName::FolderGit2 } else { IconName::Folder }))
-                .label(if worktree { "New worktree" } else { "Local checkout" })
+                .label(labels[worktree as usize].clone())
                 .tooltip("Where the new thread runs")
                 .dropdown_menu(move |mut menu, _, _| {
                     for (label, choice, icon_name) in [
-                        ("Local checkout", false, IconName::Folder),
-                        ("New worktree", true, IconName::FolderGit2),
+                        (labels[0].clone(), false, IconName::Folder),
+                        (labels[1].clone(), true, IconName::FolderGit2),
                     ] {
                         let view = view.clone();
                         menu = menu.item(

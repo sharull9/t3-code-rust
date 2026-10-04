@@ -70,6 +70,10 @@ fn response_is_current(
     })
 }
 
+/// The thread terminal this panel opens. A new worktree's setup script runs
+/// in it too, so its output is here.
+pub const TERMINAL_ID: &str = "term-1";
+
 pub struct WorkspacePanel {
     scope: WorkspaceScope,
     scope_epoch: u64,
@@ -132,7 +136,7 @@ impl WorkspacePanel {
             diff: None,
             selected_change: None,
             terminal_history: String::new(),
-            terminal_id: "term-1".into(),
+            terminal_id: TERMINAL_ID.into(),
             terminal_status: "closed".into(),
             terminal_input,
             terminal_open: false,

@@ -50,6 +50,8 @@ pub enum ThreadAction {
     Settle(bool),
     Archive,
     Unarchive,
+    /// `thread.delete`: removes the thread for good; there is no undo.
+    Delete,
     Rename(String),
     RuntimeMode(String),
     InteractionMode(String),
@@ -68,6 +70,7 @@ impl ThreadAction {
             Self::Settle(false) => "thread.unsettle",
             Self::Archive => "thread.archive",
             Self::Unarchive => "thread.unarchive",
+            Self::Delete => "thread.delete",
             Self::Rename(_) => "thread.metadata.update",
             Self::RuntimeMode(_) => "thread.runtime-mode.set",
             Self::InteractionMode(_) => "thread.interaction-mode.set",
@@ -329,6 +332,7 @@ mod command_tests {
         assert_eq!(command["threadId"], "thread-1");
         assert!(uuid::Uuid::parse_str(command["commandId"].as_str().unwrap()).is_ok());
         assert!(ThreadAction::Archive.command("thread-1").get("reason").is_none());
+        assert_eq!(ThreadAction::Delete.command("thread-1")["type"], "thread.delete");
         let restore = ThreadAction::Unarchive.command("thread-1");
         assert_eq!(restore["type"], "thread.unarchive");
         assert_eq!(restore["threadId"], "thread-1");

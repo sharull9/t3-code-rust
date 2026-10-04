@@ -184,7 +184,88 @@ impl Connection {
         }
         self.rpc().subscribe("terminal.attach", payload)
     }
+
+    /// Runs a project's setup script (`ProjectScript::run_on_worktree_create`)
+    /// in a thread's terminal, the way the server does for threads it puts
+    /// in a worktree: in the worktree, with `T3CODE_PROJECT_ROOT` and
+    /// `T3CODE_WORKTREE_PATH` set. Returns once the command is typed in,
+    /// or with `wait`, once it stops running (see [`wait_for_idle`]).
+    pub async fn run_setup_script(
+        &self,
+        thread_id: &str,
+        terminal_id: &str,
+        project_root: &str,
+        worktree_path: &str,
+        command: &str,
+        wait: bool,
+    ) -> Result<(), RpcError> {
+        self.rpc()
+            .call(
+                "terminal.open",
+                json!({
+                    "threadId": thread_id,
+                    "terminalId": terminal_id,
+                    "cwd": worktree_path,
+                    "worktreePath": worktree_path,
+                    "env": {
+                        "T3CODE_PROJECT_ROOT": project_root,
+                        "T3CODE_WORKTREE_PATH": worktree_path,
+                    },
+                }),
+            )
+            .await?;
+        // Attach before typing so the script's first activity isn't missed.
+        let stream = if wait {
+            Some(self.subscribe_terminal(thread_id, terminal_id, Some(worktree_path))?)
+        } else {
+            None
+        };
+        self.rpc()
+            .call(
+                "terminal.write",
+                json!({ "threadId": thread_id, "terminalId": terminal_id, "data": format!("{command}") }),
+            )
+            .await?;
+        if let Some(stream) = stream {
+            wait_for_idle(stream).await;
+        }
+        Ok(())
+    }
 }
+
+/// Waits for a terminal's command to finish: its shell reports a running
+/// subprocess, then none. A command that never shows as running within
+/// [`SETUP_START_TIMEOUT`] counts as done, and none is waited on longer than
+/// [`SETUP_RUN_TIMEOUT`], so a stuck script can't hold the thread forever.
+async fn wait_for_idle(mut stream: Subscription<WorkspaceTerminalEvent>) {
+    let mut running = false;
+    let deadline = tokio::time::Instant::now() + SETUP_RUN_TIMEOUT;
+    loop {
+        let limit = if running {
+            deadline
+        } else {
+            deadline.min(tokio::time::Instant::now() + SETUP_START_TIMEOUT)
+        };
+        let Ok(Some(Ok(event))) = tokio::time::timeout_at(limit, stream.next()).await else {
+            return;
+        };
+        match event {
+            WorkspaceTerminalEvent::Activity { has_running_subprocess, .. } => {
+                if running && !has_running_subprocess {
+                    return;
+                }
+                running |= has_running_subprocess;
+            }
+            WorkspaceTerminalEvent::Exited { .. }
+            | WorkspaceTerminalEvent::Closed { .. }
+            | WorkspaceTerminalEvent::Error { .. } => return,
+            _ => {}
+        }
+    }
+}
+
+const SETUP_START_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+const SETUP_RUN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15 * 60);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

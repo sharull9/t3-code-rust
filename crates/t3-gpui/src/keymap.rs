@@ -458,6 +458,13 @@ pub fn apply(cx: &mut App) {
     cx.clear_key_bindings();
     cx.bind_keys(bindings);
     cx.bind_keys([KeyBinding::new("ctrl-i", crate::app::ToggleInfo, Some("T3App"))]);
+    // Undoes the sidebar's last settle or archive while its toast is up. A
+    // focused text field keeps its own undo: its binding is deeper.
+    cx.bind_keys([KeyBinding::new(
+        if MAC { "cmd-z" } else { "ctrl-z" },
+        crate::app::UndoThreadAction,
+        Some("T3App"),
+    )]);
 }
 
 #[cfg(test)]
