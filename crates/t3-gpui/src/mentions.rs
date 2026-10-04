@@ -14,7 +14,7 @@ use std::ops::Range;
 
 use gpui_kit::assets::IconName;
 use gpui_kit::component::input::{InlineToken, InlineTokenContext, InputContent, InputToken};
-use gpui_kit::component::scroll::ScrollableElement as _;
+use gpui_kit::component::scroll::Scrollbar;
 use gpui_kit::component::{ActiveTheme as _, Sizable as _, StyledExt as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
@@ -372,17 +372,27 @@ pub struct MentionMenu {
     /// The file search this menu is waiting for, if any.
     pub pending_request: Option<u64>,
     pub error: Option<SharedString>,
+    /// Scrolls the highlighted row into view as the keyboard moves it.
+    pub scroll: ScrollHandle,
 }
 
 impl MentionMenu {
     pub fn new(trigger: Trigger) -> Self {
-        Self { trigger, items: Vec::new(), highlighted: 0, pending_request: None, error: None }
+        Self {
+            trigger,
+            items: Vec::new(),
+            highlighted: 0,
+            pending_request: None,
+            error: None,
+            scroll: ScrollHandle::new(),
+        }
     }
 
     pub fn move_highlight(&mut self, delta: isize) {
         if !self.items.is_empty() {
             let len = self.items.len() as isize;
             self.highlighted = (self.highlighted as isize + delta).rem_euclid(len) as usize;
+            self.scroll.scroll_to_item(self.highlighted);
         }
     }
 }
@@ -480,22 +490,34 @@ pub fn render_menu(
                     .child(badge)
             }))
     });
-    v_flex()
-        .id("mention-menu")
-        .test_support()
+    // The rows are the scroll container's direct children, so
+    // `scroll_to_item` can bring the highlighted one into view. The cap sits
+    // on the container itself; `overflow_y_scrollbar` would also cap the
+    // content and never scroll (see `sidebar::capped_scroll`).
+    div()
+        .relative()
         .w_full()
-        .max_h(px(280.))
-        .p_1()
         .rounded_xl()
         .border_1()
         .border_color(theme.border)
         .bg(theme.popover)
         .shadow_lg()
-        .overflow_y_scrollbar()
-        .children(rows)
-        .children(empty_text.map(|text| {
-            div().px_2().py_2().text_sm().text_color(theme.muted_foreground).child(text)
-        }))
+        .overflow_hidden()
+        .child(
+            v_flex()
+                .id("mention-menu")
+                .test_support()
+                .w_full()
+                .max_h(px(280.))
+                .p_1()
+                .overflow_y_scroll()
+                .track_scroll(&menu.scroll)
+                .children(rows)
+                .children(empty_text.map(|text| {
+                    div().px_2().py_2().text_sm().text_color(theme.muted_foreground).child(text)
+                })),
+        )
+        .child(div().absolute().inset_0().child(Scrollbar::vertical(&menu.scroll)))
 }
 
 /// How a mention token looks inside the composer: a tinted chip with a file

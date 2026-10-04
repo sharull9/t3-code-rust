@@ -394,8 +394,14 @@ fn render_thumbnail(
     let theme = cx.theme();
     let tooltip: SharedString = summary(row).into();
     let scrim = gpui_kit::black().opacity(0.45);
+    let name: SharedString = row.attachment.name.clone().into();
+    let full = preview.clone();
     div()
         .id(SharedString::from(format!("composer-attachment-{local_id}")))
+        .cursor_pointer()
+        .on_click(move |_, window, cx| {
+            crate::image_viewer::open(window, cx, full.clone(), name.clone(), None)
+        })
         .relative()
         .flex_none()
         .size(THUMBNAIL)

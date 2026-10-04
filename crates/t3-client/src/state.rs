@@ -128,6 +128,20 @@ fn apply_event(thread: &mut ThreadDetail, event: OrchestrationEvent) {
                 upsert(&mut thread.messages, message, |message| &message.id);
             }
         }
+        "turn-item.updated" => match crate::turn_items::convert(&event.payload) {
+            // Each update carries the whole item; replace the earlier copy.
+            Some(crate::turn_items::Converted::Message(message)) => {
+                if let Ok(message) = serde_json::from_value::<Message>(message) {
+                    upsert(&mut thread.messages, message, |message| &message.id);
+                }
+            }
+            Some(crate::turn_items::Converted::Activity(activity)) => {
+                if let Ok(activity) = serde_json::from_value::<crate::Activity>(activity) {
+                    upsert(&mut thread.activities, activity, |activity| &activity.id);
+                }
+            }
+            None => {}
+        },
         "thread.message-sent" => {
             let Ok(payload) = serde_json::from_value::<MessageSentPayload>(event.payload) else {
                 return;
@@ -274,6 +288,51 @@ mod tests {
         assert_eq!(thread.messages[0].text, "Hello");
         assert_eq!(thread.messages[0].turn_id.as_deref(), Some("run1"));
         assert!(!thread.messages[0].streaming);
+    }
+
+    #[test]
+    fn v2_turn_items_show_as_activities_and_update_in_place() {
+        let command = |status: &str, output: Option<&str>| {
+            json!({
+                "id": "cmd-1", "type": "command_execution", "threadId": "t1", "runId": "run1",
+                "nodeId": null, "providerThreadId": null, "providerTurnId": null,
+                "nativeItemRef": null, "parentItemId": null, "ordinal": 1, "status": status,
+                "title": null, "startedAt": "2026-10-04T00:00:01Z", "completedAt": null,
+                "updatedAt": "2026-10-04T00:00:02Z", "input": "ls", "output": output
+            })
+        };
+        let mut state = ThreadState::default();
+        state.apply(
+            serde_json::from_value(json!({
+                "kind": "snapshot", "snapshotSequence": 3,
+                "projection": {
+                    "thread": { "id": "t1", "projectId": "p1", "title": "V2 thread" },
+                    "messages": [],
+                    "turnItems": [command("running", None), {
+                        "id": "think-1", "type": "reasoning", "threadId": "t1", "runId": "run1",
+                        "status": "completed", "startedAt": "2026-10-04T00:00:00Z",
+                        "updatedAt": "2026-10-04T00:00:00Z", "text": "Plan it", "streaming": false
+                    }]
+                }
+            }))
+            .unwrap(),
+        );
+        let thread = state.thread.as_ref().unwrap();
+        assert_eq!(thread.activities.len(), 1);
+        assert_eq!(thread.activities[0].summary, "ls");
+        assert_eq!(thread.messages[0].role, MessageRole::Reasoning);
+
+        state.apply(
+            serde_json::from_value(json!({
+                "kind": "event", "sequence": 4,
+                "event": { "type": "turn-item.updated", "threadId": "t1",
+                           "payload": command("completed", Some("a.txt")) }
+            }))
+            .unwrap(),
+        );
+        let thread = state.thread.as_ref().unwrap();
+        assert_eq!(thread.activities.len(), 1, "the update replaces the running copy");
+        assert_eq!(thread.activities[0].payload["output"], "a.txt");
     }
 
     #[test]

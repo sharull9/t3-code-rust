@@ -31,6 +31,8 @@ pub enum Command {
     StartLocal(Option<PathBuf>),
     RefreshConfig,
     OpenAsset(t3_client::attachments::UploadedAttachment),
+    /// Fetch an image attachment's bytes; answered with `Event::Thumbnail`.
+    LoadThumbnail(t3_client::attachments::UploadedAttachment),
     SaveDrafts(crate::drafts::DraftStore),
     UploadAttachment {
         thread_id: String,
@@ -118,6 +120,8 @@ pub enum Status {
 pub enum Event {
     Status(Status),
     AssetUrl(Result<String, String>),
+    /// `result` is `None` when offline: nothing was tried, so try again later.
+    Thumbnail { attachment_id: String, mime_type: String, result: Option<Result<Vec<u8>, String>> },
     EnvironmentKey {
         server: String,
         key: String,
@@ -527,6 +531,7 @@ async fn wait_offline(
                 Some(Command::Pair(link)) => return Offline::Pair(link),
                 Some(Command::StartLocal(path)) => return Offline::Local(path),
                 Some(Command::RefreshConfig | Command::OpenAsset(_)) => events.error("Reconnect to access the server."),
+                Some(Command::LoadThumbnail(attachment)) => events.emit(Event::Thumbnail { attachment_id: attachment.id, mime_type: attachment.mime_type, result: None }),
                 Some(Command::SaveDrafts(store)) => save_drafts(store, &events).await,
                 Some(Command::UploadAttachment { thread_id, request_id, attachment }) => events.emit(Event::AttachmentUploaded { thread_id, local_id: attachment.id, request_id, result: Err("Reconnect to upload this attachment.".into()) }),
                 Some(Command::Workspace { request_id, scope, .. }) => events.emit(Event::WorkspaceResult { request_id, scope, result: Err("Reconnect to use the workspace.".into()) }),
@@ -672,6 +677,13 @@ async fn run_session(
                     });
                 }
                 Some(Command::SaveDrafts(store)) => save_drafts(store, &events).await,
+                Some(Command::LoadThumbnail(attachment)) => {
+                    let connection = connection.clone(); let events = events.clone(); let base_url = base_url.clone();
+                    operations.spawn(async move {
+                        let result = t3_client::attachments::download_attachment(&connection, &base_url, &attachment).await.map_err(|e| e.to_string());
+                        events.emit(Event::Thumbnail { attachment_id: attachment.id, mime_type: attachment.mime_type, result: Some(result) });
+                    });
+                }
                 Some(Command::UploadAttachment { thread_id, request_id, attachment }) => {
                     let connection = connection.clone(); let http = http.clone(); let base_url = base_url.clone(); let events = events.clone();
                     operations.spawn(async move {

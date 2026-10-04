@@ -658,9 +658,17 @@ impl<'de> Deserialize<'de> for ThreadStreamItem {
             Some("synchronized") => Ok(Self::Synchronized),
             Some("snapshot") => {
                 if let Some(projection) = value.get("projection") {
-                    // V2 puts the sequence and projection directly on the frame.
+                    // V2 puts the sequence and projection directly on the frame,
+                    // and tool calls, reasoning and requests in `turnItems`.
                     let mut thread = projection["thread"].clone();
-                    thread["messages"] = projection["messages"].clone();
+                    let (reasoning, activities) = crate::turn_items::convert_all(
+                        projection["turnItems"].as_array().map_or(&[], Vec::as_slice),
+                    );
+                    let mut messages =
+                        projection["messages"].as_array().cloned().unwrap_or_default();
+                    messages.extend(reasoning);
+                    thread["messages"] = Value::Array(messages);
+                    thread["activities"] = Value::Array(activities);
                     let snapshot = serde_json::from_value(serde_json::json!({
                         "snapshotSequence": value["snapshotSequence"],
                         "thread": thread,

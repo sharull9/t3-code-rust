@@ -284,6 +284,52 @@ fn validate_size(kind: AttachmentKind, size_bytes: u64) -> Result<(), Attachment
     Ok(())
 }
 
+/// Largest attachment `download_attachment` will read, so a bad server can't
+/// exhaust memory through a thumbnail.
+const MAX_DOWNLOAD_BYTES: usize = 32 * 1024 * 1024;
+
+/// Fetches an uploaded attachment's bytes: mints a signed URL over the
+/// connection (`assets.createUrl`, as the web app's attachment previews do),
+/// then reads it without following redirects off this server.
+pub async fn download_attachment(
+    connection: &Connection,
+    base_url: &Url,
+    attachment: &UploadedAttachment,
+) -> Result<Vec<u8>, AttachmentError> {
+    let minted: serde_json::Value = connection
+        .rpc()
+        .call(
+            "assets.createUrl",
+            json!({ "resource": {
+                "_tag": "attachment",
+                "attachmentId": attachment.id,
+                "fileName": attachment.name,
+                "mimeType": attachment.mime_type,
+            } }),
+        )
+        .await?;
+    let relative = minted["relativeUrl"]
+        .as_str()
+        .ok_or_else(|| AttachmentError::Invalid("the server returned no asset URL".into()))?;
+    let url = resolve_upload_url(base_url, relative)?;
+    let http = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(60))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()?;
+    let response = http.get(url).send().await?;
+    let status = response.status();
+    if !status.is_success() {
+        let detail = response.text().await.unwrap_or_default();
+        return Err(AttachmentError::Upload { status: status.as_u16(), detail });
+    }
+    let bytes = response.bytes().await?;
+    if bytes.len() > MAX_DOWNLOAD_BYTES {
+        return Err(AttachmentError::Invalid("the attachment is too large to preview".into()));
+    }
+    Ok(bytes.to_vec())
+}
+
 fn resolve_upload_url(base_url: &Url, relative_url: &str) -> Result<Url, AttachmentError> {
     let url = base_url.join(relative_url)?;
     if url.origin() != base_url.origin() {

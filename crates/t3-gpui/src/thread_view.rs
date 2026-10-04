@@ -35,6 +35,8 @@ pub enum ThreadViewEvent {
     Attachment(AttachmentPanelEvent),
     Stop,
     OpenAttachment(t3_client::attachments::UploadedAttachment),
+    /// Fetch an image attachment for the transcript's thumbnails.
+    LoadThumbnail(t3_client::attachments::UploadedAttachment),
     Update(t3_client::ThreadAction),
     /// A draft thread's model or modes changed; nothing is sent to the server.
     DraftSettingsChanged(DraftThread),
@@ -150,8 +152,14 @@ impl ThreadView {
             },
         ));
         subscriptions.push(cx.subscribe(&transcript, |_, _, event: &TranscriptEvent, cx| {
-            let TranscriptEvent::OpenAttachment(attachment) = event;
-            cx.emit(ThreadViewEvent::OpenAttachment(attachment.clone()));
+            cx.emit(match event {
+                TranscriptEvent::OpenAttachment(attachment) => {
+                    ThreadViewEvent::OpenAttachment(attachment.clone())
+                }
+                TranscriptEvent::LoadThumbnail(attachment) => {
+                    ThreadViewEvent::LoadThumbnail(attachment.clone())
+                }
+            });
         }));
         subscriptions.push(cx.subscribe(&attachments, |_, _, event: &AttachmentPanelEvent, cx| {
             cx.emit(ThreadViewEvent::Attachment(event.clone()))
@@ -1122,6 +1130,11 @@ impl ThreadView {
     /// The selected model's account limits, one small meter per window, so
     /// they're in view while writing. Hover for resets; click for the Limits
     /// tab.
+    /// Repaints the transcript after a thumbnail arrives.
+    pub fn refresh_thumbnails(&mut self, cx: &mut Context<Self>) {
+        self.transcript.update(cx, |_, cx| cx.notify());
+    }
+
     fn render_limits(&self, cx: &Context<Self>) -> Option<AnyElement> {
         let provider = self.selected_provider()?;
         let limits = provider.usage_limits.as_ref().filter(|limits| limits.unavailable.is_none())?;
@@ -1534,6 +1547,61 @@ mod composer_tests {
         assert!(events.borrow().iter().any(|e| e == "send:use $repo-explorer @src/api/index.ts"));
         assert!(events.borrow().iter().any(|e| e == "search:1:"), "`@` alone browses recent files");
         assert!(events.borrow().iter().any(|e| e == "search:2:ind"));
+    }
+
+    #[gpui_kit::test]
+    fn arrowing_through_a_long_menu_keeps_the_highlight_in_view(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let draft = DraftThread {
+            id: "draft-1".into(),
+            project_id: "project-1".into(),
+            model_selection: json!({ "instanceId": "claude-a", "model": "opus" }),
+            runtime_mode: "full-access".into(),
+            interaction_mode: "default".into(),
+            new_worktree: false,
+        };
+        let (handle, view) = cx.update(|cx| {
+            gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+                let panel = cx.new(UserInputPanel::new);
+                let attachments = cx.new(AttachmentPanel::new);
+                cx.new(|cx| {
+                    ThreadView::new_draft(draft, "Demo".into(), panel, attachments, window, cx)
+                })
+            })
+            .unwrap()
+        });
+        let skills: Vec<_> = (0..20)
+            .map(|ix| json!({ "name": format!("skill-{ix:02}"), "path": format!("/s/{ix}"), "enabled": true }))
+            .collect();
+        let providers: Vec<t3_client::ServerProvider> = serde_json::from_value(json!([
+            {"instanceId":"claude-a","driver":"claudeAgent","enabled":true,"installed":true,
+             "models":[{"slug":"opus","name":"Opus"}], "skills": skills}
+        ]))
+        .unwrap();
+        view.update(cx, |view, cx| view.set_providers(providers, cx));
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            let composer_id = view.read(cx).composer.entity_id();
+            window.click(("input", composer_id), cx);
+            window.input("$", cx);
+        })
+        .unwrap();
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            for _ in 0..15 {
+                window.press("down", cx);
+            }
+        })
+        .unwrap();
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            window.render_frame(cx);
+            assert_eq!(view.read(cx).mention.as_ref().unwrap().highlighted, 15);
+            let menu = window.find("mention-menu").bounds();
+            let row = window.find(("mention-row", 15usize)).bounds();
+            assert!(row.top() >= menu.top() && row.bottom() <= menu.bottom() + px(1.));
+        })
+        .unwrap();
     }
 
     #[gpui_kit::test]

@@ -4,6 +4,7 @@ mod backend;
 mod directory_picker;
 mod drafts;
 mod fonts;
+mod image_viewer;
 mod info_panel;
 mod keymap;
 mod limits_view;

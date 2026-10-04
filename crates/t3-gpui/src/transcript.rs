@@ -14,8 +14,9 @@
 //! stream item, a row being expanded/collapsed, a scroll tick, or the slow
 //! (1s) "Working for..." ticker below.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use gpui_kit::assets::IconName;
@@ -30,7 +31,7 @@ use gpui_kit::component::{
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use serde_json::Value;
-use t3_client::attachments::UploadedAttachment;
+use t3_client::attachments::{AttachmentKind, UploadedAttachment};
 use t3_client::{
     Activity, ActivityTone, Message, MessageRole, Session, ThreadState, ThreadStreamItem,
 };
@@ -58,6 +59,59 @@ pub struct Transcript {
 
 pub enum TranscriptEvent {
     OpenAttachment(UploadedAttachment),
+    /// An image attachment needs its thumbnail fetched; the answer goes to
+    /// [`Thumbnails::finish`].
+    LoadThumbnail(UploadedAttachment),
+}
+
+/// Fetched image attachments by attachment id, shared by every transcript
+/// so reopening a thread doesn't fetch them again.
+#[derive(Default)]
+pub struct Thumbnails {
+    images: HashMap<String, Thumbnail>,
+}
+
+#[derive(Clone)]
+enum Thumbnail {
+    Loading,
+    Ready(Arc<Image>),
+    Failed,
+}
+
+impl Global for Thumbnails {}
+
+impl Thumbnails {
+    /// Stores a fetched attachment; undecodable or failed fetches show the
+    /// file's name instead. `None` (offline) forgets the request, so the
+    /// next load of the thread asks again.
+    pub fn finish(
+        attachment_id: &str,
+        mime_type: &str,
+        result: Option<Result<Vec<u8>, String>>,
+        cx: &mut App,
+    ) {
+        let Some(result) = result else {
+            cx.default_global::<Thumbnails>().images.remove(attachment_id);
+            return;
+        };
+        let format = match mime_type.to_ascii_lowercase().as_str() {
+            "image/png" => Some(ImageFormat::Png),
+            "image/jpeg" | "image/jpg" => Some(ImageFormat::Jpeg),
+            "image/webp" => Some(ImageFormat::Webp),
+            "image/gif" => Some(ImageFormat::Gif),
+            "image/bmp" => Some(ImageFormat::Bmp),
+            _ => None,
+        };
+        let thumbnail = match (result, format) {
+            (Ok(bytes), Some(format)) => Thumbnail::Ready(Arc::new(Image::from_bytes(format, bytes))),
+            _ => Thumbnail::Failed,
+        };
+        cx.default_global::<Thumbnails>().images.insert(attachment_id.to_owned(), thumbnail);
+    }
+
+    fn get(attachment_id: &str, cx: &App) -> Option<Thumbnail> {
+        cx.try_global::<Thumbnails>()?.images.get(attachment_id).cloned()
+    }
 }
 
 impl EventEmitter<TranscriptEvent> for Transcript {}
@@ -163,6 +217,25 @@ impl Transcript {
         }
 
         self.rebuild(replaced, cx);
+        self.request_thumbnails(cx);
+    }
+
+    /// Asks for the thumbnails of user messages' images not fetched yet.
+    fn request_thumbnails(&mut self, cx: &mut Context<Self>) {
+        let Some(thread) = self.state.thread.as_ref() else { return };
+        let wanted: Vec<UploadedAttachment> = thread
+            .messages
+            .iter()
+            .filter(|message| message.role == MessageRole::User)
+            .flat_map(|message| &message.attachments)
+            .filter(|attachment| attachment.kind == AttachmentKind::Image)
+            .filter(|attachment| Thumbnails::get(&attachment.id, cx).is_none())
+            .cloned()
+            .collect();
+        for attachment in wanted {
+            cx.default_global::<Thumbnails>().images.insert(attachment.id.clone(), Thumbnail::Loading);
+            cx.emit(TranscriptEvent::LoadThumbnail(attachment));
+        }
     }
 
     /// Recomputes `rows` from the current state and diffs it against the
@@ -331,27 +404,45 @@ fn render_message(message: &MessageRow, entity: &Entity<Transcript>, cx: &App) -
     let attachments = attachment_chips(&message.attachments, &message.id, entity, cx);
 
     match message.role {
-        MessageRole::User => h_flex()
-            .group(MESSAGE_GROUP)
-            .justify_end()
-            .child(
-                v_flex()
-                    .max_w(relative(0.8))
-                    .items_end()
-                    .gap_1()
-                    .child(
-                        div()
-                            .px_4()
-                            .py_2p5()
-                            .rounded_xl()
-                            .bg(cx.theme().secondary_hover)
-                            .text_sm()
-                            .child(message.text.clone()),
-                    )
-                    .when(!message.attachments.is_empty(), |column| column.child(attachments))
-                    .child(h_flex().justify_end().child(copy)),
-            )
-            .into_any_element(),
+        MessageRole::User => {
+            // Images sit inside the bubble above the text, as in T3; other
+            // files stay as chips beneath it.
+            let (images, files): (Vec<_>, Vec<_>) = message
+                .attachments
+                .iter()
+                .cloned()
+                .partition(|attachment| attachment.kind == AttachmentKind::Image);
+            let thumbnails = (!images.is_empty()).then(|| {
+                h_flex().flex_wrap().gap_2().children(
+                    images.iter().map(|image| render_thumbnail(image, &message.id, entity, cx)),
+                )
+            });
+            let files = (!files.is_empty()).then(|| attachment_chips(&files, &message.id, entity, cx));
+            let text = (!message.text.trim().is_empty()).then(|| message.text.clone());
+            h_flex()
+                .group(MESSAGE_GROUP)
+                .justify_end()
+                .child(
+                    v_flex()
+                        .max_w(relative(0.8))
+                        .items_end()
+                        .gap_1()
+                        .child(
+                            v_flex()
+                                .gap_2()
+                                .px_4()
+                                .py_2p5()
+                                .rounded_xl()
+                                .bg(cx.theme().secondary_hover)
+                                .text_sm()
+                                .children(thumbnails)
+                                .children(text),
+                        )
+                        .children(files)
+                        .child(h_flex().justify_end().child(copy)),
+                )
+                .into_any_element()
+        }
         MessageRole::Assistant => v_flex()
             .group(MESSAGE_GROUP)
             .gap_1()
@@ -390,6 +481,86 @@ fn copy_text_button(message_id: &str, text: String) -> impl IntoElement {
 
 /// Hover group for a transcript row, revealing its copy control.
 const MESSAGE_GROUP: &str = "transcript-message";
+
+/// Side lengths of an image attachment's thumbnail in a message. Fixed, so a
+/// row keeps its height while the image loads.
+const THUMBNAIL_WIDTH: Pixels = px(100.);
+const THUMBNAIL_HEIGHT: Pixels = px(72.);
+
+/// An image attachment: the picture once fetched, a placeholder until then;
+/// clicking opens the full file.
+fn render_thumbnail(
+    attachment: &UploadedAttachment,
+    message_id: &str,
+    entity: &Entity<Transcript>,
+    cx: &App,
+) -> AnyElement {
+    let theme = cx.theme();
+    let value = attachment.clone();
+    let entity = entity.clone();
+    let tooltip: SharedString = format!("{} · {}", attachment.name, format_size(attachment.size_bytes)).into();
+    let thumbnail = Thumbnails::get(&attachment.id, cx);
+    let loaded = match &thumbnail {
+        Some(Thumbnail::Ready(image)) => Some(image.clone()),
+        _ => None,
+    };
+    let content = match thumbnail {
+        Some(Thumbnail::Ready(image)) => img(image).size_full().object_fit(ObjectFit::Cover).into_any_element(),
+        Some(Thumbnail::Failed) => v_flex()
+            .size_full()
+            .items_center()
+            .justify_center()
+            .gap_1()
+            .p_1()
+            .text_xs()
+            .text_color(theme.muted_foreground)
+            .child(ui::icon(IconName::Image).small())
+            .child(div().max_w_full().truncate().child(attachment.name.clone()))
+            .into_any_element(),
+        Some(Thumbnail::Loading) | None => div()
+            .size_full()
+            .flex()
+            .items_center()
+            .justify_center()
+            .text_color(theme.muted_foreground)
+            .child(ui::icon(IconName::Image).small())
+            .into_any_element(),
+    };
+    div()
+        .id(SharedString::from(format!("message-image-{message_id}-{}", attachment.id)))
+        .test_support()
+        .flex_none()
+        .w(THUMBNAIL_WIDTH)
+        .h(THUMBNAIL_HEIGHT)
+        .rounded_lg()
+        .overflow_hidden()
+        .border_1()
+        .border_color(theme.border)
+        .bg(theme.muted)
+        .cursor_pointer()
+        .tooltip(move |window, cx| gpui_kit::component::tooltip::Tooltip::new(tooltip.clone()).build(window, cx))
+        .on_click(move |_, window, cx| {
+            let open_externally = {
+                let (entity, value) = (entity.clone(), value.clone());
+                move |_: &mut Window, cx: &mut App| {
+                    entity.update(cx, |_, cx| cx.emit(TranscriptEvent::OpenAttachment(value.clone())));
+                }
+            };
+            // Shown in place once fetched; until then the browser opens it.
+            match &loaded {
+                Some(image) => crate::image_viewer::open(
+                    window,
+                    cx,
+                    image.clone(),
+                    value.name.clone().into(),
+                    Some(Rc::new(open_externally)),
+                ),
+                None => open_externally(window, cx),
+            }
+        })
+        .child(content)
+        .into_any_element()
+}
 
 fn attachment_chips(
     attachments: &[UploadedAttachment],
@@ -1173,6 +1344,62 @@ mod tests {
             assert!(first.size.width <= px(40.));
             assert!(second.size.width <= px(40.));
             assert!(second.origin.y - first.origin.y <= px(100.));
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn user_images_load_once_and_show_inside_the_bubble_above_the_text(cx: &mut TestAppContext) {
+        use gpui_kit::test::TestWindowExt as _;
+        use std::{cell::RefCell, rc::Rc};
+
+        cx.update(gpui_kit::init);
+        let (handle, transcript) = cx.update(|cx| {
+            gpui_kit::open_window(WindowOptions::default(), cx, |_, cx| cx.new(Transcript::new)).unwrap()
+        });
+        let requested = Rc::new(RefCell::new(Vec::new()));
+        let capture = requested.clone();
+        let _subscription = cx.update(|cx| {
+            cx.subscribe(&transcript, move |_, event: &TranscriptEvent, _| {
+                if let TranscriptEvent::LoadThumbnail(attachment) = event {
+                    capture.borrow_mut().push(attachment.id.clone());
+                }
+            })
+        });
+        let snapshot = || {
+            serde_json::from_value::<t3_client::ThreadDetailSnapshot>(serde_json::json!({
+                "snapshotSequence": 0,
+                "thread": {
+                    "id": "thread-1", "projectId": "project-1", "title": "Screenshot",
+                    "messages": [{
+                        "id":"message-1","role":"user","text":"Look at this","streaming":false,
+                        "attachments":[
+                            {"type":"image","id":"img-1","name":"shot.png","mimeType":"image/png","sizeBytes":2048},
+                            {"type":"file","id":"file-1","name":"notes.txt","mimeType":"text/plain","sizeBytes":12}
+                        ],
+                        "createdAt":"2026-01-01T00:00:00.000Z","updatedAt":"2026-01-01T00:00:00.000Z"
+                    }],
+                    "activities": []
+                }
+            }))
+            .unwrap()
+        };
+        transcript.update(cx, |transcript, cx| {
+            transcript.apply(ThreadStreamItem::Snapshot { snapshot: snapshot() }, cx);
+            transcript.apply(ThreadStreamItem::Snapshot { snapshot: snapshot() }, cx);
+        });
+        assert_eq!(*requested.borrow(), ["img-1"], "only images, and only once");
+
+        cx.update_window(handle, |_, window, cx| {
+            let mut png = std::io::Cursor::new(Vec::new());
+            image::RgbImage::new(4, 4).write_to(&mut png, image::ImageFormat::Png).unwrap();
+            Thumbnails::finish("img-1", "image/png", Some(Ok(png.into_inner())), cx);
+            transcript.update(cx, |_, cx| cx.notify());
+            window.render_frame(cx);
+            let tile = window.find("message-image-message-1-img-1").bounds();
+            assert_eq!(tile.size, size(THUMBNAIL_WIDTH, THUMBNAIL_HEIGHT));
+            let file = window.find("open-attachment-message-1-file-1").bounds();
+            assert!(file.origin.y > tile.origin.y, "other files stay below the bubble");
         })
         .unwrap();
     }

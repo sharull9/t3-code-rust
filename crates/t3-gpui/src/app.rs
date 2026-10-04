@@ -395,6 +395,12 @@ impl T3App {
                 Ok(url) => cx.open_url(&url),
                 Err(error) => self.error = Some(error.into()),
             },
+            Event::Thumbnail { attachment_id, mime_type, result } => {
+                crate::transcript::Thumbnails::finish(&attachment_id, &mime_type, result, cx);
+                if let Some(thread) = &self.thread {
+                    thread.update(cx, |view, cx| view.refresh_thumbnails(cx));
+                }
+            }
             Event::EnvironmentId { server, id } => {
                 self.environments.insert(crate::drafts::normalize_server_url(&server), id);
             }
@@ -1122,6 +1128,9 @@ impl T3App {
                 ThreadViewEvent::OpenAttachment(attachment) => {
                     self.backend.send(Command::OpenAsset(attachment.clone()))
                 }
+                ThreadViewEvent::LoadThumbnail(attachment) => {
+                    self.backend.send(Command::LoadThumbnail(attachment.clone()))
+                }
                 _ => {}
             }
             return;
@@ -1141,6 +1150,9 @@ impl T3App {
             }
             ThreadViewEvent::OpenAttachment(attachment) => {
                 self.backend.send(Command::OpenAsset(attachment.clone()))
+            }
+            ThreadViewEvent::LoadThumbnail(attachment) => {
+                self.backend.send(Command::LoadThumbnail(attachment.clone()))
             }
             ThreadViewEvent::Update(action) => self
                 .backend
