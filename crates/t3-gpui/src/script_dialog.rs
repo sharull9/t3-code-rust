@@ -175,9 +175,13 @@ impl Render for ScriptDialog {
                     .child(
                         h_flex()
                             .items_start()
+                            .gap_4()
                             .child(
+                                // `min_w_0` lets the description wrap instead
+                                // of pushing the close button out of the dialog.
                                 v_flex()
                                     .flex_1()
+                                    .min_w_0()
                                     .gap_1()
                                     .child(div().text_lg().font_semibold().child("Add Action"))
                                     .child(div().text_sm().text_color(theme.muted_foreground).child(
@@ -186,6 +190,7 @@ impl Render for ScriptDialog {
                             )
                             .child(
                                 Button::new("script-dialog-close")
+                                    .flex_none()
                                     .ghost()
                                     .xsmall()
                                     .icon(icon(IconName::X))

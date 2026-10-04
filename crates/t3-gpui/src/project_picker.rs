@@ -22,7 +22,9 @@ use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::component::{ActiveTheme as _, Sizable as _, StyledExt as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
-use t3_client::ProjectShell;
+use std::collections::HashMap;
+
+use t3_client::{ProjectShell, ShellState};
 
 use crate::ui::{self, icon};
 
@@ -105,15 +107,14 @@ impl ProjectPicker {
         }
     }
 
-    /// Opens the picker over `projects`, sorted by title so the Ctrl+N slots
-    /// are predictable.
+    /// Opens the picker over `projects` in the order given; see
+    /// [`recent_projects`].
     pub fn open(
         &mut self,
-        mut projects: Vec<ProjectShell>,
+        projects: Vec<ProjectShell>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        projects.sort_by(|a, b| a.title.cmp(&b.title));
         self.all = projects;
         self.open = true;
         self.search.update(cx, |state, cx| {
@@ -387,6 +388,25 @@ impl ProjectPicker {
     }
 }
 
+/// The shell's projects, most recently active first: the latest update to
+/// the project or any of its threads. Ctrl+1 is the project you last worked
+/// in.
+pub fn recent_projects(shell: &ShellState) -> Vec<ProjectShell> {
+    let mut latest: HashMap<&str, &str> = HashMap::new();
+    for thread in &shell.threads {
+        let entry = latest.entry(thread.project_id.as_str()).or_default();
+        *entry = (*entry).max(thread.updated_at.as_str());
+    }
+    let mut projects = shell.projects.clone();
+    let activity = |project: &ProjectShell| {
+        let thread = latest.get(project.id.as_str()).copied().unwrap_or_default();
+        thread.max(project.updated_at.as_str()).to_owned()
+    };
+    // ISO timestamps sort as strings; ties fall back to the title.
+    projects.sort_by_cached_key(|p| (std::cmp::Reverse(activity(p)), p.title.clone()));
+    projects
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -412,6 +432,26 @@ mod tests {
         let matched: Vec<_> =
             projects.iter().filter(|p| matches(p, "code")).map(|p| p.id.as_str()).collect();
         assert_eq!(matched, ["p1"]);
+    }
+
+    #[test]
+    fn recent_projects_lead_with_the_latest_thread_activity() {
+        let mut old = project("old", "A project");
+        old.updated_at = "2026-01-01T00:00:00Z".into();
+        let mut busy = project("busy", "B project");
+        busy.updated_at = "2025-01-01T00:00:00Z".into();
+        let thread: t3_client::ThreadShell = serde_json::from_value(serde_json::json!({
+            "id": "t1", "projectId": "busy", "title": "Work", "runtimeMode": "full-access",
+            "updatedAt": "2026-06-01T00:00:00Z",
+        }))
+        .unwrap();
+        let shell = ShellState {
+            projects: vec![old, busy, project("idle", "C project")],
+            threads: vec![thread],
+            ..Default::default()
+        };
+        let ids: Vec<_> = recent_projects(&shell).into_iter().map(|p| p.id).collect();
+        assert_eq!(ids, ["busy", "old", "idle"]);
     }
 
     #[test]
