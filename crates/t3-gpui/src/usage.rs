@@ -125,6 +125,14 @@ impl UsageView {
         }
     }
 
+    /// Switches to the Limits tab.
+    pub fn show_limits(&mut self, cx: &mut Context<Self>) {
+        if self.metric != Metric::Limits {
+            self.metric = Metric::Limits;
+            cx.notify();
+        }
+    }
+
     pub fn set_active(&mut self, active: bool) {
         self.active = active;
     }

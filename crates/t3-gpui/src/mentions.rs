@@ -1,10 +1,14 @@
-//! `@` file and `$` skill mentions in the composer.
+//! `@` file and `$` skill mentions, and `/` commands, in the composer.
 //!
 //! Typing `@` or `$` at the start of a word opens a suggestion menu. Picking a
 //! suggestion replaces the typed word with an atomic inline token whose text
 //! is upstream's wire format (`@path`, `@"path with spaces"`, `$skill-name`),
 //! so the server and other clients read the prompt exactly as T3's composer
 //! writes it. See `packages/shared/src/composerInlineTokens.ts`.
+//!
+//! `/` opens T3's command menu: `/model`, `/plan` and `/default` act on the
+//! composer, and the provider's own commands (`/compact`, …) are typed out
+//! for the provider to run, as in upstream's `ChatComposer`.
 
 use std::ops::Range;
 
@@ -14,12 +18,13 @@ use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::component::{ActiveTheme as _, Sizable as _, StyledExt as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
-use t3_client::{ProviderSkill, WorkspaceEntry};
+use t3_client::{ProviderSkill, ProviderSlashCommand, WorkspaceEntry};
 
 use crate::ui::icon;
 
 pub const FILE_RESULT_LIMIT: u32 = 40;
 const SKILL_RESULT_LIMIT: usize = 50;
+const COMMAND_RESULT_LIMIT: usize = 50;
 const FILE_TOKEN: &str = "file:";
 const SKILL_TOKEN: &str = "skill:";
 
@@ -27,6 +32,7 @@ const SKILL_TOKEN: &str = "skill:";
 pub enum MentionKind {
     File,
     Skill,
+    Command,
 }
 
 /// The word being typed at the cursor, `@query` or `$query`.
@@ -38,8 +44,8 @@ pub struct Trigger {
     pub query: String,
 }
 
-/// The mention being typed when the cursor ends a word that starts with `@`
-/// or `$` at the start of the text or after whitespace.
+/// The mention being typed when the cursor ends a word that starts with `@`,
+/// `$` or `/` at the start of the text or after whitespace.
 pub fn detect_trigger(text: &str, cursor: usize) -> Option<Trigger> {
     let before = text.get(..cursor)?;
     let start = before.rfind(char::is_whitespace).map_or(0, |ix| {
@@ -49,11 +55,16 @@ pub fn detect_trigger(text: &str, cursor: usize) -> Option<Trigger> {
     let kind = match word.chars().next()? {
         '@' => MentionKind::File,
         '$' => MentionKind::Skill,
+        '/' => MentionKind::Command,
         _ => return None,
     };
     let query = &word[1..];
     // A second sigil means this is prose such as an email address.
     if query.contains(['@', '$', '"']) {
+        return None;
+    }
+    // `/usr/bin` is a path, not a command.
+    if kind == MentionKind::Command && query.contains(['/', '\\']) {
         return None;
     }
     // `$20` and similar stay prose, as upstream's skill grammar requires.
@@ -160,6 +171,97 @@ pub fn skill_scope_label(skill: &ProviderSkill) -> String {
     }
 }
 
+/// What `/` offers before the provider's own commands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BuiltinCommands {
+    /// `/plan` and `/default`, when the provider has an interaction mode.
+    pub interaction_modes: bool,
+}
+
+/// `/` commands matching `query`, best first: exact name, name prefix, then
+/// any match in the name or description. The provider's commands run as the
+/// message itself, so they're only offered when `/` starts the message;
+/// `/compact` also needs an otherwise empty composer.
+pub fn search_commands(
+    builtins: BuiltinCommands,
+    provider: &[&ProviderSlashCommand],
+    query: &str,
+    at_start: bool,
+    otherwise_empty: bool,
+) -> Vec<Suggestion> {
+    let query = query.trim().to_lowercase();
+    let mut candidates = vec![command_suggestion(
+        "model",
+        "Switch response model for this thread",
+        Pick::OpenModelPicker,
+    )];
+    if builtins.interaction_modes {
+        candidates.push(command_suggestion(
+            "plan",
+            "Switch this thread into plan mode",
+            Pick::InteractionMode("plan"),
+        ));
+        candidates.push(command_suggestion(
+            "default",
+            "Switch this thread back to normal build mode",
+            Pick::InteractionMode("default"),
+        ));
+    }
+    if at_start {
+        candidates.extend(
+            provider
+                .iter()
+                .filter(|command| command.name != "compact" || otherwise_empty)
+                .map(|command| {
+                    let description = command
+                        .description
+                        .clone()
+                        .or_else(|| command.input.as_ref().map(|input| input.hint.clone()))
+                        .unwrap_or_else(|| "Run provider command".into());
+                    let mut suggestion = command_suggestion(
+                        &command.name,
+                        &description,
+                        Pick::Text(format!("/{} ", command.name)),
+                    );
+                    suggestion.badge = Some("Provider".into());
+                    suggestion
+                }),
+        );
+    }
+    let mut ranked: Vec<(usize, usize, Suggestion)> = candidates
+        .into_iter()
+        .enumerate()
+        .filter_map(|(order, suggestion)| {
+            let name = suggestion.title.trim_start_matches('/').to_lowercase();
+            let detail = suggestion.detail.as_deref().unwrap_or_default().to_lowercase();
+            let rank = if query.is_empty() || name == query {
+                0
+            } else if name.starts_with(&query) {
+                1
+            } else if name.contains(&query) {
+                2
+            } else if detail.contains(&query) {
+                3
+            } else {
+                return None;
+            };
+            Some((rank, order, suggestion))
+        })
+        .collect();
+    ranked.sort_by_key(|(rank, order, _)| (*rank, *order));
+    ranked.into_iter().take(COMMAND_RESULT_LIMIT).map(|(_, _, suggestion)| suggestion).collect()
+}
+
+fn command_suggestion(name: &str, description: &str, pick: Pick) -> Suggestion {
+    Suggestion {
+        pick,
+        title: format!("/{name}").into(),
+        detail: Some(description.to_owned().into()),
+        badge: None,
+        kind: SuggestionKind::Command,
+    }
+}
+
 /// Skills matching `query`, best first: name prefix, label prefix, then any
 /// match in the name, label or description.
 pub fn search_skills(skills: &[&ProviderSkill], query: &str) -> Vec<Suggestion> {
@@ -187,7 +289,7 @@ pub fn search_skills(skills: &[&ProviderSkill], query: &str) -> Vec<Suggestion> 
             Some((
                 rank,
                 Suggestion {
-                    token: skill_token(&skill.name, &label),
+                    pick: Pick::Token(skill_token(&skill.name, &label)),
                     title: label.into(),
                     detail: skill.summary().map(|text| text.to_owned().into()),
                     badge: Some(skill_scope_label(skill).into()),
@@ -207,7 +309,7 @@ pub fn file_suggestions(entries: &[WorkspaceEntry]) -> Vec<Suggestion> {
         .map(|entry| {
             let directory = entry.kind == "directory";
             Suggestion {
-                token: file_token(&entry.path),
+                pick: Pick::Token(file_token(&entry.path)),
                 title: basename(&entry.path).to_owned().into(),
                 detail: Some(parent(&entry.path).to_owned().into()).filter(|p: &SharedString| !p.is_empty()),
                 badge: None,
@@ -236,11 +338,26 @@ pub enum SuggestionKind {
     File(Option<SharedString>),
     Directory,
     Skill,
+    Command,
+}
+
+/// What choosing a suggestion does to the typed `@query`, `$query` or
+/// `/query`.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Pick {
+    /// Replace it with a chip.
+    Token(InlineToken),
+    /// Replace it with plain text, such as `/compact `.
+    Text(String),
+    /// Remove it and open the model picker.
+    OpenModelPicker,
+    /// Remove it and switch the interaction mode ("plan" or "default").
+    InteractionMode(&'static str),
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Suggestion {
-    pub token: InlineToken,
+    pub pick: Pick,
     pub title: SharedString,
     pub detail: Option<SharedString>,
     pub badge: Option<SharedString>,
@@ -278,6 +395,9 @@ fn kind_mark(kind: &SuggestionKind, cx: &App) -> AnyElement {
             icon(IconName::FolderClosed).xsmall().text_color(theme.muted_foreground).into_any_element()
         }
         SuggestionKind::Skill => icon(IconName::Box).xsmall().text_color(theme.muted_foreground).into_any_element(),
+        SuggestionKind::Command => {
+            icon(IconName::SquareTerminal).xsmall().text_color(theme.muted_foreground).into_any_element()
+        }
         SuggestionKind::File(Some(ext)) if is_image(ext) => {
             icon(IconName::Image).xsmall().text_color(theme.muted_foreground).into_any_element()
         }
@@ -318,6 +438,9 @@ pub fn render_menu(
         (None, None, MentionKind::File) if menu.items.is_empty() => Some("No matching files".into()),
         (None, None, MentionKind::Skill) if menu.items.is_empty() => {
             Some("No skills for this provider".into())
+        }
+        (None, None, MentionKind::Command) if menu.items.is_empty() => {
+            Some("No matching commands".into())
         }
         _ => None,
     };
@@ -415,6 +538,32 @@ mod tests {
         assert!(detect_trigger("mail a@b.com", 12).is_none());
         assert!(detect_trigger("costs $20", 9).is_none());
         assert!(detect_trigger("@src done", 9).is_none(), "the cursor left the word");
+        let command = detect_trigger("/comp", 5).unwrap();
+        assert_eq!((command.kind, command.query.as_str()), (MentionKind::Command, "comp"));
+        assert!(detect_trigger("see /usr/bin", 12).is_none(), "paths are not commands");
+    }
+
+    #[test]
+    fn commands_offer_builtins_anywhere_and_provider_commands_only_first() {
+        let provider: Vec<ProviderSlashCommand> = serde_json::from_value(serde_json::json!([
+            {"name":"compact","description":"Compact the conversation"},
+            {"name":"review","input":{"hint":"Optional focus"}},
+        ]))
+        .unwrap();
+        let refs: Vec<&ProviderSlashCommand> = provider.iter().collect();
+        let builtins = BuiltinCommands { interaction_modes: true };
+        let titles = |items: Vec<Suggestion>| items.into_iter().map(|s| s.title.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            titles(search_commands(builtins, &refs, "", true, true)),
+            ["/model", "/plan", "/default", "/compact", "/review"]
+        );
+        assert_eq!(titles(search_commands(builtins, &refs, "", true, false)), ["/model", "/plan", "/default", "/review"]);
+        assert_eq!(titles(search_commands(builtins, &refs, "", false, true)), ["/model", "/plan", "/default"]);
+        let review = search_commands(builtins, &refs, "rev", true, true);
+        assert_eq!(review[0].pick, Pick::Text("/review ".into()));
+        assert_eq!(review[0].detail.as_deref(), Some("Optional focus"));
+        let plain = BuiltinCommands { interaction_modes: false };
+        assert_eq!(titles(search_commands(plain, &[], "", true, true)), ["/model"]);
     }
 
     #[test]

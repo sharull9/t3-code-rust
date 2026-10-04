@@ -5,13 +5,25 @@
 //! completion only when its request id still matches the row.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
+use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
-use gpui_kit::component::{ActiveTheme as _, Disableable as _, Sizable as _, h_flex, v_flex};
+use gpui_kit::component::tooltip::Tooltip;
+use gpui_kit::component::{
+    ActiveTheme as _, Disableable as _, Sizable as _, Size, StyledExt as _, h_flex,
+};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
-use t3_client::attachments::{LocalAttachment, UploadedAttachment, validate_selection};
+use t3_client::attachments::{
+    AttachmentKind, LocalAttachment, UploadedAttachment, validate_selection,
+};
+
+use crate::ui::{self, icon};
+
+/// Side of an image attachment's thumbnail in the tray.
+const THUMBNAIL: Pixels = px(64.);
 
 #[derive(Debug, Clone)]
 pub enum AttachmentPanelEvent {
@@ -32,6 +44,9 @@ pub struct AttachmentRow {
     pub attachment: LocalAttachment,
     pub request_id: u64,
     pub status: AttachmentStatus,
+    /// An image's bytes, read when it was added: a paste's file is deleted
+    /// once uploaded, but its thumbnail stays.
+    pub preview: Option<Arc<Image>>,
 }
 
 pub struct AttachmentPanel {
@@ -152,6 +167,7 @@ impl AttachmentPanel {
         for attachment in accepted {
             let request_id = self.allocate_request_id();
             self.rows.push(AttachmentRow {
+                preview: load_preview(&attachment),
                 attachment: attachment.clone(),
                 request_id,
                 status: AttachmentStatus::Uploading,
@@ -222,6 +238,22 @@ impl AttachmentPanel {
         self.next_request_id = self.next_request_id.wrapping_add(1).max(1);
         self.next_request_id
     }
+}
+
+/// The image to show for an attachment the server accepts as an image.
+fn load_preview(attachment: &LocalAttachment) -> Option<Arc<Image>> {
+    if attachment.kind != AttachmentKind::Image {
+        return None;
+    }
+    let format = match attachment.mime_type.to_ascii_lowercase().as_str() {
+        "image/png" => ImageFormat::Png,
+        "image/jpeg" | "image/jpg" => ImageFormat::Jpeg,
+        "image/webp" => ImageFormat::Webp,
+        "image/gif" => ImageFormat::Gif,
+        _ => return None,
+    };
+    let bytes = std::fs::read(&attachment.path).ok()?;
+    Some(Arc::new(Image::from_bytes(format, bytes)))
 }
 
 /// Pastes older than this are removed at startup. Attachment trays live only
@@ -303,74 +335,146 @@ fn discard_pasted(path: &Path) {
 
 impl Render for AttachmentPanel {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let rows: Vec<_> = self
+        let items: Vec<_> = self
             .rows
             .iter()
-            .map(|row| render_row(row, self.connected, cx).into_any_element())
+            .map(|row| match &row.preview {
+                Some(preview) => render_thumbnail(row, preview.clone(), self.connected, cx),
+                None => render_chip(row, self.connected, cx),
+            })
             .collect();
-        v_flex().gap_1().children(rows)
+        h_flex().flex_wrap().items_end().gap_2().children(items)
     }
 }
 
-fn render_row(
+/// "name · 25 KiB · Ready", for a thumbnail's tooltip.
+fn summary(row: &AttachmentRow) -> String {
+    let status = match &row.status {
+        AttachmentStatus::Uploading => "Uploading…".to_owned(),
+        AttachmentStatus::Uploaded(_) => "Ready".to_owned(),
+        AttachmentStatus::Failed(error) => format!("Upload failed · {error}"),
+    };
+    format!("{} · {} · {status}", row.attachment.name, format_size(row.attachment.size_bytes))
+}
+
+fn remove_button(local_id: &str, cx: &mut Context<AttachmentPanel>) -> Button {
+    let id = local_id.to_owned();
+    Button::new(SharedString::from(format!("composer-attachment-remove-{local_id}")))
+        .ghost()
+        .xsmall()
+        .icon(icon(IconName::X))
+        .tooltip("Remove")
+        .on_click(cx.listener(move |this, _, _, cx| this.remove(&id, cx)))
+}
+
+fn retry_button(local_id: &str, connected: bool, cx: &mut Context<AttachmentPanel>) -> Button {
+    let id = local_id.to_owned();
+    Button::new(SharedString::from(format!("composer-attachment-retry-{local_id}")))
+        .ghost()
+        .xsmall()
+        .icon(icon(IconName::RotateCcw))
+        .tooltip("Retry upload")
+        .disabled(!connected)
+        .on_click(cx.listener(move |this, _, _, cx| this.retry(&id, cx)))
+}
+
+/// An image: its thumbnail, a remove button in the corner, and a spinner
+/// or retry button over it while uploading or after a failure.
+fn render_thumbnail(
     row: &AttachmentRow,
+    preview: Arc<Image>,
     connected: bool,
     cx: &mut Context<AttachmentPanel>,
-) -> impl IntoElement {
+) -> AnyElement {
+    let local_id = row.attachment.id.as_str();
+    let failed = matches!(row.status, AttachmentStatus::Failed(_));
+    let uploading = matches!(row.status, AttachmentStatus::Uploading);
+    let retry = failed.then(|| retry_button(local_id, connected, cx));
+    let remove = remove_button(local_id, cx);
     let theme = cx.theme();
-    let local_id = row.attachment.id.clone();
-    let remove_id = local_id.clone();
-    let retry_id = local_id;
-    let (status, status_color, retryable) = match &row.status {
-        AttachmentStatus::Uploading => ("Uploading…".to_owned(), theme.muted_foreground, false),
-        AttachmentStatus::Uploaded(_) => ("Ready".to_owned(), theme.primary, false),
-        AttachmentStatus::Failed(error) => (format!("Upload failed · {error}"), theme.danger, true),
-    };
-
-    h_flex()
-        .id(SharedString::from(format!("composer-attachment-{remove_id}")))
-        .items_center()
-        .gap_2()
-        .px_2()
-        .py_1()
-        .rounded_md()
+    let tooltip: SharedString = summary(row).into();
+    let scrim = gpui_kit::black().opacity(0.45);
+    div()
+        .id(SharedString::from(format!("composer-attachment-{local_id}")))
+        .relative()
+        .flex_none()
+        .size(THUMBNAIL)
+        .rounded_lg()
+        .overflow_hidden()
         .border_1()
-        .border_color(theme.border)
-        .bg(theme.secondary)
-        .child(
-            v_flex()
-                .flex_1()
-                .min_w_0()
-                .child(div().text_sm().truncate().child(row.attachment.name.clone()))
-                .child(div().text_xs().text_color(theme.muted_foreground).child(format!(
-                    "{} · {}",
-                    format_size(row.attachment.size_bytes),
-                    status
-                )))
-                .text_color(theme.foreground),
-        )
-        .when(retryable, |row_element| {
-            row_element.child(
-                Button::new(SharedString::from(format!("composer-attachment-retry-{retry_id}")))
-                    .ghost()
-                    .small()
-                    .label("Retry")
-                    .disabled(!connected)
-                    .on_click(cx.listener(move |this, _, _, cx| this.retry(&retry_id, cx))),
+        .border_color(if failed { theme.danger } else { theme.border })
+        .bg(theme.muted)
+        .tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx))
+        .child(img(preview).size_full().object_fit(ObjectFit::Cover))
+        .when(uploading, |tile| {
+            tile.child(
+                div()
+                    .absolute()
+                    .inset_0()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .bg(scrim)
+                    .text_color(gpui_kit::white())
+                    .child(ui::loader(SharedString::from(format!("attachment-upload-{local_id}")), Size::Small)),
             )
         })
-        .child(div().text_xs().text_color(status_color).child(match &row.status {
-            AttachmentStatus::Uploaded(_) => "✓",
-            AttachmentStatus::Failed(_) => "!",
-            AttachmentStatus::Uploading => "·",
-        }))
+        .when_some(retry, |tile, retry| {
+            tile.child(
+                div()
+                    .absolute()
+                    .inset_0()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .bg(scrim)
+                    .child(retry),
+            )
+        })
         .child(
-            Button::new(SharedString::from(format!("composer-attachment-remove-{remove_id}")))
-                .ghost()
-                .small()
-                .label("Remove")
-                .on_click(cx.listener(move |this, _, _, cx| this.remove(&remove_id, cx))),
+            div()
+                .absolute()
+                .top_1()
+                .right_1()
+                .rounded_md()
+                .bg(theme.background.opacity(0.85))
+                .child(remove),
         )
+        .into_any_element()
+}
+
+/// Any other file: a chip with its name, size and status.
+fn render_chip(row: &AttachmentRow, connected: bool, cx: &mut Context<AttachmentPanel>) -> AnyElement {
+    let local_id = row.attachment.id.as_str();
+    let failed = matches!(row.status, AttachmentStatus::Failed(_));
+    let retry = failed.then(|| retry_button(local_id, connected, cx));
+    let remove = remove_button(local_id, cx);
+    let theme = cx.theme();
+    let (status, status_color) = match &row.status {
+        AttachmentStatus::Uploading => ("Uploading…".to_owned(), theme.muted_foreground),
+        AttachmentStatus::Uploaded(_) => (format_size(row.attachment.size_bytes), theme.muted_foreground),
+        AttachmentStatus::Failed(error) => (format!("Failed · {error}"), theme.danger),
+    };
+    let tooltip: SharedString = summary(row).into();
+    h_flex()
+        .id(SharedString::from(format!("composer-attachment-{local_id}")))
+        .max_w(px(280.))
+        .gap_1p5()
+        .pl_2()
+        .pr_0p5()
+        .py_0p5()
+        .rounded_md()
+        .border_1()
+        .border_color(if failed { theme.danger } else { theme.border })
+        .bg(theme.background)
+        .text_xs()
+        .tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx))
+        .child(icon(IconName::File).xsmall().text_color(theme.muted_foreground))
+        .child(div().min_w_0().truncate().font_medium().child(row.attachment.name.clone()))
+        .child(div().flex_shrink_0().text_color(status_color).child(status))
+        .children(retry)
+        .child(remove)
+        .into_any_element()
 }
 
 fn format_size(size_bytes: u64) -> String {

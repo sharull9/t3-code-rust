@@ -22,7 +22,7 @@ use t3_client::{Session, ThreadShell, ThreadStreamItem};
 
 use crate::attachments::{AttachmentPanel, AttachmentPanelEvent};
 use crate::drafts::DraftThread;
-use crate::mentions::{self, MentionKind, MentionMenu};
+use crate::mentions::{self, MentionKind, MentionMenu, Pick};
 use crate::model_picker::{ModelPicker, ModelPickerEvent};
 use crate::transcript::{Transcript, TranscriptEvent};
 use crate::ui;
@@ -43,6 +43,8 @@ pub enum ThreadViewEvent {
     /// Search the thread's workspace for `@` mention candidates; the app
     /// answers with [`ThreadView::apply_file_results`].
     SearchFiles { request_id: u64, query: String },
+    /// The composer's limit meters were clicked: show every limit.
+    OpenUsageLimits,
 }
 
 pub struct ThreadView {
@@ -539,6 +541,23 @@ impl ThreadView {
                     .unwrap_or_default();
                 menu.items = mentions::search_skills(&skills, &trigger.query);
             }
+            MentionKind::Command => {
+                let text = self.composer.read(cx).value();
+                let otherwise_empty = text[..trigger.range.start].trim().is_empty()
+                    && text[trigger.range.end..].trim().is_empty()
+                    && self.attachments.read(cx).is_empty();
+                let commands = self
+                    .selected_provider()
+                    .map(|provider| provider.slash_commands(self.cwd.as_deref()))
+                    .unwrap_or_default();
+                menu.items = mentions::search_commands(
+                    mentions::BuiltinCommands { interaction_modes: true },
+                    &commands,
+                    &trigger.query,
+                    text[..trigger.range.start].trim().is_empty(),
+                    otherwise_empty,
+                );
+            }
             MentionKind::File => {
                 self.next_file_search += 1;
                 menu.pending_request = Some(self.next_file_search);
@@ -588,7 +607,8 @@ impl ThreadView {
         self.mention.as_ref().is_some_and(|menu| !menu.items.is_empty())
     }
 
-    /// Replaces the typed `@query`/`$query` with the chosen chip and a space.
+    /// Replaces the typed `@query`/`$query` with the chosen chip and a
+    /// space, or carries out the chosen `/` command.
     fn choose_mention(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
         let Some(menu) = self.mention.take() else { return };
         let Some(item) = menu.items.get(ix).cloned() else {
@@ -596,12 +616,41 @@ impl ThreadView {
             return;
         };
         let range = menu.trigger.range.clone();
+        let replacement = match &item.pick {
+            Pick::Token(_) => None,
+            Pick::Text(text) => Some(text.clone()),
+            Pick::OpenModelPicker | Pick::InteractionMode(_) => Some(String::new()),
+        };
         self.composer.update(cx, |state, cx| {
-            if state.replace_range_with_token(range, item.token, window, cx).is_ok() {
-                state.insert(" ", window, cx);
+            match (&item.pick, replacement) {
+                (Pick::Token(token), _) => {
+                    if state.replace_range_with_token(range, token.clone(), window, cx).is_ok() {
+                        state.insert(" ", window, cx);
+                    }
+                }
+                (_, Some(text)) => {
+                    state.set_selected_range(range, cx);
+                    state.replace(text, window, cx);
+                }
+                _ => {}
             }
             state.focus(window, cx);
         });
+        // Settings can't change mid-turn or while another change is in flight.
+        let settings_locked = !self.connected
+            || !self.thread_loaded
+            || self.sending
+            || self.pending_update.is_some()
+            || self.is_working(cx);
+        match item.pick {
+            Pick::OpenModelPicker if !settings_locked => {
+                self.model_picker.update(cx, |picker, cx| picker.open(window, cx));
+            }
+            Pick::InteractionMode(mode) if !settings_locked => {
+                self.update_setting(t3_client::ThreadAction::InteractionMode(mode.into()), cx);
+            }
+            _ => {}
+        }
         cx.notify();
     }
 
@@ -989,6 +1038,7 @@ impl Render for ThreadView {
                 )
             })
             .child(div().flex_1())
+            .children(self.render_limits(cx))
             .children(branch.map(|branch| {
                 h_flex().gap_1().child(Icon::new(IconName::GitBranch).xsmall()).child(branch)
             }));
@@ -1068,6 +1118,73 @@ impl Render for ThreadView {
 }
 
 /// The empty state of a draft thread, in place of the transcript.
+impl ThreadView {
+    /// The selected model's account limits, one small meter per window, so
+    /// they're in view while writing. Hover for resets; click for the Limits
+    /// tab.
+    fn render_limits(&self, cx: &Context<Self>) -> Option<AnyElement> {
+        let provider = self.selected_provider()?;
+        let limits = provider.usage_limits.as_ref().filter(|limits| limits.unavailable.is_none())?;
+        if limits.windows.is_empty() {
+            return None;
+        }
+        let theme = cx.theme();
+        let color = if matches!(provider.driver.as_str(), "claude" | "claudeAgent") {
+            ui::hex(0xd97757)
+        } else {
+            theme.foreground
+        };
+        let fill = theme.muted.blend(color.opacity(0.6));
+        let now = chrono::Utc::now();
+        let mut details: Vec<String> = limits
+            .windows
+            .iter()
+            .map(|window| {
+                let reset = match window.reset() {
+                    Some(at) if at > now => {
+                        format!(" · resets in {}", crate::limits_view::duration((at - now).num_seconds()))
+                    }
+                    _ => String::new(),
+                };
+                format!("{}: {:.0}% left{reset}", window.label, window.remaining())
+            })
+            .collect();
+        details.insert(0, crate::model_picker::provider_name(provider));
+        details.push("Click to see every limit".into());
+        let tooltip: SharedString = details.join("\n").into();
+        Some(
+            h_flex()
+                .id("composer-limits")
+                .test_support()
+                .gap_3()
+                .mr_3()
+                .cursor_pointer()
+                .hover(|style| style.text_color(theme.foreground))
+                .tooltip(move |window, cx| {
+                    gpui_kit::component::tooltip::Tooltip::new(tooltip.clone()).build(window, cx)
+                })
+                .on_click(cx.listener(|_, _, _, cx| cx.emit(ThreadViewEvent::OpenUsageLimits)))
+                .children(limits.windows.iter().map(|window| {
+                    let remaining = window.remaining();
+                    h_flex()
+                        .gap_1()
+                        .child(window.label.clone())
+                        .child(
+                            div()
+                                .w(px(36.))
+                                .h(px(4.))
+                                .rounded_full()
+                                .overflow_hidden()
+                                .bg(theme.muted)
+                                .child(div().h_full().w(relative(remaining as f32 / 100.)).bg(fill)),
+                        )
+                        .child(format!("{remaining:.0}%"))
+                }))
+                .into_any_element(),
+        )
+    }
+}
+
 fn draft_hero(project: &SharedString, cx: &App) -> Div {
     let theme = cx.theme();
     v_flex()
@@ -1417,6 +1534,75 @@ mod composer_tests {
         assert!(events.borrow().iter().any(|e| e == "send:use $repo-explorer @src/api/index.ts"));
         assert!(events.borrow().iter().any(|e| e == "search:1:"), "`@` alone browses recent files");
         assert!(events.borrow().iter().any(|e| e == "search:2:ind"));
+    }
+
+    #[gpui_kit::test]
+    fn slash_commands_type_provider_commands_and_switch_modes(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let draft = DraftThread {
+            id: "draft-1".into(),
+            project_id: "project-1".into(),
+            model_selection: json!({ "instanceId": "claude-a", "model": "opus" }),
+            runtime_mode: "full-access".into(),
+            interaction_mode: "default".into(),
+            new_worktree: false,
+        };
+        let (handle, view) = cx.update(|cx| {
+            gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+                let panel = cx.new(UserInputPanel::new);
+                let attachments = cx.new(AttachmentPanel::new);
+                cx.new(|cx| {
+                    ThreadView::new_draft(draft, "Demo".into(), panel, attachments, window, cx)
+                })
+            })
+            .unwrap()
+        });
+        let providers: Vec<t3_client::ServerProvider> = serde_json::from_value(json!([
+            {"instanceId":"claude-a","driver":"claudeAgent","enabled":true,"installed":true,
+             "models":[{"slug":"opus","name":"Opus"}],
+             "slashCommands":[{"name":"compact","description":"Compact the conversation"},
+                              {"name":"review","description":"Review the changes"}],
+             "usageLimits":{"checkedAt":"2026-10-04T00:00:00Z","windows":[
+                {"id":"session","kind":"session","label":"Session","usedPercent":15}]}}
+        ]))
+        .unwrap();
+        view.update(cx, |view, cx| view.set_providers(providers, cx));
+
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            assert!(window.find("composer-limits").visible(), "limits show under the composer");
+            let composer_id = view.read(cx).composer.entity_id();
+            window.click(("input", composer_id), cx);
+            window.input("/rev", cx);
+        })
+        .unwrap();
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            assert!(window.find(("mention-row", 0usize)).visible());
+            window.press("enter", cx);
+        })
+        .unwrap();
+        cx.update_window(handle, |_, window, cx| {
+            assert_eq!(view.read(cx).draft(cx), "/review ");
+            assert!(view.read(cx).composer.read(cx).tokens().is_empty(), "typed, not chipped");
+            window.input("then /pla", cx);
+        })
+        .unwrap();
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            // Mid-message only the composer's own commands are offered.
+            let menu = view.read(cx).mention.as_ref().unwrap();
+            assert_eq!(menu.items.len(), 1);
+            assert_eq!(menu.items[0].title.as_ref(), "/plan");
+            window.press("enter", cx);
+        })
+        .unwrap();
+        cx.update_window(handle, |_, _, cx| {
+            assert_eq!(view.read(cx).draft(cx), "/review then ");
+            let (draft, _) = view.read(cx).draft.as_ref().unwrap();
+            assert_eq!(draft.interaction_mode, "plan");
+        })
+        .unwrap();
     }
 
     #[gpui_kit::test]

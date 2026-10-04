@@ -1160,6 +1160,12 @@ impl T3App {
             | ThreadViewEvent::QuestionDraftsChanged(_)
             | ThreadViewEvent::Attachment(_)
             | ThreadViewEvent::SearchFiles { .. } => {}
+            ThreadViewEvent::OpenUsageLimits => {
+                self.set_settings_open(false, window, cx);
+                self.usage.update(cx, |usage, cx| usage.show_limits(cx));
+                self.set_usage_open(true, cx);
+                self.focus_handle.focus(window, cx);
+            }
             ThreadViewEvent::Stop => {
                 let run_id = thread
                     .active_run_id

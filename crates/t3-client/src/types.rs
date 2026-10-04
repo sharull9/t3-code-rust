@@ -242,6 +242,9 @@ pub struct ServerProvider {
     pub usage_limits: Option<crate::quotas::UsageLimits>,
     #[serde(default)]
     pub skills: Vec<ProviderSkill>,
+    /// Commands the provider runs itself (`/compact`, …), for the `/` menu.
+    #[serde(default)]
+    pub slash_commands: Vec<ProviderSlashCommand>,
     /// Skills discovered per workspace, in addition to the global `skills`.
     #[serde(default)]
     pub workspace_snapshots: Vec<ProviderWorkspaceSnapshot>,
@@ -260,6 +263,22 @@ impl ServerProvider {
 
     /// Skills a user can start from the composer in `cwd`: workspace skills
     /// first, then global ones, deduplicated by name.
+    /// The provider's slash commands for `cwd`: the workspace's own first,
+    /// then the global ones, without repeats.
+    pub fn slash_commands(&self, cwd: Option<&str>) -> Vec<&ProviderSlashCommand> {
+        let workspace = self
+            .workspace_snapshots
+            .iter()
+            .filter(|snapshot| cwd.is_some_and(|cwd| same_path(&snapshot.cwd, cwd)))
+            .flat_map(|snapshot| &snapshot.slash_commands);
+        let mut seen = std::collections::HashSet::new();
+        workspace
+            .chain(&self.slash_commands)
+            .filter(|command| !command.name.trim().is_empty())
+            .filter(|command| seen.insert(command.name.trim().to_lowercase()))
+            .collect()
+    }
+
     pub fn invocable_skills(&self, cwd: Option<&str>) -> Vec<&ProviderSkill> {
         let workspace = self
             .workspace_snapshots
@@ -337,6 +356,23 @@ pub struct ProviderWorkspaceSnapshot {
     pub cwd: String,
     #[serde(default)]
     pub skills: Vec<ProviderSkill>,
+    #[serde(default)]
+    pub slash_commands: Vec<ProviderSlashCommand>,
+}
+
+/// Port of `ServerProviderSlashCommand`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct ProviderSlashCommand {
+    pub name: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub input: Option<ProviderSlashCommandInput>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct ProviderSlashCommandInput {
+    pub hint: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]

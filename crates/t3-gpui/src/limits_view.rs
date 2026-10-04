@@ -414,7 +414,7 @@ impl BarDetails {
     }
 }
 
-fn duration(seconds: i64) -> String {
+pub(crate) fn duration(seconds: i64) -> String {
     if seconds <= 0 {
         return "Reset due".into();
     }
