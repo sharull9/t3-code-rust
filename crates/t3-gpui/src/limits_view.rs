@@ -4,24 +4,44 @@ use chrono::Utc;
 use gpui_kit::component::Sizable as _;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::hover_card::HoverCard;
-use gpui_kit::component::{ActiveTheme as _, StyledExt as _, h_flex, v_flex};
+use gpui_kit::component::{
+    ActiveTheme as _, Disableable as _, StyledExt as _, WindowExt as _, h_flex, v_flex,
+};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use t3_client::quotas::{LimitAccount, LimitPool, LimitsReport, QuotaWindow};
 
-pub fn render(report: &LimitsReport, connected: bool, wide: bool, cx: &App) -> AnyElement {
+/// What the hover cards' "Use reset" needs from the usage page.
+pub struct ResetUi {
+    pub view: WeakEntity<crate::usage::UsageView>,
+    pub connected: bool,
+    /// The account whose reset is being spent; its button shows progress.
+    pub pending: Option<String>,
+    /// The last reset's outcome, and whether it failed.
+    pub message: Option<(String, bool)>,
+}
+
+pub fn render(
+    report: &LimitsReport,
+    connected: bool,
+    wide: bool,
+    reset: &ResetUi,
+    cx: &App,
+) -> AnyElement {
     let theme = cx.theme();
     v_flex().id("usage-limits-content").test_support().w_full().gap_6()
         .when(!connected, |view| view.child(div().text_sm().text_color(theme.muted_foreground)
             .child("Offline · Showing the last reported limits. Reconnect to refresh.")))
         .children(report.notices.iter().map(|notice| div().text_sm().text_color(theme.warning).child(notice.clone())))
+        .when_some(reset.message.clone(), |view, (message, failed)| view.child(div().id("limits-reset-message").text_sm()
+            .text_color(if failed { theme.warning } else { theme.success }).child(message)))
         .children(report.pools().into_iter().enumerate().map(|(index, pool)| {
             let color = if matches!(pool.driver.as_str(), "claude" | "claudeAgent") { ui::hex(0xd97757) } else { theme.foreground };
             v_flex().id(("limits-provider", index)).gap_3()
                 .child(h_flex().gap_2().items_center()
                     .child(provider_logo::logo(&pool.driver, px(18.), color))
                     .child(div().text_sm().font_semibold().child(ui::provider_label(Some(&pool.driver)))))
-                .children(pool.windows.iter().enumerate().map(|(row, window)| render_window(&pool, window, index, row, wide, cx)))
+                .children(pool.windows.iter().enumerate().map(|(row, window)| render_window(&pool, window, index, row, wide, reset, cx)))
                 .into_any_element()
         }))
         .when(report.accounts.is_empty(), |view| view.child(v_flex().py_8().gap_2()
@@ -47,6 +67,7 @@ fn render_window(
     provider: usize,
     row: usize,
     wide: bool,
+    reset: &ResetUi,
     cx: &App,
 ) -> AnyElement {
     let theme = cx.theme();
@@ -124,7 +145,7 @@ fn render_window(
                 .min_h(px(30.))
                 .when_some(value, |view, value| {
                     let id = format!("quota-hover-{provider}-{row}-{index}");
-                    view.child(account_bar(id, &pool.driver, account, value, count, color, cx))
+                    view.child(account_bar(id, &pool.driver, account, value, count, color, reset, cx))
                 })
         }));
     div()
@@ -154,6 +175,7 @@ fn account_bar(
     window: &QuotaWindow,
     pool_size: usize,
     color: Hsla,
+    reset: &ResetUi,
     cx: &App,
 ) -> AnyElement {
     let theme = cx.theme();
@@ -201,7 +223,7 @@ fn account_bar(
                         .child(format!("{remaining:.0}%")),
                 ),
         );
-    let details = BarDetails::new(driver, account, window, pool_size, color);
+    let details = BarDetails::new(driver, account, window, pool_size, color, reset);
     HoverCard::new(SharedString::from(id))
         .anchor(Anchor::TopLeft)
         .open_delay(std::time::Duration::from_millis(150))
@@ -224,6 +246,11 @@ struct BarDetails {
     restores: f64,
     credits: Option<(u64, Option<String>)>,
     checked_at: String,
+    key: String,
+    reset_target: Option<serde_json::Value>,
+    view: WeakEntity<crate::usage::UsageView>,
+    connected: bool,
+    redeeming: bool,
 }
 
 impl BarDetails {
@@ -233,6 +260,7 @@ impl BarDetails {
         window: &QuotaWindow,
         pool_size: usize,
         color: Hsla,
+        reset: &ResetUi,
     ) -> Self {
         Self {
             driver: driver.to_owned(),
@@ -251,7 +279,50 @@ impl BarDetails {
                 .filter(|credits| credits.available_count > 0)
                 .map(|credits| (credits.available_count, credits.next_expires_at.clone())),
             checked_at: account.limits.checked_at.clone(),
+            key: account.key.clone(),
+            reset_target: account.reset_target.clone(),
+            view: reset.view.clone(),
+            connected: reset.connected,
+            redeeming: reset.pending.as_deref() == Some(account.key.as_str()),
         }
+    }
+
+    /// "Use reset": confirms, then asks the usage page to spend one credit.
+    fn reset_button(&self, count: u64) -> Option<impl IntoElement + use<>> {
+        let input = self.reset_target.clone()?;
+        let (view, key, name) = (self.view.clone(), self.key.clone(), self.name.clone());
+        Some(
+            Button::new(SharedString::from(format!("limits-use-reset-{}", self.key)))
+                .outline()
+                .xsmall()
+                .label(if self.redeeming { "Resetting…" } else { "Use reset" })
+                .loading(self.redeeming)
+                .disabled(!self.connected || self.redeeming)
+                .on_click(move |_, window, cx| {
+                    let (view, key, name, input) =
+                        (view.clone(), key.clone(), name.clone(), input.clone());
+                    window.open_alert_dialog(cx, move |alert, _, _| {
+                        let (view, key, name, input) =
+                            (view.clone(), key.clone(), name.clone(), input.clone());
+                        alert
+                            .title("Use a banked reset?")
+                            .description(format!(
+                                "This resets {name}'s usage limits now and spends one of its \
+                                 {count} banked reset{}.",
+                                if count == 1 { "" } else { "s" }
+                            ))
+                            .ok_text("Use reset")
+                            .show_cancel(true)
+                            .on_ok(move |_, _, cx| {
+                                let (key, name, input) = (key.clone(), name.clone(), input.clone());
+                                let _ = view.update(cx, |usage, cx| {
+                                    usage.consume_reset(key, name, input, cx)
+                                });
+                                true
+                            })
+                    });
+                }),
+        )
     }
 
     fn render(&self, cx: &App) -> AnyElement {
@@ -276,6 +347,7 @@ impl BarDetails {
         let checked = chrono::DateTime::parse_from_rfc3339(&self.checked_at)
             .map(|at| at.with_timezone(&chrono::Local).format("%H:%M").to_string())
             .unwrap_or_else(|_| "—".into());
+        let reset_button = self.credits.as_ref().and_then(|(count, _)| self.reset_button(*count));
         let credits = self.credits.as_ref().map(|(count, expires)| {
             let expires = expires
                 .as_deref()
@@ -328,8 +400,15 @@ impl BarDetails {
                     .border_color(theme.border)
                     .text_xs()
                     .text_color(theme.muted_foreground)
-                    .child(div().flex_1().min_w_0().truncate().child(credits.unwrap_or_else(|| "No banked resets".into())))
-                    .child(format!("Checked {checked}")),
+                    .items_center()
+                    .child(
+                        v_flex()
+                            .flex_1()
+                            .min_w_0()
+                            .child(div().truncate().child(credits.unwrap_or_else(|| "No banked resets".into())))
+                            .child(format!("Checked {checked}")),
+                    )
+                    .children(reset_button),
             )
             .into_any_element()
     }

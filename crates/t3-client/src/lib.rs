@@ -209,6 +209,21 @@ impl Connection {
         self.rpc.call("projects.mutate", mutation).await
     }
 
+    /// `provider.consumeResetCredit`: spends one banked limit reset. `input`
+    /// is a [`quotas::LimitAccount::reset_target`]. Returns the outcome
+    /// ("reset", "nothingToReset", "noCredit" or "alreadyRedeemed") and any
+    /// warning about a follow-up step that failed after the reset.
+    pub async fn consume_reset_credit(
+        &self,
+        input: Value,
+    ) -> Result<(String, Option<String>), RpcError> {
+        let value: Value = self.rpc.call("provider.consumeResetCredit", input).await?;
+        let outcome = value["outcome"]
+            .as_str()
+            .ok_or_else(|| RpcError::Decode(format!("unexpected reset result: {value}")))?;
+        Ok((outcome.to_owned(), value["warning"].as_str().map(str::to_owned)))
+    }
+
     /// `project.create` (see `project.ts`'s `ProjectMutation`).
     /// `project_id` is generated client-side, same as the web app's
     /// `newProjectId()`; the folder is expected to already exist (picked via

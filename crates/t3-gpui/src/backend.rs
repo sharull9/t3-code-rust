@@ -55,6 +55,8 @@ pub enum Command {
         window: t3_client::UsageWindow,
     },
     LoadLimits { request_id: u64 },
+    /// Spend a banked limit reset; answered with `Event::ResetCreditFinished`.
+    ConsumeResetCredit { key: String, input: Value },
     /// `server.getSettings`; answered with `Event::Settings`.
     LoadSettings,
     /// `server.updateSettings`; answered with `Event::SettingsSaved`.
@@ -169,6 +171,8 @@ pub enum Event {
         result: Result<Vec<t3_client::ResolvedKeybinding>, String>,
     },
     LimitsFinished { request_id: u64, result: Result<(), String> },
+    /// `(outcome, warning)` from `provider.consumeResetCredit`.
+    ResetCreditFinished { key: String, result: Result<(String, Option<String>), String> },
     Archived {
         request_id: String,
         snapshot: Option<t3_client::ShellSnapshot>,
@@ -537,6 +541,7 @@ async fn wait_offline(
                     events.emit(Event::Usage { request_id, result: Err("Reconnect to see usage.".into()) });
                 }
                 Some(Command::LoadLimits { request_id }) => events.emit(Event::LimitsFinished { request_id, result: Err("Reconnect to see limits.".into()) }),
+                Some(Command::ConsumeResetCredit { key, .. }) => events.emit(Event::ResetCreditFinished { key, result: Err("Reconnect to use a reset.".into()) }),
                 Some(Command::LoadSettings) => {}
                 Some(Command::UpdateSettings { request_id, .. }) => events.emit(Event::SettingsSaved { request_id, result: Err("Reconnect to change server settings.".into()) }),
                 Some(Command::UpdateKeybindings { request_id, .. }) => events.emit(Event::KeybindingsSaved { request_id, result: Err("Reconnect to change shared shortcuts.".into()) }),
@@ -627,6 +632,17 @@ async fn run_session(
                     operations.spawn(async move {
                         let result = refresh_providers(&connection).await.map(|providers| events.emit(Event::Providers(providers)));
                         events.emit(Event::LimitsFinished { request_id, result });
+                    });
+                }
+                Some(Command::ConsumeResetCredit { key, input }) => {
+                    let connection = connection.clone(); let events = events.clone();
+                    operations.spawn(async move {
+                        let result = connection.consume_reset_credit(input).await.map_err(|error| describe(&error));
+                        // The limits changed; show the new numbers.
+                        if let Ok(providers) = refresh_providers(&connection).await {
+                            events.emit(Event::Providers(providers));
+                        }
+                        events.emit(Event::ResetCreditFinished { key, result });
                     });
                 }
                 Some(Command::LoadSettings) => {

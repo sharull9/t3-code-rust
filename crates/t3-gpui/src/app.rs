@@ -250,6 +250,7 @@ impl T3App {
                 match event {
                     UsageEvent::Load { request_id, window } => this.backend.send(Command::LoadUsage { request_id: *request_id, window: window.clone() }),
                     UsageEvent::LoadLimits { request_id } => this.backend.send(Command::LoadLimits { request_id: *request_id }),
+                    UsageEvent::ConsumeResetCredit { key, input } => this.backend.send(Command::ConsumeResetCredit { key: key.clone(), input: input.clone() }),
                 }
             }),
             cx.subscribe(&workspace, |this, _, event: &WorkspaceEvent, _| {
@@ -650,6 +651,9 @@ impl T3App {
             }
             Event::LimitsFinished { request_id, result } => {
                 self.usage.update(cx, |usage, cx| usage.finish_limits(request_id, result, cx));
+            }
+            Event::ResetCreditFinished { key, result } => {
+                self.usage.update(cx, |usage, cx| usage.finish_reset(&key, result, cx));
             }
             Event::Archived { request_id, snapshot } => {
                 self.settings.update(cx, |page, cx| {

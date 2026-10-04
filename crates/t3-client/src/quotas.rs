@@ -46,6 +46,9 @@ impl QuotaWindow {
 pub struct ResetCredits {
     pub available_count: u64,
     pub next_expires_at: Option<String>,
+    /// Pins a limits-source redemption to the credit on display.
+    #[serde(default)]
+    pub next_credit_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -148,6 +151,10 @@ pub struct LimitAccount {
     pub plan: Option<String>,
     pub source: Option<String>,
     pub limits: UsageLimits,
+    /// `provider.consumeResetCredit`'s input for the banked resets in
+    /// `limits.reset_credits`: `{ instanceId }` for a provider instance,
+    /// `{ sourceId, accountId, creditId }` for a limits-source account.
+    pub reset_target: Option<Value>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -182,6 +189,7 @@ impl LimitsReport {
                 provider.auth.label.clone(),
                 None,
                 limits.clone(),
+                Some(serde_json::json!({ "instanceId": provider.instance_id })),
             );
         }
         for source in &config.usage_limit_sources {
@@ -207,6 +215,18 @@ impl LimitsReport {
                     account.plan.clone(),
                     Some(source.label.clone()),
                     account.usage_limits.clone(),
+                    account
+                        .usage_limits
+                        .reset_credits
+                        .as_ref()
+                        .and_then(|credits| credits.next_credit_id.as_ref())
+                        .map(|credit| {
+                            serde_json::json!({
+                                "sourceId": source.id,
+                                "accountId": account.id,
+                                "creditId": credit,
+                            })
+                        }),
                 );
             }
         }
@@ -222,6 +242,7 @@ impl LimitsReport {
         plan: Option<String>,
         source: Option<String>,
         limits: UsageLimits,
+        reset_target: Option<Value>,
     ) {
         if let Some(link) = &limits.external_usage
             && !self.external_links.iter().any(|seen| seen.url == link.url)
@@ -259,15 +280,19 @@ impl LimitsReport {
         if let Some(existing) = self.accounts.iter_mut().find(|account| account.key == key) {
             let next_at = DateTime::parse_from_rfc3339(&limits.checked_at).ok();
             let old_at = DateTime::parse_from_rfc3339(&existing.limits.checked_at).ok();
+            // Credits travel with whoever can redeem them.
             if next_at > old_at {
-                let credits = limits
-                    .reset_credits
-                    .clone()
-                    .or(existing.limits.reset_credits.clone());
+                let credits = if limits.reset_credits.is_some() {
+                    existing.reset_target = reset_target;
+                    limits.reset_credits.clone()
+                } else {
+                    existing.limits.reset_credits.clone()
+                };
                 existing.limits = limits;
                 existing.limits.reset_credits = credits;
-            } else if existing.limits.reset_credits.is_none() {
+            } else if existing.limits.reset_credits.is_none() && limits.reset_credits.is_some() {
                 existing.limits.reset_credits = limits.reset_credits;
+                existing.reset_target = reset_target;
             }
             if existing.source.is_some() && source.is_none() {
                 existing.name = name;
@@ -284,6 +309,7 @@ impl LimitsReport {
                 plan,
                 source,
                 limits,
+                reset_target,
             });
         }
     }
@@ -444,6 +470,26 @@ mod tests {
                   ] } }
             ] }]
         })).unwrap()
+    }
+
+    #[test]
+    fn banked_resets_name_the_instance_or_source_credit_that_redeems_them() {
+        let mut config = config();
+        let other = &mut config.usage_limit_sources[0].accounts[1];
+        other.usage_limits.reset_credits = Some(ResetCredits {
+            available_count: 2,
+            next_expires_at: None,
+            next_credit_id: Some("credit-7".into()),
+        });
+        let report = LimitsReport::from_config(&config);
+        let work = report.accounts.iter().find(|a| a.name == "Work").unwrap();
+        // The newer source snapshot has no credits, so the instance's stay.
+        assert_eq!(work.reset_target, Some(json!({ "instanceId": "codex-a" })));
+        let other = report.accounts.iter().find(|a| a.name == "OE").unwrap();
+        assert_eq!(
+            other.reset_target,
+            Some(json!({ "sourceId": "hub", "accountId": "b.json", "creditId": "credit-7" }))
+        );
     }
 
     #[test]

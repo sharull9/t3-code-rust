@@ -34,6 +34,11 @@ pub enum UsageEvent {
     LoadLimits {
         request_id: u64,
     },
+    /// Spend a banked reset; `input` is the account's `reset_target`.
+    ConsumeResetCredit {
+        key: String,
+        input: serde_json::Value,
+    },
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -57,6 +62,10 @@ pub struct UsageView {
     limits_pending: Option<u64>,
     limits_loaded_at: Option<Instant>,
     limits_error: Option<String>,
+    /// The account (`LimitAccount::key`, name) whose reset is being spent.
+    redeeming: Option<(String, String)>,
+    /// What the last reset did, and whether it failed.
+    reset_message: Option<(String, bool)>,
     connected: bool,
     days: u32,
     metric: Metric,
@@ -99,6 +108,8 @@ impl UsageView {
             quota_config: t3_client::ServerConfig::default(),
             limits: t3_client::quotas::LimitsReport::default(),
             limits_pending: None,
+            redeeming: None,
+            reset_message: None,
             limits_loaded_at: None,
             limits_error: None,
             connected: false,
@@ -153,12 +164,60 @@ impl UsageView {
         cx.notify();
     }
 
+    /// Asks the server to spend one of `key`'s banked resets; one at a time.
+    pub fn consume_reset(
+        &mut self,
+        key: String,
+        name: String,
+        input: serde_json::Value,
+        cx: &mut Context<Self>,
+    ) {
+        if self.redeeming.is_some() || !self.connected {
+            return;
+        }
+        self.redeeming = Some((key.clone(), name));
+        self.reset_message = None;
+        cx.emit(UsageEvent::ConsumeResetCredit { key, input });
+        cx.notify();
+    }
+
+    pub fn finish_reset(
+        &mut self,
+        key: &str,
+        result: Result<(String, Option<String>), String>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((pending, name)) = self.redeeming.take_if(|(pending, _)| pending == key) else {
+            return;
+        };
+        debug_assert_eq!(pending, key);
+        self.reset_message = Some(match result {
+            Ok((outcome, warning)) => {
+                let message = match outcome.as_str() {
+                    "reset" => format!("Used a banked reset for {name}."),
+                    "nothingToReset" => format!("{name} has nothing to reset right now."),
+                    "noCredit" => format!("{name} has no banked resets left."),
+                    "alreadyRedeemed" => format!("That reset for {name} was already used."),
+                    other => format!("{name}: {other}"),
+                };
+                let message = match warning {
+                    Some(warning) => format!("{message} {warning}"),
+                    None => message,
+                };
+                (message, outcome != "reset")
+            }
+            Err(error) => (format!("Could not use a reset for {name}: {error}"), true),
+        });
+        cx.notify();
+    }
+
     pub fn set_connected(&mut self, connected: bool, cx: &mut Context<Self>) {
         if self.connected != connected {
             self.connected = connected;
             if !connected {
                 self.pending = None;
                 self.limits_pending = None;
+                self.redeeming = None;
             }
             cx.notify();
         }
@@ -171,6 +230,8 @@ impl UsageView {
         self.limits_pending = None;
         self.limits_loaded_at = None;
         self.limits_error = None;
+        self.redeeming = None;
+        self.reset_message = None;
         self.pending = None;
         self.report = None;
         self.loaded_at = None;
@@ -267,7 +328,13 @@ impl Render for UsageView {
             .as_ref()
             .filter(|_| self.report_days == self.days);
         let body = if self.metric == Metric::Limits {
-            crate::limits_view::render(&self.limits, self.connected, self.limits_wide, cx)
+            let reset = crate::limits_view::ResetUi {
+                view: cx.entity().downgrade(),
+                connected: self.connected,
+                pending: self.redeeming.as_ref().map(|(key, _)| key.clone()),
+                message: self.reset_message.clone(),
+            };
+            crate::limits_view::render(&self.limits, self.connected, self.limits_wide, &reset, cx)
         } else {
             match report {
                 Some(report) => self.render_report(report, cx).into_any_element(),
@@ -1062,6 +1129,7 @@ mod tests {
                 captured.borrow_mut().push(match event {
                     UsageEvent::Load { request_id, .. } => ("history", *request_id),
                     UsageEvent::LoadLimits { request_id } => ("limits", *request_id),
+                    UsageEvent::ConsumeResetCredit { .. } => ("reset", 0),
                 });
             })
         });
@@ -1142,6 +1210,46 @@ mod tests {
         })
         .unwrap();
         assert_eq!(events.borrow().len(), 3);
+    }
+
+    #[gpui_kit::test]
+    fn banked_resets_are_spent_one_at_a_time_and_report_their_outcome(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let page = cx.new(UsageView::new);
+        let sent = Rc::new(RefCell::new(Vec::new()));
+        let captured = sent.clone();
+        let _subscription = cx.update(|cx| {
+            cx.subscribe(&page, move |_, event: &UsageEvent, _| {
+                if let UsageEvent::ConsumeResetCredit { key, input } = event {
+                    captured.borrow_mut().push((key.clone(), input.clone()));
+                }
+            })
+        });
+        page.update(cx, |page, cx| {
+            let input = json!({ "instanceId": "codex-a" });
+            page.consume_reset("codex:a".into(), "Work".into(), input.clone(), cx);
+            assert!(page.redeeming.is_none(), "offline: nothing is sent");
+            page.set_connected(true, cx);
+            page.consume_reset("codex:a".into(), "Work".into(), input.clone(), cx);
+            page.consume_reset("codex:b".into(), "Personal".into(), input, cx);
+            page.finish_reset("codex:b", Ok(("reset".into(), None)), cx);
+            assert!(page.redeeming.is_some(), "another account's answer is ignored");
+            page.finish_reset("codex:a", Ok(("noCredit".into(), None)), cx);
+            assert!(page.redeeming.is_none());
+            assert_eq!(
+                page.reset_message,
+                Some(("Work has no banked resets left.".into(), true))
+            );
+            page.consume_reset("codex:a".into(), "Work".into(), json!({}), cx);
+            page.finish_reset("codex:a", Ok(("reset".into(), Some("Cooldown kept.".into()))), cx);
+            assert_eq!(
+                page.reset_message,
+                Some(("Used a banked reset for Work. Cooldown kept.".into(), false))
+            );
+        });
+        let sent = sent.borrow();
+        assert_eq!(sent.len(), 2);
+        assert_eq!(sent[0], ("codex:a".to_owned(), json!({ "instanceId": "codex-a" })));
     }
 
     #[gpui_kit::test]
