@@ -113,8 +113,6 @@ pub struct WorkspacePanel {
     connected: bool,
     /// The server's working directory (see `ServerConfig::cwd`).
     server_cwd: Option<String>,
-    /// This scope's diff already fell back to `server_cwd`.
-    diff_fallback: bool,
     /// Shows only the terminal, docked under the main column.
     docked: bool,
     error: Option<String>,
@@ -160,7 +158,6 @@ impl WorkspacePanel {
             show_all_refs: false,
             connected: false,
             server_cwd: None,
-            diff_fallback: false,
             docked: false,
             error: None,
             _subscriptions: subscriptions,
@@ -197,7 +194,6 @@ impl WorkspacePanel {
         self.refs = None;
         self.diff = None;
         self.selected_change = None;
-        self.diff_fallback = false;
         self.terminal.reset();
         self.terminal_input.clear();
         self.terminal_writing = false;
@@ -355,24 +351,17 @@ impl WorkspacePanel {
             Ok(_) => {
                 self.error = Some("The server returned an unexpected workspace response.".into())
             }
-            // The server only diffs inside its own working directory and
-            // worktrees folder; like the web client, fall back to its
-            // directory when the thread's is outside them.
+            // The server only diffs inside the folder it was started in (and
+            // its worktrees folder); say so instead of its raw error.
             Err(error)
                 if pending.slot == RequestSlot::Diff
-                    && error.contains("configured workspace root")
-                    && let Some(server_cwd) = self
-                        .server_cwd
-                        .clone()
-                        .filter(|server_cwd| Some(server_cwd) != self.scope.cwd.as_ref())
-                    && !self.diff_fallback =>
+                    && error.contains("configured workspace root") =>
             {
-                self.diff_fallback = true;
-                self.request(
-                    WorkspaceRequest::DiffPreview { cwd: server_cwd },
-                    RequestSlot::Diff,
-                    cx,
-                );
+                let root = self.server_cwd.as_deref().unwrap_or("the folder it was started in");
+                self.error = Some(format!(
+                    "The server only shows changes for folders inside {root}. Start it from a \
+                     folder that contains this project to see them here."
+                ));
             }
             Err(error) => self.error = Some(error),
         }
@@ -982,12 +971,7 @@ impl WorkspacePanel {
                             ),
                     )
                     .on_click(cx.listener(move |this, _, _, cx| {
-                        let cwd = if this.diff_fallback {
-                            this.server_cwd.clone()
-                        } else {
-                            this.scope.cwd.clone()
-                        };
-                        let Some(cwd) = cwd else {
+                        let Some(cwd) = this.scope.cwd.clone() else {
                             return;
                         };
                         this.selected_change = Some(path.clone());

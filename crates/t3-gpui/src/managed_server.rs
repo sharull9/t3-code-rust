@@ -69,8 +69,12 @@ impl Launcher {
         if let Some(entry) = &self.entry {
             command.env("ELECTRON_RUN_AS_NODE", "1").arg(entry);
         }
-        if let Some(home) = dirs::home_dir() {
-            command.current_dir(home);
+        // The server's working directory bounds what it will diff
+        // (`review.getDiffPreview` rejects anything outside it), so start at
+        // the root of the home drive: projects outside the home folder, such
+        // as `C:\dev\app`, keep their Changes view.
+        if let Some(root) = dirs::home_dir().as_deref().and_then(|home| home.ancestors().last()) {
+            command.current_dir(root);
         }
         #[cfg(windows)]
         command.creation_flags(CREATE_NO_WINDOW);
